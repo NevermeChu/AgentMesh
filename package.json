@@ -1,0 +1,49 @@
+{
+  "name": "agentmesh",
+  "version": "0.1.0",
+  "description": "AgentMesh: A lightweight bridge connecting orchestrator agents to native vendor coding agents (Codex, Antigravity, Grok, Claude Code, OpenCode, ZCode) via MCP and CLI",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "agentmesh": "./dist/cli/index.js",
+    "mesh": "./dist/cli/index.js",
+    "multi-agent": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/cli/index.js",
+    "serve": "node dist/cli/index.js serve",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "multi-agent",
+    "codex",
+    "claude",
+    "antigravity",
+    "grok",
+    "opencode",
+    "zcode"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "commander": "^13.1.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsup": "^8.4.0",
+    "typescript": "^5.8.2",
+    "vitest": "^3.0.8"
+  }
+}

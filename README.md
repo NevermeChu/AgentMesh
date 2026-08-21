@@ -20,14 +20,14 @@
 
 ## 🤖 支持的 Agent 矩阵
 
-| Agent 名称 | 别名 (Aliases) | 默认二进制 | 首选模式 (Preferred) | 降级/备选模式 (Fallback) | 环境变量覆盖 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **`codex`** | `openai-codex`, `codex-cli` | `codex` | MCP (`codex mcp-server`) | CLI (`codex exec` / `codex review`) | `CODEX_BIN` |
-| **`claude`** | `claude-code`, `anthropic-claude` | `claude` | MCP (`claude mcp serve`) | CLI (`claude -p`) | `CLAUDE_BIN` |
-| **`antigravity`** | `gemini`, `agy`, `google-gemini`, `google-antigravity` | `agy` / `gemini` | CLI (`agy -p`) | — | `AGY_BIN` / `GEMINI_BIN` |
-| **`grok`** | `xai-grok`, `grok-cli`, `grok-build`| `grok` | CLI (`grok -p`) | — | `GROK_BIN` |
-| **`opencode`** | `opencode-ai`, `opencode-cli` | `opencode` | CLI (`opencode run --auto`) | — | `OPENCODE_BIN` |
-| **`zcode`** | `z-code`, `zcode-cli` | `zcode` | CLI (`zcode <prompt>`) | — | `ZCODE_BIN` |
+| Agent 名称        | 别名 (Aliases)                                         | 默认二进制       | 首选模式 (Preferred)        | 降级/备选模式 (Fallback)            | 环境变量覆盖             |
+| :---------------- | :----------------------------------------------------- | :--------------- | :-------------------------- | :---------------------------------- | :----------------------- |
+| **`codex`**       | `openai-codex`, `codex-cli`                            | `codex`          | MCP (`codex mcp-server`)    | CLI (`codex exec` / `codex review`) | `CODEX_BIN`              |
+| **`claude`**      | `claude-code`, `anthropic-claude`                      | `claude`         | MCP (`claude mcp serve`)    | CLI (`claude -p`)                   | `CLAUDE_BIN`             |
+| **`antigravity`** | `gemini`, `agy`, `google-gemini`, `google-antigravity` | `agy` / `gemini` | CLI (`agy -p`)              | —                                   | `AGY_BIN` / `GEMINI_BIN` |
+| **`grok`**        | `xai-grok`, `grok-cli`, `grok-build`                   | `grok`           | CLI (`grok -p`)             | —                                   | `GROK_BIN`               |
+| **`opencode`**    | `opencode-ai`, `opencode-cli`                          | `opencode`       | CLI (`opencode run --auto`) | —                                   | `OPENCODE_BIN`           |
+| **`zcode`**       | `z-code`, `zcode-cli`                                  | `zcode`          | CLI (`zcode <prompt>`)      | —                                   | `ZCODE_BIN`              |
 
 > Claude Reviewer 在 `auto` 模式下会从 MCP 自动降级到 CLI，并移除 Bash/Edit/Write 等可写工具。显式指定 `mode=mcp` 的 Claude Reviewer 会返回错误，因为该路径目前无法建立可靠的只读边界。Antigravity Reviewer 在非 Windows 平台使用原生 `--sandbox` 与 `plan` 模式；Windows 上因原生沙箱可能在受保护工具链路径初始化失败，目前降级为 `plan` + `prompt-only`。所有标记为 `prompt-only` 的适配器都不能视为运行时只读沙箱。
 
@@ -39,9 +39,11 @@
 
 ### 1. 安装与构建
 
+开发与发布要求 Node.js `>=22.13.0`，CI 同时验证 Node.js 22 和 24。仓库固定使用 npm `11.16.0`；本机 Node.js 24 与构建目标并不冲突，`tsup` 的 `node22` target 表示发布产物兼容的最低 Node.js 运行时，而不是实际执行构建的本机版本。
+
 ```bash
-# 安装依赖
-npm install
+# 按 lockfile 安装完全一致的依赖
+npm ci
 
 # 编译构建
 npm run build
@@ -56,6 +58,7 @@ node dist/cli/index.js list
 ```
 
 输出示例：
+
 ```text
 Supported Agent Adapters & System Status:
 
@@ -158,10 +161,7 @@ Orchestrator 调用 `delegate_task` / `review_changes` 时省略 `agent`，Agent
   "mcpServers": {
     "agentmesh": {
       "command": "node",
-      "args": [
-        "d:/Project/Git Repository/AgentMesh/dist/cli/index.js",
-        "serve"
-      ],
+      "args": ["d:/Project/Git Repository/AgentMesh/dist/cli/index.js", "serve"],
       "env": {
         "CODEX_BIN": "codex",
         "CLAUDE_BIN": "claude"
@@ -237,12 +237,35 @@ MCP Client / 主控 Agent (Antigravity / Codex / Claude Code)
 ## 🧪 自动化测试
 
 ```bash
-# 运行单元测试与集成测试
+# 按仓库规则格式化全部受支持文件
+npm run format
+
+# 仅检查格式，不修改文件
+npm run format:check
+
+# 运行单元测试和内存内 MCP 协议测试
 npm test
+
+# 执行覆盖率门槛
+npm run test:coverage
+
+# 通过真实子进程调用假的 Agent CLI，验证参数、JSON 与会话交接
+npm run test:integration
+
+# 打包、安装到临时消费项目，并验证导出、版本和 CLI
+npm run test:package
+
+# 运行类型感知 ESLint
+npm run lint
 
 # 检查严格 TypeScript 类型安全
 npm run typecheck
+
+# 执行格式、Lint、类型、分层测试、构建和发布包验证
+npm run check
 ```
+
+VS Code 在安装推荐的 Prettier 扩展后会按 `.prettierrc.json` 在保存时格式化。Husky 的 pre-commit hook 会通过 lint-staged 格式化并检查暂存文件，再执行类型检查；GitHub Actions 会在 Ubuntu 与 Windows 的 Node.js 22/24 矩阵中执行完整校验。依赖统一从 npm 官方仓库解析，Dependabot 定期提交 npm 与 GitHub Actions 更新。
 
 ---
 

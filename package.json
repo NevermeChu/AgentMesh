@@ -2,10 +2,37 @@
   "name": "agentmesh",
   "version": "0.1.0",
   "description": "AgentMesh: A lightweight bridge connecting orchestrator agents to native vendor coding agents (Codex, Antigravity, Grok, Claude Code, OpenCode, ZCode) via MCP and CLI",
+  "author": "NevermeChu",
+  "license": "MIT",
+  "homepage": "https://github.com/NevermeChu/AgentMesh#readme",
+  "bugs": {
+    "url": "https://github.com/NevermeChu/AgentMesh/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NevermeChu/AgentMesh.git"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "packageManager": "npm@11.16.0",
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./mcp/server": {
+      "types": "./dist/mcp/server.d.ts",
+      "import": "./dist/mcp/server.js",
+      "require": "./dist/mcp/server.cjs"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "agentmesh": "./dist/cli/index.js",
     "mesh": "./dist/cli/index.js",
@@ -13,6 +40,7 @@
   },
   "files": [
     "dist",
+    "CHANGELOG.md",
     "PROBLEMS.md"
   ],
   "scripts": {
@@ -20,9 +48,20 @@
     "dev": "tsup --watch",
     "start": "node dist/cli/index.js",
     "serve": "node dist/cli/index.js serve",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:coverage": "vitest run --coverage",
+    "test:integration": "vitest run --config vitest.integ.config.ts",
+    "test:package": "npm run build && node scripts/verify-package.mjs",
+    "test:watch": "vitest",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run test:integration && npm run test:package",
+    "prepare": "husky",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check"
   },
   "keywords": [
     "mcp",
@@ -35,16 +74,42 @@
     "opencode",
     "zcode"
   ],
-  "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "overrides": {
+    "esbuild": "0.28.2"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "commander": "^13.1.0",
     "zod": "^3.24.2"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.13.9",
+    "@vitest/coverage-v8": "^3.2.7",
+    "esbuild": "0.28.2",
+    "eslint": "^10.8.1",
+    "globals": "^17.11.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.5.2",
+    "prettier": "^3.6.2",
     "tsup": "^8.4.0",
     "typescript": "^5.8.2",
+    "typescript-eslint": "^8.67.0",
     "vitest": "^3.0.8"
+  },
+  "lint-staged": {
+    "*.{ts,js,mjs,cjs}": [
+      "prettier --write",
+      "eslint --fix"
+    ],
+    "*.{json,jsonc,md,yml,yaml}": "prettier --write"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": true
   }
 }

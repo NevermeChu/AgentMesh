@@ -1,5 +1,11 @@
 import { BaseAdapter } from "./base.js";
-import type { AgentName, AgentResult, RunAgentOptions, SandboxMechanism, TransportMode } from "./types.js";
+import type {
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  SandboxMechanism,
+  TransportMode,
+} from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
 

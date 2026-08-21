@@ -2,6 +2,8 @@ import { Command } from "commander";
 import { defaultRunner } from "../core/runner.js";
 import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
+import { VERSION } from "../version.js";
+import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
   parseMode,
   parseRole,
@@ -12,10 +14,35 @@ import {
 
 const program = new Command();
 
+interface RunCommandOptions {
+  agent?: string;
+  base?: string;
+  contextSession?: string;
+  cwd: string;
+  mode?: TransportMode;
+  role?: AgentRole;
+  session?: string;
+  timeout?: number;
+}
+
+interface ReviewCommandOptions {
+  agent?: string;
+  base?: string;
+  contextSession?: string;
+  cwd: string;
+  mode?: TransportMode;
+  timeout?: number;
+}
+
+interface ContinueCommandOptions {
+  mode: TransportMode;
+  timeout?: number;
+}
+
 program
   .name("agentmesh")
   .description("AgentMesh management CLI and stdio MCP server")
-  .version("0.1.0");
+  .version(VERSION);
 
 const debugProgram = program
   .command("debug")
@@ -29,23 +56,16 @@ debugProgram
   .description("Directly run a task outside an Orchestrator (diagnostics only)")
   .option("-c, --cwd <path>", "Working directory", process.cwd())
   .option("-r, --role <role>", "Role: worker | reviewer | tester", parseRole)
-  .option(
-    "-a, --agent <agent>",
-    "Explicit agent override for project role assignment",
-  )
+  .option("-a, --agent <agent>", "Explicit agent override for project role assignment")
   .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode)
-  .option(
-    "-t, --timeout <ms>",
-    "Execution timeout in milliseconds",
-    parseTimeout,
-  )
+  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
   .option("-s, --session <sessionId>", "Bridge session ID to attach")
   .option(
     "--context-session <sessionId>",
     "Bridge session whose normalized context should be shared",
   )
   .option("--base <commit>", "Git base branch/commit for diff comparison")
-  .action(async (agentOrTask: string, taskParts: string[], options) => {
+  .action(async (agentOrTask: string, taskParts: string[], options: RunCommandOptions) => {
     try {
       const input = resolveRunInput(agentOrTask, taskParts, options.agent);
       const role = options.role || "worker";
@@ -77,10 +97,7 @@ debugProgram
         process.exit(1);
       }
     } catch (err) {
-      console.error(
-        "Execution error:",
-        err instanceof Error ? err.message : String(err),
-      );
+      console.error("Execution error:", err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
   });
@@ -88,24 +105,18 @@ debugProgram
 // Debug command: review
 debugProgram
   .command("review [agentOrTask] [task...]")
-  .description(
-    "Directly run a reviewer outside an Orchestrator (diagnostics only)",
-  )
+  .description("Directly run a reviewer outside an Orchestrator (diagnostics only)")
   .option("-c, --cwd <path>", "Working directory", process.cwd())
   .option("-a, --agent <agent>", "Explicit reviewer agent override")
   .option("--base <commit>", "Git base branch/commit to diff against")
   .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode)
-  .option(
-    "-t, --timeout <ms>",
-    "Execution timeout in milliseconds",
-    parseTimeout,
-  )
+  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
   .option(
     "--context-session <sessionId>",
     "Worker/tester Bridge session whose evidence should be shared",
   )
   .action(
-    async (agentOrTask: string | undefined, taskParts: string[], options) => {
+    async (agentOrTask: string | undefined, taskParts: string[], options: ReviewCommandOptions) => {
       try {
         const input = resolveReviewInput(
           agentOrTask,
@@ -138,10 +149,7 @@ debugProgram
           process.exit(1);
         }
       } catch (err) {
-        console.error(
-          "Review error:",
-          err instanceof Error ? err.message : String(err),
-        );
+        console.error("Review error:", err instanceof Error ? err.message : String(err));
         process.exit(1);
       }
     },
@@ -152,13 +160,9 @@ program
   .description("Show and validate the nearest project .agentmesh/config.json")
   .action((cwd: string | undefined) => {
     try {
-      const loaded = defaultRunner.getProjectConfiguration(
-        cwd || process.cwd(),
-      );
+      const loaded = defaultRunner.getProjectConfiguration(cwd || process.cwd());
       if (!loaded) {
-        console.error(
-          `No .agentmesh/config.json found for '${cwd || process.cwd()}'.`,
-        );
+        console.error(`No .agentmesh/config.json found for '${cwd || process.cwd()}'.`);
         process.exitCode = 1;
         return;
       }
@@ -173,18 +177,9 @@ program
 debugProgram
   .command("continue <sessionId> <task>")
   .description("Directly continue a Bridge session for diagnostics")
-  .option(
-    "-m, --mode <mode>",
-    "Transport mode: auto | mcp | cli",
-    parseMode,
-    "auto",
-  )
-  .option(
-    "-t, --timeout <ms>",
-    "Execution timeout in milliseconds",
-    parseTimeout,
-  )
-  .action(async (sessionId: string, task: string, options) => {
+  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode, "auto")
+  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
+  .action(async (sessionId: string, task: string, options: ContinueCommandOptions) => {
     try {
       console.log(`[AgentMesh] Continuing session '${sessionId}'...\n`);
       const result = await defaultRunner.continueTask({
@@ -206,10 +201,7 @@ debugProgram
         process.exit(1);
       }
     } catch (err) {
-      console.error(
-        "Continue error:",
-        err instanceof Error ? err.message : String(err),
-      );
+      console.error("Continue error:", err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
   });
@@ -217,9 +209,7 @@ debugProgram
 // Command: list
 program
   .command("list")
-  .description(
-    "List all supported agents and their availability status on this system",
-  )
+  .description("List all supported agents and their availability status on this system")
   .action(async () => {
     try {
       const agents = await defaultRunner.listAgents();
@@ -248,10 +238,7 @@ program
         "\nTip: You can specify custom binary locations using environment variables (e.g. CODEX_BIN, CLAUDE_BIN, AGY_BIN, GROK_BIN).\n",
       );
     } catch (err) {
-      console.error(
-        "Failed to list agents:",
-        err instanceof Error ? err.message : String(err),
-      );
+      console.error("Failed to list agents:", err instanceof Error ? err.message : String(err));
       process.exit(1);
     }
   });

@@ -40,10 +40,7 @@ export {
 export type { ExecutionOptions, ExecutionResult } from "./core/executor.js";
 
 export { executeViaMcpClient } from "./core/mcp-client.js";
-export type {
-  McpClientExecutionOptions,
-  McpClientExecutionResult,
-} from "./core/mcp-client.js";
+export type { McpClientExecutionOptions, McpClientExecutionResult } from "./core/mcp-client.js";
 
 export {
   buildRolePrompt,
@@ -55,13 +52,10 @@ export {
   parseReviewOutput,
 } from "./core/prompts.js";
 export type { ParsedReviewOutput } from "./core/prompts.js";
+export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
-export {
-  findProjectConfigPath,
-  loadProjectConfig,
-  resolveRoleAssignment,
-} from "./core/config.js";
+export { findProjectConfigPath, loadProjectConfig, resolveRoleAssignment } from "./core/config.js";
 export type {
   AgentMeshProjectConfig,
   ConfigurableRole,
@@ -69,16 +63,8 @@ export type {
   RoleAssignment,
 } from "./core/config.js";
 
-export {
-  MultiAgentRunner,
-  AgentMeshRunner,
-  defaultRunner,
-} from "./core/runner.js";
-export type {
-  DelegateTaskParams,
-  ReviewChangesParams,
-  ContinueTaskParams,
-} from "./core/runner.js";
+export { MultiAgentRunner, AgentMeshRunner, defaultRunner } from "./core/runner.js";
+export type { DelegateTaskParams, ReviewChangesParams, ContinueTaskParams } from "./core/runner.js";
 
 // MCP Server
 export { createMcpServer, startMcpServer } from "./mcp/server.js";

@@ -1,7 +1,14 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { BaseAdapter } from "./base.js";
-import type { AgentExecutableInfo, AgentName, AgentResult, RunAgentOptions, SandboxMechanism, TransportMode } from "./types.js";
+import type {
+  AgentExecutableInfo,
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  SandboxMechanism,
+  TransportMode,
+} from "./types.js";
 import { executeCommand, findExecutableOnPath, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
 
@@ -30,7 +37,10 @@ export function parseAntigravityJsonOutput(output: string): ParsedAntigravityOut
           ? parsed.message
           : undefined;
     const error =
-      explicitError || (status && status.toUpperCase() !== "SUCCESS" ? `Antigravity returned status ${status}` : undefined);
+      explicitError ||
+      (status && status.toUpperCase() !== "SUCCESS"
+        ? `Antigravity returned status ${status}`
+        : undefined);
     return { output: response, sessionId, status, error };
   } catch {
     return { output: output.trim() };
@@ -38,7 +48,7 @@ export function parseAntigravityJsonOutput(output: string): ParsedAntigravityOut
 }
 
 export function findWinGetAntigravityBinary(
-  localAppData = process.env.LOCALAPPDATA
+  localAppData = process.env.LOCALAPPDATA,
 ): string | undefined {
   if (!localAppData) return undefined;
   const packagesDir = path.join(localAppData, "Microsoft", "WinGet", "Packages");
@@ -162,8 +172,12 @@ export class AntigravityAdapter extends BaseAdapter {
       });
 
       const parsed = parseAntigravityJsonOutput(res.stdout);
-      const diagnosticOutput = [parsed.output || res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-      const nativeSessionId = parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
+      const diagnosticOutput = [parsed.output || res.stdout, res.stderr]
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      const nativeSessionId =
+        parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
       if (res.exitCode !== 0 || parsed.error) {
         return {

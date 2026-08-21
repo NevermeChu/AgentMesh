@@ -122,9 +122,7 @@ interface AgentAdapter {
 
   run(options: RunAgentOptions): Promise<AgentResult>;
 
-  continue?(
-    options: ContinueAgentOptions
-  ): Promise<AgentResult>;
+  continue?(options: ContinueAgentOptions): Promise<AgentResult>;
 }
 ```
 

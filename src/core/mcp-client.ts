@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { findExecutableOnPath, buildCmdCommandLine } from "./executor.js";
+import { VERSION } from "../version.js";
 
 export interface McpClientExecutionOptions {
   command: string;
@@ -26,7 +27,7 @@ export interface McpClientExecutionResult {
  * Spawns an agent in MCP server mode, performs the requested tool or prompt call, and cleanly disconnects.
  */
 export async function executeViaMcpClient(
-  options: McpClientExecutionOptions
+  options: McpClientExecutionOptions,
 ): Promise<McpClientExecutionResult> {
   const startTime = Date.now();
   const timeoutMs = options.timeoutMs ?? 120_000;
@@ -66,11 +67,11 @@ export async function executeViaMcpClient(
   const client = new Client(
     {
       name: "agentmesh-client",
-      version: "0.1.0",
+      version: VERSION,
     },
     {
       capabilities: {},
-    }
+    },
   );
 
   let timer: NodeJS.Timeout | null = null;
@@ -93,7 +94,7 @@ export async function executeViaMcpClient(
 
       if (!targetTool) {
         throw new Error(
-          `No tools found on MCP server '${options.command}'. Available tools: [${toolNames.join(", ")}]`
+          `No tools found on MCP server '${options.command}'. Available tools: [${toolNames.join(", ")}]`,
         );
       }
 
@@ -102,20 +103,23 @@ export async function executeViaMcpClient(
         arguments: options.toolArguments || {},
       });
 
-      let textOutput = "";
-      if (Array.isArray(toolResult.content)) {
-        textOutput = toolResult.content
-          .map((item) => {
-            if ("text" in item && typeof item.text === "string") return item.text;
-            return JSON.stringify(item);
-          })
-          .join("\n");
-      } else {
-        textOutput = JSON.stringify(toolResult);
-      }
+      const content: unknown = toolResult.content;
+      const textOutput = Array.isArray(content)
+        ? content
+            .map((item: unknown) => {
+              if (typeof item === "object" && item !== null && "text" in item) {
+                const text = item.text;
+                if (typeof text === "string") return text;
+              }
+              return JSON.stringify(item);
+            })
+            .join("\n")
+        : JSON.stringify(toolResult);
 
       if (toolResult.isError) {
-        throw new Error(`MCP Tool '${targetTool}' reported error: ${textOutput || "Unknown tool error"}`);
+        throw new Error(
+          `MCP Tool '${targetTool}' reported error: ${textOutput || "Unknown tool error"}`,
+        );
       }
 
       return {

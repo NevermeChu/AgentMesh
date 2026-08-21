@@ -1,5 +1,11 @@
 import { BaseAdapter } from "./base.js";
-import type { AgentName, AgentResult, RunAgentOptions, SandboxMechanism, TransportMode } from "./types.js";
+import type {
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  SandboxMechanism,
+  TransportMode,
+} from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
 
@@ -28,13 +34,19 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
   let error: string | undefined;
   let parsedAny = false;
 
-  for (const line of output.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+  for (const line of output
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean)) {
     try {
       const event = JSON.parse(line) as Record<string, unknown>;
       parsedAny = true;
       sessionId ||= findStringField(event, new Set(["sessionID", "sessionId", "session_id"]));
       const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
-      const part = event.part && typeof event.part === "object" ? event.part as Record<string, unknown> : undefined;
+      const part =
+        event.part && typeof event.part === "object"
+          ? (event.part as Record<string, unknown>)
+          : undefined;
       const text =
         type === "text" && typeof part?.text === "string"
           ? part.text
@@ -46,7 +58,8 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
         error =
           typeof event.error === "string"
             ? event.error
-            : findStringField(event.error, new Set(["message", "name", "code"])) || "OpenCode returned an error event";
+            : findStringField(event.error, new Set(["message", "name", "code"])) ||
+              "OpenCode returned an error event";
       }
     } catch {
       // Preserve compatibility with older/default output if a CLI emits mixed lines.
@@ -100,8 +113,12 @@ export class OpenCodeAdapter extends BaseAdapter {
       });
 
       const parsed = parseOpenCodeJsonLines(res.stdout);
-      const diagnosticOutput = [parsed.output || res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-      const nativeSessionId = parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
+      const diagnosticOutput = [parsed.output || res.stdout, res.stderr]
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+      const nativeSessionId =
+        parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
       if (res.exitCode !== 0 || parsed.error) {
         return {

@@ -17,7 +17,7 @@ export function parseTimeout(value: string): number {
   const timeout = Number(value);
   if (!Number.isSafeInteger(timeout) || timeout <= 0 || timeout > MAX_TIMEOUT_MS) {
     throw new InvalidArgumentError(
-      `Timeout must be a positive integer no greater than ${MAX_TIMEOUT_MS}ms.`
+      `Timeout must be a positive integer no greater than ${MAX_TIMEOUT_MS}ms.`,
     );
   }
   return timeout;
@@ -26,10 +26,13 @@ export function parseTimeout(value: string): number {
 export function resolveRunInput(
   agentOrTask: string,
   taskParts: string[],
-  explicitAgent?: string
+  explicitAgent?: string,
 ): { agent?: string; task: string } {
   if (explicitAgent) {
-    return { agent: explicitAgent, task: [agentOrTask, ...taskParts].join(" ").trim() };
+    return {
+      agent: explicitAgent,
+      task: [agentOrTask, ...taskParts].join(" ").trim(),
+    };
   }
   if (taskParts.length > 0) {
     return { agent: agentOrTask, task: taskParts.join(" ").trim() };
@@ -41,14 +44,17 @@ export function resolveReviewInput(
   agentOrTask: string | undefined,
   taskParts: string[],
   explicitAgent: string | undefined,
-  isKnownAgent: (value: string) => boolean
+  isKnownAgent: (value: string) => boolean,
 ): { agent?: string; task?: string } {
   if (explicitAgent) {
     const task = [agentOrTask, ...taskParts].filter(Boolean).join(" ").trim();
     return { agent: explicitAgent, task: task || undefined };
   }
   if (agentOrTask && taskParts.length > 0) {
-    return { agent: agentOrTask, task: taskParts.join(" ").trim() || undefined };
+    return {
+      agent: agentOrTask,
+      task: taskParts.join(" ").trim() || undefined,
+    };
   }
   if (agentOrTask && isKnownAgent(agentOrTask)) return { agent: agentOrTask };
   return { task: agentOrTask?.trim() || undefined };

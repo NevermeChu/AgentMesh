@@ -31,7 +31,7 @@ export class ProcessExecutionError extends Error {
       stdout: string;
       stderr: string;
       timedOut?: boolean;
-    }
+    },
   ) {
     super(message);
     this.name = "ProcessExecutionError";
@@ -46,9 +46,7 @@ export class ProcessExecutionError extends Error {
  * Searches system PATH or explicit path for an executable, accounting for Windows extensions (.exe, .cmd, .bat, etc.)
  * and handling relative/absolute paths without extensions.
  */
-export async function findExecutableOnPath(
-  cmdName: string
-): Promise<string | null> {
+export async function findExecutableOnPath(cmdName: string): Promise<string | null> {
   if (!cmdName || !cmdName.trim()) {
     return null;
   }
@@ -159,7 +157,7 @@ export function buildCmdCommandLine(command: string, args: string[]): string {
 export async function executeCommand(
   command: string,
   args: string[],
-  options: ExecutionOptions = {}
+  options: ExecutionOptions = {},
 ): Promise<ExecutionResult> {
   const startTime = Date.now();
   const isWindows = process.platform === "win32";
@@ -215,13 +213,13 @@ export async function executeCommand(
     try {
       childProcess = spawn(actualCmd, actualArgs, spawnOptions);
     } catch (err) {
-      const errorMsg =
-        err instanceof Error ? err.message : String(err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
       return reject(
-        new ProcessExecutionError(
-          `Failed to spawn process '${command}': ${errorMsg}`,
-          { exitCode: 127, stdout: "", stderr: errorMsg }
-        )
+        new ProcessExecutionError(`Failed to spawn process '${command}': ${errorMsg}`, {
+          exitCode: 127,
+          stdout: "",
+          stderr: errorMsg,
+        }),
       );
     }
 
@@ -291,15 +289,12 @@ export async function executeCommand(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (hardSettleTimer) clearTimeout(hardSettleTimer);
       reject(
-        new ProcessExecutionError(
-          `Process '${command}' encountered error: ${err.message}`,
-          {
-            exitCode: 1,
-            stdout: stdoutData,
-            stderr: stderrData || err.message,
-            timedOut,
-          }
-        )
+        new ProcessExecutionError(`Process '${command}' encountered error: ${err.message}`, {
+          exitCode: 1,
+          stdout: stdoutData,
+          stderr: stderrData || err.message,
+          timedOut,
+        }),
       );
     });
 

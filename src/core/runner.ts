@@ -6,8 +6,10 @@ import type {
   RunAgentOptions,
   TransportMode,
 } from "../agents/types.js";
-import { AgentRegistry, defaultRegistry } from "../agents/registry.js";
-import { SessionManager, defaultSessionManager } from "./session.js";
+import { defaultRegistry } from "../agents/registry.js";
+import type { AgentRegistry } from "../agents/registry.js";
+import { defaultSessionManager } from "./session.js";
+import type { SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import type { BridgeSession } from "./types.js";
 
@@ -62,7 +64,8 @@ function buildHistoryContext(session: BridgeSession): string | undefined {
       `Task: ${history.task}`,
     ];
     if (history.summary) details.push(`Summary: ${history.summary}`);
-    if (history.finalAnswer) details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+    if (history.finalAnswer)
+      details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
     if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
     return details.join("\n");
   });
@@ -79,7 +82,7 @@ export class MultiAgentRunner {
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
-    sessionManager: SessionManager = defaultSessionManager
+    sessionManager: SessionManager = defaultSessionManager,
   ) {
     this.registry = registry;
     this.sessionManager = sessionManager;
@@ -121,7 +124,8 @@ export class MultiAgentRunner {
       };
     }
 
-    const selectedAgent = params.agent ?? existingSession?.agent ?? roleResolution.assignment?.agent;
+    const selectedAgent =
+      params.agent ?? existingSession?.agent ?? roleResolution.assignment?.agent;
     if (!selectedAgent) {
       const message = `No agent was provided and role '${effectiveRole}' is not configured in '${configCwd}/.agentmesh/config.json'.`;
       return {
@@ -356,9 +360,7 @@ export class MultiAgentRunner {
     // Generate structured history context from prior session turns
     // Native conversations already contain their own history. Only inject the
     // normalized Bridge context when a CLI cannot provide a native resume ID.
-    const historyContext = session.nativeSessionId
-      ? undefined
-      : buildHistoryContext(session);
+    const historyContext = session.nativeSessionId ? undefined : buildHistoryContext(session);
 
     let result: AgentResult;
     try {

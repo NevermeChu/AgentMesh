@@ -122,7 +122,9 @@ export class SessionManager {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      throw new Error(`Failed to save AgentMesh sessions to '${this.storagePath}': ${message}`);
+      throw new Error(`Failed to save AgentMesh sessions to '${this.storagePath}': ${message}`, {
+        cause: err,
+      });
     }
   }
 
@@ -161,17 +163,41 @@ export class SessionManager {
       throw new Error(`Timed out acquiring AgentMesh session lock '${this.lockPath}'.`);
     }
 
+    let outcome: { ok: true; value: T } | { ok: false; error: unknown };
     try {
       this.loadFromFile();
-      return operation();
-    } finally {
+      outcome = { ok: true, value: operation() };
+    } catch (error) {
+      outcome = { ok: false, error };
+    }
+
+    let cleanupError: unknown;
+    try {
       fs.closeSync(lockFd);
-      try {
-        fs.unlinkSync(this.lockPath);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    } catch (error) {
+      cleanupError = error;
+    }
+    try {
+      fs.unlinkSync(this.lockPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" && cleanupError === undefined) {
+        cleanupError = error;
       }
     }
+
+    if (!outcome.ok) {
+      if (outcome.error instanceof Error) throw outcome.error;
+      throw new Error("AgentMesh session operation failed with a non-Error value.", {
+        cause: outcome.error,
+      });
+    }
+    if (cleanupError !== undefined) {
+      if (cleanupError instanceof Error) throw cleanupError;
+      throw new Error("AgentMesh session lock cleanup failed with a non-Error value.", {
+        cause: cleanupError,
+      });
+    }
+    return outcome.value;
   }
 
   /**
@@ -229,7 +255,7 @@ export class SessionManager {
    */
   public updateSession(
     id: string,
-    updates: Partial<Omit<BridgeSession, "id" | "createdAt">>
+    updates: Partial<Omit<BridgeSession, "id" | "createdAt">>,
   ): BridgeSession | undefined {
     return this.withFileLock(() => {
       const existing = this.sessions.get(id);
@@ -269,8 +295,7 @@ export class SessionManager {
     }
 
     return Array.from(this.sessions.values(), snapshotSession).sort(
-      (a, b) =>
-        new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
+      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
     );
   }
 

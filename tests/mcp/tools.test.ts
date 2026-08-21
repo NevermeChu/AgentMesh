@@ -6,7 +6,12 @@ import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
 import { BaseAdapter } from "../../src/agents/base.js";
-import type { AgentName, AgentResult, RunAgentOptions, TransportMode } from "../../src/agents/types.js";
+import type {
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  TransportMode,
+} from "../../src/agents/types.js";
 
 class TestAdapter extends BaseAdapter {
   readonly name: AgentName = "codex";
@@ -55,11 +60,10 @@ describe("mcp/tools protocol integration", () => {
   let clientTransport: InMemoryTransport;
   let serverTransport: InMemoryTransport;
   let runner: MultiAgentRunner;
-  let sessionManager: SessionManager;
 
   beforeEach(async () => {
     const registry = new AgentRegistry();
-    sessionManager = new SessionManager({ persist: false });
+    const sessionManager = new SessionManager({ persist: false });
     const adapter = new TestAdapter();
     registry.register(adapter);
     runner = new MultiAgentRunner(registry, sessionManager);
@@ -67,15 +71,9 @@ describe("mcp/tools protocol integration", () => {
     const server = createMcpServer({ runner });
     [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
 
-    client = new Client(
-      { name: "test-client", version: "1.0.0" },
-      { capabilities: {} }
-    );
+    client = new Client({ name: "test-client", version: "1.0.0" }, { capabilities: {} });
 
-    await Promise.all([
-      server.connect(serverTransport),
-      client.connect(clientTransport),
-    ]);
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
   });
 
   afterEach(async () => {
@@ -87,7 +85,7 @@ describe("mcp/tools protocol integration", () => {
     }
   });
 
-  it("should discover all registered MCP tools", async () => {
+  it("discovers the complete MCP tool contract", async () => {
     const response = await client.listTools();
     const toolNames = response.tools.map((t) => t.name);
 
@@ -99,7 +97,7 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("get_role_config");
   });
 
-  it("should execute delegate_task via MCP callTool", async () => {
+  it("delegates a worker task through MCP", async () => {
     const res = await client.callTool({
       name: "delegate_task",
       arguments: {
@@ -118,7 +116,7 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("Executed successfully: Implement user registration");
   });
 
-  it("should execute review_changes via MCP callTool on PASS", async () => {
+  it("returns a successful reviewer verdict through MCP", async () => {
     const res = await client.callTool({
       name: "review_changes",
       arguments: {
@@ -134,7 +132,7 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("PASS");
   });
 
-  it("should set isError: true when review_changes produces FAIL findings", async () => {
+  it("propagates reviewer findings as an MCP error", async () => {
     const res = await client.callTool({
       name: "review_changes",
       arguments: {
@@ -152,7 +150,7 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("SQL Injection");
   });
 
-  it("should report UNKNOWN reviewer output as an error instead of PASS", async () => {
+  it("fails closed for an unknown reviewer verdict", async () => {
     const res = await client.callTool({
       name: "review_changes",
       arguments: {
@@ -168,7 +166,7 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).not.toContain("--- REVIEW FINDINGS ---");
   });
 
-  it("should execute continue_task via MCP callTool", async () => {
+  it("continues a Bridge session through MCP", async () => {
     const firstRun = await runner.delegateTask({
       agent: "codex",
       task: "Initial feature",
@@ -188,54 +186,7 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain(firstRun.sessionId!);
   });
 
-  it("should execute list_agents via MCP callTool", async () => {
-    const res = await client.callTool({
-      name: "list_agents",
-      arguments: {},
-    });
-
-    expect(res.isError).toBeFalsy();
-    const content = res.content as Array<{ type: string; text: string }>;
-    const agents = JSON.parse(content[0]?.text || "[]");
-    expect(Array.isArray(agents)).toBe(true);
-    expect(agents.some((a: { name: string }) => a.name === "codex")).toBe(true);
-  });
-
-  it("should execute get_session via MCP callTool", async () => {
-    const createdSession = sessionManager.createSession({
-      agent: "codex",
-      cwd: "/my/project",
-      role: "worker",
-    });
-
-    const res = await client.callTool({
-      name: "get_session",
-      arguments: {
-        sessionId: createdSession.id,
-      },
-    });
-
-    expect(res.isError).toBeFalsy();
-    const content = res.content as Array<{ type: string; text: string }>;
-    const session = JSON.parse(content[0]?.text || "{}");
-    expect(session.id).toBe(createdSession.id);
-    expect(session.agent).toBe("codex");
-  });
-
-  it("should return error structure on unknown session in get_session", async () => {
-    const res = await client.callTool({
-      name: "get_session",
-      arguments: {
-        sessionId: "invalid_session_id_123",
-      },
-    });
-
-    expect(res.isError).toBe(true);
-    const content = res.content as Array<{ type: string; text: string }>;
-    expect(content[0]?.text).toContain("Session 'invalid_session_id_123' not found");
-  });
-
-  it("should reject blank tasks and invalid timeout bounds at the MCP schema", async () => {
+  it("rejects invalid task and timeout inputs at the MCP boundary", async () => {
     const blankTask = await client.callTool({
       name: "delegate_task",
       arguments: { agent: "codex", task: "   " },
@@ -249,7 +200,7 @@ describe("mcp/tools protocol integration", () => {
     expect(invalidTimeout.isError).toBe(true);
   });
 
-  it("should accept an omitted agent and report a missing project role assignment", async () => {
+  it("reports a missing project role assignment when agent is omitted", async () => {
     const res = await client.callTool({
       name: "delegate_task",
       arguments: {

@@ -1,5 +1,11 @@
 import { BaseAdapter } from "./base.js";
-import type { AgentName, AgentResult, RunAgentOptions, SandboxMechanism, TransportMode } from "./types.js";
+import type {
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  SandboxMechanism,
+  TransportMode,
+} from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { executeViaMcpClient } from "../core/mcp-client.js";
 import { buildRolePrompt } from "../core/prompts.js";
@@ -35,7 +41,9 @@ export function parseCodexJsonLines(output: string): {
         error =
           typeof event.error === "string"
             ? event.error
-            : event.error && typeof event.error === "object" && typeof (event.error as Record<string, unknown>).message === "string"
+            : event.error &&
+                typeof event.error === "object" &&
+                typeof (event.error as Record<string, unknown>).message === "string"
               ? String((event.error as Record<string, unknown>).message)
               : typeof event.message === "string"
                 ? event.message
@@ -84,7 +92,7 @@ export class CodexAdapter extends BaseAdapter {
         "-c",
         'sandbox_permissions=["disk-full-read-access"]',
         "-c",
-        'sandbox_mode="read-only"'
+        'sandbox_mode="read-only"',
       );
     } else {
       mcpArgs.push("-c", 'sandbox_mode="workspace-write"');
@@ -136,7 +144,7 @@ export class CodexAdapter extends BaseAdapter {
         "-c",
         'sandbox_permissions=["disk-full-read-access"]',
         "-c",
-        'sandbox_mode="read-only"'
+        'sandbox_mode="read-only"',
       );
       if (options.baseCommit) {
         args.push("--base", options.baseCommit);
@@ -185,7 +193,10 @@ export class CodexAdapter extends BaseAdapter {
         .trim();
       const nativeSessionId = parsed.sessionId || options.nativeSessionId;
       const stderrSemanticError =
-        !parsed.output && /(?:\bERROR\b|patch rejected|writing is blocked|rejected by user approval)/i.test(res.stderr)
+        !parsed.output &&
+        /(?:\bERROR\b|patch rejected|writing is blocked|rejected by user approval)/i.test(
+          res.stderr,
+        )
           ? res.stderr.trim()
           : undefined;
       const semanticError = parsed.error || stderrSemanticError;

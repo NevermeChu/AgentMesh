@@ -1,5 +1,11 @@
 import { BaseAdapter } from "./base.js";
-import type { AgentName, AgentResult, RunAgentOptions, SandboxMechanism, TransportMode } from "./types.js";
+import type {
+  AgentName,
+  AgentResult,
+  RunAgentOptions,
+  SandboxMechanism,
+  TransportMode,
+} from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { executeViaMcpClient } from "../core/mcp-client.js";
 import { buildRolePrompt } from "../core/prompts.js";
@@ -38,7 +44,9 @@ export function parseClaudeJsonOutput(output: string): {
     const explicitError =
       typeof parsed.error === "string"
         ? parsed.error
-        : parsed.error && typeof parsed.error === "object" && typeof (parsed.error as Record<string, unknown>).message === "string"
+        : parsed.error &&
+            typeof parsed.error === "object" &&
+            typeof (parsed.error as Record<string, unknown>).message === "string"
           ? String((parsed.error as Record<string, unknown>).message)
           : undefined;
     const isError =
@@ -71,7 +79,7 @@ export class ClaudeAdapter extends BaseAdapter {
   protected override async runViaMcp(options: RunAgentOptions): Promise<AgentResult> {
     if (options.role === "reviewer") {
       throw new Error(
-        "Claude MCP reviewer mode is disabled because it cannot enforce a read-only tool boundary."
+        "Claude MCP reviewer mode is disabled because it cannot enforce a read-only tool boundary.",
       );
     }
     const startTime = Date.now();

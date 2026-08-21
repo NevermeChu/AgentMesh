@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { AgentRegistry } from "../../src/agents/registry.js";
 
 describe("agents/registry", () => {
-  it("should register default adapters and resolve aliases", () => {
+  it("resolves canonical names and aliases", () => {
     const registry = new AgentRegistry();
 
     // Canonical names
@@ -19,14 +19,10 @@ describe("agents/registry", () => {
     expect(registry.getAdapter("claude-code")?.name).toBe("claude");
     expect(registry.getAdapter("grok-build")?.name).toBe("grok");
     expect(registry.getAdapter("opencode-ai")?.name).toBe("opencode");
-  });
-
-  it("should return undefined for unknown agents", () => {
-    const registry = new AgentRegistry();
     expect(registry.getAdapter("unknown_robot")).toBeUndefined();
   });
 
-  it("should list availability of all registered agents", async () => {
+  it("lists availability for every registered agent", async () => {
     const registry = new AgentRegistry();
     const list = await registry.listAgentAvailability();
 

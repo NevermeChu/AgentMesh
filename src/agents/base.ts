@@ -141,8 +141,9 @@ export abstract class BaseAdapter implements AgentAdapter {
 
   protected abstract runViaCli(options: RunAgentOptions): Promise<AgentResult>;
 
-  protected async runViaMcp(_options: RunAgentOptions): Promise<AgentResult> {
-    throw new Error(`MCP mode is not supported by ${this.displayName}`);
+  protected runViaMcp(options: RunAgentOptions): Promise<AgentResult> {
+    void options;
+    return Promise.reject(new Error(`MCP mode is not supported by ${this.displayName}`));
   }
 
   protected formatSuccessResult(
@@ -154,7 +155,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       summary?: string;
       finalAnswer?: string;
       role?: AgentRole;
-    }
+    },
   ): AgentResult {
     const isReviewer = options?.role === "reviewer";
     let status: "success" | "failed" = "success";
@@ -192,11 +193,7 @@ export abstract class BaseAdapter implements AgentAdapter {
     };
   }
 
-  protected formatErrorResult(
-    err: unknown,
-    startTime: number,
-    output = ""
-  ): AgentResult {
+  protected formatErrorResult(err: unknown, startTime: number, output = ""): AgentResult {
     const errorMsg = err instanceof Error ? err.message : String(err);
     const combinedOutput = output ? `${output}\n${errorMsg}` : errorMsg;
     return {

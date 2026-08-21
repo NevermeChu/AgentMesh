@@ -25,25 +25,31 @@ export interface LoadedProjectConfig {
 const NonBlankString = z.string().trim().min(1);
 const RoleAssignmentSchema = z.union([
   NonBlankString,
-  z.object({
-    agent: NonBlankString,
-    mode: z.enum(["auto", "mcp", "cli"]).optional(),
-    timeoutMs: z.number().int().positive().max(3_600_000).optional(),
-  }).strict(),
+  z
+    .object({
+      agent: NonBlankString,
+      mode: z.enum(["auto", "mcp", "cli"]).optional(),
+      timeoutMs: z.number().int().positive().max(3_600_000).optional(),
+    })
+    .strict(),
 ]);
 
-const ProjectConfigSchema = z.object({
-  version: z.literal(1),
-  roles: z.object({
-    orchestrator: RoleAssignmentSchema.optional(),
-    worker: RoleAssignmentSchema.optional(),
-    reviewer: RoleAssignmentSchema.optional(),
-    tester: RoleAssignmentSchema.optional(),
-  }).strict(),
-}).strict();
+const ProjectConfigSchema = z
+  .object({
+    version: z.literal(1),
+    roles: z
+      .object({
+        orchestrator: RoleAssignmentSchema.optional(),
+        worker: RoleAssignmentSchema.optional(),
+        reviewer: RoleAssignmentSchema.optional(),
+        tester: RoleAssignmentSchema.optional(),
+      })
+      .strict(),
+  })
+  .strict();
 
 function normalizeAssignment(
-  value: z.infer<typeof RoleAssignmentSchema> | undefined
+  value: z.infer<typeof RoleAssignmentSchema> | undefined,
 ): RoleAssignment | undefined {
   return typeof value === "string" ? { agent: value } : value;
 }
@@ -72,7 +78,9 @@ export function loadProjectConfig(startDirectory: string): LoadedProjectConfig |
     parsedJson = JSON.parse(fs.readFileSync(configPath, "utf-8"));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Failed to read AgentMesh project config '${configPath}': ${message}`);
+    throw new Error(`Failed to read AgentMesh project config '${configPath}': ${message}`, {
+      cause: error,
+    });
   }
 
   const parsed = ProjectConfigSchema.safeParse(parsedJson);
@@ -100,7 +108,7 @@ export function loadProjectConfig(startDirectory: string): LoadedProjectConfig |
 
 export function resolveRoleAssignment(
   startDirectory: string,
-  role: ConfigurableRole
+  role: ConfigurableRole,
 ): { assignment?: RoleAssignment; loaded?: LoadedProjectConfig } {
   const loaded = loadProjectConfig(startDirectory);
   return { assignment: loaded?.config.roles[role], loaded };

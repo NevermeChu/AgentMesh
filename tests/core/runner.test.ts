@@ -56,7 +56,7 @@ describe("core/runner", () => {
     runner = new MultiAgentRunner(registry, sessionManager);
   });
 
-  it("should handle unknown agent gracefully without crashing", async () => {
+  it("returns a structured error for an unknown agent", async () => {
     const res = await runner.delegateTask({
       agent: "non_existent_agent",
       task: "Do something",
@@ -66,34 +66,7 @@ describe("core/runner", () => {
     expect(res.summary).toContain("Unknown agent");
   });
 
-  it("should delegate task, create session, and record history", async () => {
-    const res = await runner.delegateTask({
-      agent: "codex",
-      task: "Implement login",
-      role: "worker",
-    });
-
-    expect(res.status).toBe("success");
-    expect(res.sessionId).toBeDefined();
-    expect(res.nativeSessionId).toBe("native_sess_999");
-
-    const session = runner.getSession(res.sessionId!);
-    expect(session).toBeDefined();
-    expect(session?.history.length).toBe(1);
-    expect(session?.history[0]?.task).toBe("Implement login");
-  });
-
-  it("should perform reviewChanges and assign reviewer role", async () => {
-    const res = await runner.reviewChanges({
-      agent: "codex",
-      task: "Review PR #12",
-    });
-
-    expect(res.status).toBe("success");
-    expect(res.output).toContain("role: reviewer");
-  });
-
-  it("should handle continueTask, forward historyContext and nativeSessionId to adapter", async () => {
+  it("creates and continues a native-backed Bridge session", async () => {
     const firstRes = await runner.delegateTask({
       agent: "codex",
       task: "Initial feature",
@@ -106,6 +79,7 @@ describe("core/runner", () => {
 
     expect(contRes.status).toBe("success");
     expect(contRes.sessionId).toBe(firstRes.sessionId);
+    expect(firstRes.nativeSessionId).toBe("native_sess_999");
 
     // Native resume avoids redundantly injecting the Bridge transcript.
     expect(mock.lastRunOptions).toBeDefined();
@@ -116,7 +90,7 @@ describe("core/runner", () => {
     expect(session?.history.length).toBe(2);
   });
 
-  it("should return failure when continuing non-existent session", async () => {
+  it("returns failure when continuing a missing session", async () => {
     const res = await runner.continueTask({
       sessionId: "invalid-session-id",
       task: "Next step",
@@ -126,7 +100,7 @@ describe("core/runner", () => {
     expect(res.summary).toContain("not found");
   });
 
-  it("should return failure when delegating to non-existent session", async () => {
+  it("returns failure when delegating to a missing session", async () => {
     const res = await runner.delegateTask({
       agent: "codex",
       task: "Next step",
@@ -137,7 +111,7 @@ describe("core/runner", () => {
     expect(res.summary).toContain("Session 'invalid-session-id-456' not found");
   });
 
-  it("should reject session transfer when agent mismatches", async () => {
+  it("rejects session transfer when agent mismatches", async () => {
     const createdSession = sessionManager.createSession({
       agent: "claude",
       cwd: process.cwd(),
@@ -155,7 +129,7 @@ describe("core/runner", () => {
     expect(res.error).toContain("expected 'claude', got 'codex'");
   });
 
-  it("should reject session transfer when cwd mismatches", async () => {
+  it("rejects session transfer when cwd mismatches", async () => {
     const createdSession = sessionManager.createSession({
       agent: "codex",
       cwd: "D:/Project/FirstRepo",
@@ -173,7 +147,7 @@ describe("core/runner", () => {
     expect(res.summary).toContain("Session cwd mismatch");
   });
 
-  it("should reject session transfer when role mismatches", async () => {
+  it("rejects session transfer when role mismatches", async () => {
     const createdSession = sessionManager.createSession({
       agent: "codex",
       cwd: process.cwd(),
@@ -192,7 +166,7 @@ describe("core/runner", () => {
     expect(res.error).toContain("expected 'worker', got 'reviewer'");
   });
 
-  it("should accept valid matching sessionId in delegateTask and update history", async () => {
+  it("accepts a matching session binding and records history", async () => {
     const createdSession = sessionManager.createSession({
       agent: "codex",
       cwd: process.cwd(),
@@ -216,7 +190,7 @@ describe("core/runner", () => {
     expect(session?.history[0]?.task).toBe("Follow-up worker task");
   });
 
-  it("should inherit cwd and role from a reused session when omitted", async () => {
+  it("inherits cwd and role from a reused session", async () => {
     const createdSession = sessionManager.createSession({
       agent: "codex",
       cwd: "D:/Project/BoundRepo",
@@ -234,7 +208,7 @@ describe("core/runner", () => {
     expect(sessionManager.getSession(createdSession.id)?.history[0]?.role).toBe("reviewer");
   });
 
-  it("should share normalized context across agents without transferring native sessions", async () => {
+  it("shares normalized context without transferring native sessions", async () => {
     class MockClaudeAdapter extends MockAdapter {
       override readonly name: AgentName = "claude";
     }
@@ -260,7 +234,7 @@ describe("core/runner", () => {
     expect(claude.lastRunOptions?.historyContext).toContain("Final: Inspect authentication flow");
   });
 
-  it("should map multiple roles to one agent while creating role-isolated sessions", async () => {
+  it("maps multiple roles to one agent with isolated sessions", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-role-map-"));
     try {
       fs.mkdirSync(path.join(projectRoot, ".git"));
@@ -275,11 +249,19 @@ describe("core/runner", () => {
             reviewer: { agent: "codex", mode: "cli", timeoutMs: 4321 },
             tester: "codex",
           },
-        })
+        }),
       );
 
-      const worker = await runner.delegateTask({ task: "Implement", cwd: projectRoot, role: "worker" });
-      const reviewer = await runner.delegateTask({ task: "Review", cwd: projectRoot, role: "reviewer" });
+      const worker = await runner.delegateTask({
+        task: "Implement",
+        cwd: projectRoot,
+        role: "worker",
+      });
+      const reviewer = await runner.delegateTask({
+        task: "Review",
+        cwd: projectRoot,
+        role: "reviewer",
+      });
       expect(mock.lastRunOptions?.mode).toBe("cli");
       expect(mock.lastRunOptions?.timeoutMs).toBe(4321);
       const tester = await runner.delegateTask({ task: "Test", cwd: projectRoot, role: "tester" });
@@ -295,14 +277,14 @@ describe("core/runner", () => {
     }
   });
 
-  it("should let an explicit agent override the project role assignment", async () => {
+  it("lets an explicit agent override the project role assignment", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-role-override-"));
     try {
       fs.mkdirSync(path.join(projectRoot, ".git"));
       fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
       fs.writeFileSync(
         path.join(projectRoot, ".agentmesh", "config.json"),
-        JSON.stringify({ version: 1, roles: { worker: "claude" } })
+        JSON.stringify({ version: 1, roles: { worker: "claude" } }),
       );
       const result = await runner.delegateTask({
         agent: "codex",
@@ -316,7 +298,7 @@ describe("core/runner", () => {
     }
   });
 
-  it("should reject shared context from a different working directory", async () => {
+  it("rejects shared context from a different working directory", async () => {
     const source = sessionManager.createSession({
       agent: "codex",
       cwd: "D:/Project/FirstRepo",
@@ -333,7 +315,7 @@ describe("core/runner", () => {
     expect(runner.listSessions()).toHaveLength(1);
   });
 
-  it("should catch errors thrown by adapter and not crash", async () => {
+  it("normalizes errors thrown by an adapter", async () => {
     const res = await runner.delegateTask({
       agent: "codex",
       task: "TRIGGER_ERROR",

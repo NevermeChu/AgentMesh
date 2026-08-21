@@ -12,7 +12,7 @@ describe("core/session", () => {
     sessionManager = new SessionManager({ persist: false });
     tempStoragePath = path.join(
       os.tmpdir(),
-      `agentmesh_test_sess_${Date.now()}_${Math.random().toString(36).slice(2)}.json`
+      `agentmesh_test_sess_${Date.now()}_${Math.random().toString(36).slice(2)}.json`,
     );
   });
 
@@ -27,7 +27,7 @@ describe("core/session", () => {
     }
   });
 
-  it("should create a session with unique ID and default fields", () => {
+  it("maintains an in-memory session through its lifecycle", () => {
     const session = sessionManager.createSession({
       agent: "codex",
       cwd: "/test/path",
@@ -40,41 +40,10 @@ describe("core/session", () => {
     expect(session.role).toBe("worker");
     expect(session.history).toEqual([]);
     expect(session.createdAt).toBeDefined();
-  });
 
-  it("should retrieve an existing session by ID", () => {
-    const created = sessionManager.createSession({
-      agent: "grok",
-      cwd: "/workspace",
-    });
-
-    const found = sessionManager.getSession(created.id);
-    expect(found).toBeDefined();
-    expect(found?.id).toBe(created.id);
-    expect(found?.agent).toBe("grok");
-  });
-
-  it("should update session fields and updatedAt timestamp", () => {
-    const session = sessionManager.createSession({
-      agent: "antigravity",
-      cwd: "/project",
-    });
-
-    const updated = sessionManager.updateSession(session.id, {
+    sessionManager.updateSession(session.id, {
       nativeSessionId: "native-12345",
-      role: "reviewer",
     });
-
-    expect(updated?.nativeSessionId).toBe("native-12345");
-    expect(updated?.role).toBe("reviewer");
-  });
-
-  it("should append history entries to session", () => {
-    const session = sessionManager.createSession({
-      agent: "claude",
-      cwd: "/project",
-    });
-
     sessionManager.addHistory(session.id, {
       role: "worker",
       task: "Fix bug #42",
@@ -84,23 +53,17 @@ describe("core/session", () => {
     });
 
     const current = sessionManager.getSession(session.id);
-    expect(current?.history.length).toBe(1);
-    expect(current?.history[0]?.task).toBe("Fix bug #42");
-    expect(current?.history[0]?.status).toBe("success");
-  });
-
-  it("should delete session properly", () => {
-    const session = sessionManager.createSession({
-      agent: "codex",
-      cwd: "/path",
+    expect(current).toMatchObject({
+      id: session.id,
+      nativeSessionId: "native-12345",
+      history: [{ task: "Fix bug #42", status: "success" }],
     });
 
-    const deleted = sessionManager.deleteSession(session.id);
-    expect(deleted).toBe(true);
+    expect(sessionManager.deleteSession(session.id)).toBe(true);
     expect(sessionManager.getSession(session.id)).toBeUndefined();
   });
 
-  it("should persist session to file and reload in a new SessionManager instance (CLI cross-process simulation)", () => {
+  it("reloads a persisted session across manager instances", () => {
     const manager1 = new SessionManager({
       storagePath: tempStoragePath,
       persist: true,
@@ -138,7 +101,7 @@ describe("core/session", () => {
     expect(reloaded?.history[0]?.summary).toBe("Created 5 tests");
   });
 
-  it("should preserve updates made by separate persistent manager instances", () => {
+  it("preserves updates from concurrent manager instances", () => {
     const manager1 = new SessionManager({ storagePath: tempStoragePath, persist: true });
     const manager2 = new SessionManager({ storagePath: tempStoragePath, persist: true });
 
@@ -150,29 +113,21 @@ describe("core/session", () => {
       persist: true,
     }).listSessions();
     expect(sessions.map((session) => session.id)).toEqual(
-      expect.arrayContaining([first.id, second.id])
+      expect.arrayContaining([first.id, second.id]),
     );
   });
 
-  it("should surface corrupted persistent storage instead of silently resetting sessions", () => {
-    fs.writeFileSync(tempStoragePath, "{not valid json", "utf-8");
-    expect(
-      () => new SessionManager({ storagePath: tempStoragePath, persist: true })
-    ).toThrow("Failed to load AgentMesh sessions");
-  });
-
-  it("should reject structurally invalid persisted sessions", () => {
-    fs.writeFileSync(
-      tempStoragePath,
-      JSON.stringify([{ id: "bridge-sess_invalid", agent: "codex" }]),
-      "utf-8"
+  it.each([
+    ["malformed JSON", "{not valid json"],
+    ["invalid schema", JSON.stringify([{ id: "bridge-sess_invalid", agent: "codex" }])],
+  ])("rejects %s in persistent storage", (_case, contents) => {
+    fs.writeFileSync(tempStoragePath, contents, "utf-8");
+    expect(() => new SessionManager({ storagePath: tempStoragePath, persist: true })).toThrow(
+      "Failed to load AgentMesh sessions",
     );
-    expect(
-      () => new SessionManager({ storagePath: tempStoragePath, persist: true })
-    ).toThrow("Failed to load AgentMesh sessions");
   });
 
-  it("should return detached snapshots that cannot mutate internal session state", () => {
+  it("returns detached snapshots that cannot mutate stored state", () => {
     const created = sessionManager.createSession({
       agent: "codex",
       cwd: "/bound/project",

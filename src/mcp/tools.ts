@@ -5,18 +5,23 @@ import type { AgentResult } from "../agents/types.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
-const NonBlankString = z.string().min(1).refine((value) => value.trim().length > 0, {
-  message: "Value must not be blank",
-});
+const NonBlankString = z
+  .string()
+  .min(1)
+  .refine((value) => value.trim().length > 0, {
+    message: "Value must not be blank",
+  });
 
 function formatNormalizedResult(result: AgentResult): string[] {
   const details = [`Summary: ${result.summary}`];
   if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
     const finalAnswer = result.finalAnswer.trim();
     details.push(
-      `Final Answer:\n${finalAnswer.length <= MAX_FINAL_ANSWER_CHARS
-        ? finalAnswer
-        : `${finalAnswer.slice(0, MAX_FINAL_ANSWER_CHARS - 3)}...`}`
+      `Final Answer:\n${
+        finalAnswer.length <= MAX_FINAL_ANSWER_CHARS
+          ? finalAnswer
+          : `${finalAnswer.slice(0, MAX_FINAL_ANSWER_CHARS - 3)}...`
+      }`,
     );
   }
   if (result.error) details.push(`Error: ${result.error}`);
@@ -33,11 +38,13 @@ export const DelegateTaskInputSchema = z.object({
     .trim()
     .min(1)
     .optional()
-    .describe("Target agent harness name. When omitted, resolves the assigned role from .agentmesh/config.json"),
+    .describe(
+      "Target agent harness name. When omitted, resolves the assigned role from .agentmesh/config.json",
+    ),
   task: NonBlankString.describe("Task instructions or prompt to execute"),
-  cwd: NonBlankString
-    .optional()
-    .describe("Working directory for the agent execution (defaults to current directory)"),
+  cwd: NonBlankString.optional().describe(
+    "Working directory for the agent execution (defaults to current directory)",
+  ),
   role: z
     .enum(["worker", "reviewer", "tester"])
     .optional()
@@ -53,15 +60,15 @@ export const DelegateTaskInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
-  sessionId: NonBlankString
-    .optional()
-    .describe("Optional bridge session ID to associate or continue"),
-  contextSessionId: NonBlankString
-    .optional()
-    .describe("Optional Bridge session whose normalized history should be shared with this new or existing agent session"),
-  baseCommit: NonBlankString
-    .optional()
-    .describe("Optional git base branch/commit for diff comparison"),
+  sessionId: NonBlankString.optional().describe(
+    "Optional bridge session ID to associate or continue",
+  ),
+  contextSessionId: NonBlankString.optional().describe(
+    "Optional Bridge session whose normalized history should be shared with this new or existing agent session",
+  ),
+  baseCommit: NonBlankString.optional().describe(
+    "Optional git base branch/commit for diff comparison",
+  ),
 });
 
 export const ReviewChangesInputSchema = z.object({
@@ -70,16 +77,18 @@ export const ReviewChangesInputSchema = z.object({
     .trim()
     .min(1)
     .optional()
-    .describe("Target reviewer agent. When omitted, resolves roles.reviewer from .agentmesh/config.json"),
-  task: NonBlankString
-    .optional()
-    .describe("Specific review focus, checklist, or instructions (defaults to standard rigorous review)"),
-  cwd: NonBlankString
-    .optional()
-    .describe("Working directory for review (defaults to current directory)"),
-  baseCommit: NonBlankString
-    .optional()
-    .describe("Base branch/commit to diff against (e.g. 'main', 'HEAD~1')"),
+    .describe(
+      "Target reviewer agent. When omitted, resolves roles.reviewer from .agentmesh/config.json",
+    ),
+  task: NonBlankString.optional().describe(
+    "Specific review focus, checklist, or instructions (defaults to standard rigorous review)",
+  ),
+  cwd: NonBlankString.optional().describe(
+    "Working directory for review (defaults to current directory)",
+  ),
+  baseCommit: NonBlankString.optional().describe(
+    "Base branch/commit to diff against (e.g. 'main', 'HEAD~1')",
+  ),
   mode: z
     .enum(["auto", "mcp", "cli"])
     .optional()
@@ -91,14 +100,15 @@ export const ReviewChangesInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
-  contextSessionId: NonBlankString
-    .optional()
-    .describe("Optional worker/tester Bridge session whose normalized evidence should be shared with the reviewer"),
+  contextSessionId: NonBlankString.optional().describe(
+    "Optional worker/tester Bridge session whose normalized evidence should be shared with the reviewer",
+  ),
 });
 
 export const ContinueTaskInputSchema = z.object({
-  sessionId: NonBlankString
-    .describe("The Bridge session ID returned from a previous delegate_task or review_changes call"),
+  sessionId: NonBlankString.describe(
+    "The Bridge session ID returned from a previous delegate_task or review_changes call",
+  ),
   task: NonBlankString.describe("Follow-up instructions or fix requests to continue the session"),
   mode: z
     .enum(["auto", "mcp", "cli"])
@@ -119,9 +129,9 @@ export const GetSessionInputSchema = z.object({
 });
 
 export const GetRoleConfigInputSchema = z.object({
-  cwd: NonBlankString
-    .optional()
-    .describe("Project directory used to locate the nearest .agentmesh/config.json"),
+  cwd: NonBlankString.optional().describe(
+    "Project directory used to locate the nearest .agentmesh/config.json",
+  ),
 });
 
 export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
@@ -175,7 +185,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           isError: true,
         };
       }
-    }
+    },
   );
 
   server.tool(
@@ -203,7 +213,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           isError: true,
         };
       }
-    }
+    },
   );
 
   // review_changes
@@ -223,8 +233,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           contextSessionId: args.contextSessionId,
         });
 
-        const isError =
-          result.status === "failed" || result.reviewOutcome === "FAIL";
+        const isError = result.status === "failed" || result.reviewOutcome === "FAIL";
 
         const findingsHeader =
           result.findings && result.findings.length > 0
@@ -258,7 +267,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           isError: true,
         };
       }
-    }
+    },
   );
 
   // continue_task
@@ -302,7 +311,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           isError: true,
         };
       }
-    }
+    },
   );
 
   // list_agents
@@ -333,7 +342,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           isError: true,
         };
       }
-    }
+    },
   );
 
   // get_session
@@ -362,6 +371,6 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           },
         ],
       };
-    }
+    },
   );
 }

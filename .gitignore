@@ -18,7 +18,9 @@ coverage/
 
 # IDE & CodeGraph
 .idea/
-.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .codegraph/
 *.swp
 *.swo
@@ -29,3 +31,6 @@ Thumbs.db
 
 # AgentMesh session files
 .agentmesh/
+
+# docs
+docs

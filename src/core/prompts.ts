@@ -7,7 +7,7 @@ import type { SessionHistoryEntry } from "./types.js";
 export function buildRolePrompt(
   task: string,
   role: AgentRole = "worker",
-  context?: { baseCommit?: string; cwd?: string; historyContext?: string }
+  context?: { baseCommit?: string; cwd?: string; historyContext?: string },
 ): string {
   let basePrompt = task;
   if (context?.historyContext && context.historyContext.trim()) {
@@ -30,7 +30,7 @@ export function buildRolePrompt(
  */
 export function buildReviewerPrompt(
   task: string,
-  context?: { baseCommit?: string; cwd?: string }
+  context?: { baseCommit?: string; cwd?: string },
 ): string {
   const diffInstruction = context?.baseCommit
     ? `Compare against git base commit/branch: '${context.baseCommit}'.`
@@ -44,7 +44,8 @@ export function buildReviewerPrompt(
     `Do NOT rely on or assume previous worker summaries are accurate. Verify the actual code directly.`,
     ``,
     `## Specific Review Focus / Context`,
-    task || "Review the latest changes in the repository for correctness, stability, and adherence to requirements.",
+    task ||
+      "Review the latest changes in the repository for correctness, stability, and adherence to requirements.",
     ``,
     `## Instructions & Constraints`,
     `1. ${diffInstruction}`,
@@ -100,7 +101,7 @@ export function buildTesterPrompt(task: string): string {
 export function buildContinuationPrompt(
   task: string,
   history: SessionHistoryEntry[] = [],
-  options?: { nativeSessionId?: string }
+  options?: { nativeSessionId?: string },
 ): string {
   const parts: string[] = [];
   parts.push("# TASK CONTINUATION CONTEXT");
@@ -111,7 +112,9 @@ export function buildContinuationPrompt(
   if (history.length > 0) {
     parts.push("\n## Previous Activity in this Session");
     for (const [idx, h] of history.entries()) {
-      parts.push(`\n### Turn ${idx + 1} [Role: ${h.role.toUpperCase()} | Status: ${h.status.toUpperCase()}]`);
+      parts.push(
+        `\n### Turn ${idx + 1} [Role: ${h.role.toUpperCase()} | Status: ${h.status.toUpperCase()}]`,
+      );
       parts.push(`- Task: ${h.task}`);
       if (h.summary) {
         parts.push(`- Result Summary: ${h.summary}`);
@@ -129,6 +132,8 @@ export function buildContinuationPrompt(
  * Strips ANSI escape sequences from terminal output.
  */
 export function stripAnsi(text: string): string {
+  // ANSI escape sequences necessarily contain the ESC control character.
+  // eslint-disable-next-line no-control-regex
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 }
 
@@ -152,8 +157,10 @@ function matchVerdict(line: string): "PASS" | "FAIL" | undefined {
   }
 
   // Labeled verdicts: Verdict: PASS, Result: **PASS**, Status: FAIL, Outcome: PASS, Review: PASS
-  const labeledPass = /^(?:verdict|result|status|outcome|decision|review(?:\s+verdict|\s+result|\s+outcome)?)\s*:\s*(\*{1,2}|_{1,2})?PASS\b/i;
-  const labeledFail = /^(?:verdict|result|status|outcome|decision|review(?:\s+verdict|\s+result|\s+outcome)?)\s*:\s*(\*{1,2}|_{1,2})?FAIL\b/i;
+  const labeledPass =
+    /^(?:verdict|result|status|outcome|decision|review(?:\s+verdict|\s+result|\s+outcome)?)\s*:\s*(\*{1,2}|_{1,2})?PASS\b/i;
+  const labeledFail =
+    /^(?:verdict|result|status|outcome|decision|review(?:\s+verdict|\s+result|\s+outcome)?)\s*:\s*(\*{1,2}|_{1,2})?FAIL\b/i;
 
   if (labeledPass.test(clean)) return "PASS";
   if (labeledFail.test(clean)) return "FAIL";
@@ -170,7 +177,10 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   }
 
   const cleanOutput = stripAnsi(output).trim();
-  const lines = cleanOutput.split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = cleanOutput
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
   if (lines.length === 0) {
     return { reviewOutcome: "UNKNOWN", findings: [], summary: "Empty review output" };
   }
@@ -195,15 +205,17 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   for (let i = 1; i < findingBlocks.length; i++) {
     const block = findingBlocks[i]!;
     const severityMatch = block.match(/^(critical|high|medium|low)\b/i);
-    const severity = (severityMatch ? severityMatch[1]?.toLowerCase() : "medium") as ReviewFinding["severity"];
+    const severity = (
+      severityMatch ? severityMatch[1]?.toLowerCase() : "medium"
+    ) as ReviewFinding["severity"];
 
     const fileMatch = block.match(/(?:file|path)\s*:\s*([^\r\n]+)/i);
     const lineMatch = block.match(/(?:line|lines)\s*:\s*([^\r\n]+)/i);
     const issueMatch = block.match(
-      /(?:issue|description|finding|problem)\s*:\s*([^\r\n]+(?:\n(?!\s*(?:file|line|suggestion|severity)\s*:)[^\r\n]+)*)/i
+      /(?:issue|description|finding|problem)\s*:\s*([^\r\n]+(?:\n(?!\s*(?:file|line|suggestion|severity)\s*:)[^\r\n]+)*)/i,
     );
     const suggestionMatch = block.match(
-      /(?:suggestion|recommendation|fix)\s*:\s*([^\r\n]+(?:\n(?!\s*(?:file|line|issue|severity)\s*:)[^\r\n]+)*)/i
+      /(?:suggestion|recommendation|fix)\s*:\s*([^\r\n]+(?:\n(?!\s*(?:file|line|issue|severity)\s*:)[^\r\n]+)*)/i,
     );
 
     const file = fileMatch ? fileMatch[1]?.trim() || "unknown" : "unknown";
@@ -254,13 +266,17 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
 export function extractSummary(
   output: string,
   fallback = "Execution completed",
-  role?: AgentRole
+  role?: AgentRole,
 ): string {
   if (!output || !output.trim()) {
     return fallback;
   }
   const cleanOutput = stripAnsi(output);
-  const lines = cleanOutput.trim().split("\n").map((l) => l.trim()).filter(Boolean);
+  const lines = cleanOutput
+    .trim()
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
   if (lines.length === 0) return fallback;
 
   if (role === "reviewer" || role === undefined) {

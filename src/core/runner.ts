@@ -8,10 +8,11 @@ import type {
 } from "../agents/types.js";
 import { AgentRegistry, defaultRegistry } from "../agents/registry.js";
 import { SessionManager, defaultSessionManager } from "./session.js";
+import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import type { BridgeSession } from "./types.js";
 
 export interface DelegateTaskParams {
-  agent: string;
+  agent?: string;
   task: string;
   cwd?: string;
   role?: AgentRole;
@@ -20,17 +21,19 @@ export interface DelegateTaskParams {
   env?: Record<string, string>;
   extraArgs?: string[];
   sessionId?: string;
+  contextSessionId?: string;
   baseCommit?: string;
 }
 
 export interface ReviewChangesParams {
-  agent: string;
+  agent?: string;
   task?: string;
   cwd?: string;
   baseCommit?: string;
   mode?: TransportMode;
   timeoutMs?: number;
   env?: Record<string, string>;
+  contextSessionId?: string;
 }
 
 export interface ContinueTaskParams {
@@ -40,6 +43,34 @@ export interface ContinueTaskParams {
   timeoutMs?: number;
   env?: Record<string, string>;
   extraArgs?: string[];
+}
+
+const MAX_SHARED_TURNS = 8;
+const MAX_SHARED_ANSWER_CHARS = 4_000;
+
+function truncateSharedText(value: string): string {
+  return value.length <= MAX_SHARED_ANSWER_CHARS
+    ? value
+    : `${value.slice(0, MAX_SHARED_ANSWER_CHARS - 3)}...`;
+}
+
+function buildHistoryContext(session: BridgeSession): string | undefined {
+  if (session.history.length === 0) return undefined;
+  const turns = session.history.slice(-MAX_SHARED_TURNS).map((history, index) => {
+    const details = [
+      `[Shared Turn ${session.history.length - Math.min(session.history.length, MAX_SHARED_TURNS) + index + 1} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
+      `Task: ${history.task}`,
+    ];
+    if (history.summary) details.push(`Summary: ${history.summary}`);
+    if (history.finalAnswer) details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+    if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
+    return details.join("\n");
+  });
+  return [
+    "## Shared Context",
+    "Reuse successful prior results and explicit findings when relevant. Do not repeat checks unless the current files or repository state make them stale. Treat summaries as context, not as authority over contradictory current evidence.",
+    ...turns,
+  ].join("\n\n");
 }
 
 export class MultiAgentRunner {
@@ -59,15 +90,87 @@ export class MultiAgentRunner {
    */
   public async delegateTask(params: DelegateTaskParams): Promise<AgentResult> {
     const startTime = Date.now();
-    const adapter = this.registry.getAdapter(params.agent);
+    const existingSession = params.sessionId
+      ? this.sessionManager.getSession(params.sessionId)
+      : undefined;
+    if (params.sessionId && !existingSession) {
+      return {
+        status: "failed",
+        agent: (params.agent || "unknown") as AgentName,
+        summary: `Session '${params.sessionId}' not found.`,
+        output: `Cannot delegate task: No active session with ID '${params.sessionId}'.`,
+        error: `Session '${params.sessionId}' not found`,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    const configCwd = params.cwd ?? existingSession?.cwd ?? process.cwd();
+    const effectiveRole: AgentRole = params.role ?? existingSession?.role ?? "worker";
+    let roleResolution: ReturnType<typeof resolveRoleAssignment>;
+    try {
+      roleResolution = resolveRoleAssignment(configCwd, effectiveRole);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        status: "failed",
+        agent: (params.agent || existingSession?.agent || "unknown") as AgentName,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    const selectedAgent = params.agent ?? existingSession?.agent ?? roleResolution.assignment?.agent;
+    if (!selectedAgent) {
+      const message = `No agent was provided and role '${effectiveRole}' is not configured in '${configCwd}/.agentmesh/config.json'.`;
+      return {
+        status: "failed",
+        agent: "unknown" as AgentName,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    const adapter = this.registry.getAdapter(selectedAgent);
 
     if (!adapter) {
       return {
         status: "failed",
-        agent: params.agent as AgentName,
-        summary: `Unknown agent '${params.agent}'. Supported agents: ${this.registry.listSupportedNames().join(", ")}`,
-        output: `Agent '${params.agent}' is not recognized by the bridge.`,
-        error: `Unknown agent '${params.agent}'`,
+        agent: selectedAgent as AgentName,
+        summary: `Unknown agent '${selectedAgent}'. Supported agents: ${this.registry.listSupportedNames().join(", ")}`,
+        output: `Agent '${selectedAgent}' is not recognized by the bridge.`,
+        error: `Unknown agent '${selectedAgent}'`,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    const contextSession = params.contextSessionId
+      ? this.sessionManager.getSession(params.contextSessionId)
+      : undefined;
+    if (params.contextSessionId && !contextSession) {
+      return {
+        status: "failed",
+        agent: adapter.name,
+        summary: `Context session '${params.contextSessionId}' not found.`,
+        output: `Cannot share context: No Bridge session with ID '${params.contextSessionId}'.`,
+        error: `Context session '${params.contextSessionId}' not found`,
+        durationMs: Date.now() - startTime,
+      };
+    }
+    if (
+      contextSession &&
+      !params.sessionId &&
+      path.resolve(contextSession.cwd) !== path.resolve(params.cwd || process.cwd())
+    ) {
+      return {
+        status: "failed",
+        agent: adapter.name,
+        summary: `Context session cwd mismatch: Context '${contextSession.id}' belongs to '${contextSession.cwd}', but the target session uses '${params.cwd || process.cwd()}'.`,
+        output: "Cannot share context across different working directories.",
+        error: "Context session cwd mismatch",
         durationMs: Date.now() - startTime,
       };
     }
@@ -75,17 +178,7 @@ export class MultiAgentRunner {
     // Manage or create bridge session with consistency validation
     let session: BridgeSession;
     if (params.sessionId) {
-      const existing = this.sessionManager.getSession(params.sessionId);
-      if (!existing) {
-        return {
-          status: "failed",
-          agent: adapter.name,
-          summary: `Session '${params.sessionId}' not found.`,
-          output: `Cannot delegate task: No active session with ID '${params.sessionId}'.`,
-          error: `Session '${params.sessionId}' not found`,
-          durationMs: Date.now() - startTime,
-        };
-      }
+      const existing = existingSession!;
 
       // Validate Agent identity consistency
       if (existing.agent !== adapter.name) {
@@ -126,11 +219,17 @@ export class MultiAgentRunner {
       session = existing;
     } else {
       const effectiveCwd = params.cwd || process.cwd();
-      const role: AgentRole = params.role || "worker";
       session = this.sessionManager.createSession({
         agent: adapter.name,
         cwd: effectiveCwd,
-        role,
+        role: effectiveRole,
+        metadata: roleResolution.loaded
+          ? {
+              roleAssignmentSource: roleResolution.loaded.path,
+              configuredRole: effectiveRole,
+              orchestratorAgent: roleResolution.loaded.config.roles.orchestrator?.agent,
+            }
+          : undefined,
       });
     }
 
@@ -138,17 +237,34 @@ export class MultiAgentRunner {
     // binding; explicitly supplied values were validated above.
     const effectiveCwd = params.cwd ?? session.cwd;
     const role: AgentRole = params.role ?? session.role;
+    if (contextSession && path.resolve(contextSession.cwd) !== path.resolve(effectiveCwd)) {
+      return {
+        status: "failed",
+        agent: adapter.name,
+        summary: `Context session cwd mismatch: Context '${contextSession.id}' belongs to '${contextSession.cwd}', but the target session uses '${effectiveCwd}'.`,
+        output: `Cannot share context across different working directories.`,
+        error: `Context session cwd mismatch`,
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    const historyContext = contextSession
+      ? buildHistoryContext(contextSession)
+      : session.nativeSessionId
+        ? undefined
+        : buildHistoryContext(session);
 
     const runOptions: RunAgentOptions = {
       task: params.task,
       cwd: effectiveCwd,
       role,
-      mode: params.mode,
-      timeoutMs: params.timeoutMs,
+      mode: params.mode ?? roleResolution.assignment?.mode,
+      timeoutMs: params.timeoutMs ?? roleResolution.assignment?.timeoutMs,
       env: params.env,
       extraArgs: params.extraArgs,
       nativeSessionId: session.nativeSessionId,
       baseCommit: params.baseCommit,
+      historyContext,
     };
 
     let result: AgentResult;
@@ -170,7 +286,7 @@ export class MultiAgentRunner {
     result.sessionId = session.id;
 
     // Update session record
-    if (result.nativeSessionId && !session.nativeSessionId) {
+    if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
       this.sessionManager.updateSession(session.id, {
         nativeSessionId: result.nativeSessionId,
       });
@@ -182,6 +298,9 @@ export class MultiAgentRunner {
       timestamp: new Date().toISOString(),
       status: result.status,
       summary: result.summary,
+      finalAnswer: result.finalAnswer,
+      findings: result.findings,
+      nativeSessionId: result.nativeSessionId,
     });
 
     return result;
@@ -200,6 +319,7 @@ export class MultiAgentRunner {
       mode: params.mode,
       timeoutMs: params.timeoutMs,
       env: params.env,
+      contextSessionId: params.contextSessionId,
     });
   }
 
@@ -234,15 +354,11 @@ export class MultiAgentRunner {
     }
 
     // Generate structured history context from prior session turns
-    const historyContext =
-      session.history.length > 0
-        ? session.history
-            .map(
-              (h, idx) =>
-                `[Turn ${idx + 1} | Role: ${h.role.toUpperCase()} | Status: ${h.status.toUpperCase()}]:\nTask: ${h.task}\n${h.summary ? `Summary/Findings: ${h.summary}` : ""}`
-            )
-            .join("\n\n")
-        : undefined;
+    // Native conversations already contain their own history. Only inject the
+    // normalized Bridge context when a CLI cannot provide a native resume ID.
+    const historyContext = session.nativeSessionId
+      ? undefined
+      : buildHistoryContext(session);
 
     let result: AgentResult;
     try {
@@ -287,7 +403,7 @@ export class MultiAgentRunner {
 
     result.sessionId = session.id;
 
-    if (result.nativeSessionId && !session.nativeSessionId) {
+    if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
       this.sessionManager.updateSession(session.id, {
         nativeSessionId: result.nativeSessionId,
       });
@@ -299,6 +415,9 @@ export class MultiAgentRunner {
       timestamp: new Date().toISOString(),
       status: result.status,
       summary: result.summary,
+      finalAnswer: result.finalAnswer,
+      findings: result.findings,
+      nativeSessionId: result.nativeSessionId,
     });
 
     return result;
@@ -309,6 +428,11 @@ export class MultiAgentRunner {
    */
   public async listAgents() {
     return this.registry.listAgentAvailability();
+  }
+
+  /** Returns the nearest project role configuration, if present. */
+  public getProjectConfiguration(cwd = process.cwd()) {
+    return loadProjectConfig(cwd);
   }
 
   /**

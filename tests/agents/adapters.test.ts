@@ -27,11 +27,13 @@ describe("agents/adapters", () => {
     expect(adapter.envBinOverride).toBe("CLAUDE_BIN");
   });
 
-  it("should instantiate AntigravityAdapter with prompt-only sandbox", async () => {
+  it("should report the effective Antigravity reviewer sandbox for this platform", async () => {
     const adapter = new AntigravityAdapter();
     expect(adapter.name).toBe("antigravity");
     expect(adapter.displayName).toContain("Antigravity");
-    expect(adapter.sandboxMechanism).toBe("prompt-only");
+    expect(adapter.sandboxMechanism).toBe(
+      process.platform === "win32" ? "prompt-only" : "native-sandbox"
+    );
     expect(adapter.aliases).toContain("gemini");
     expect(adapter.aliases).toContain("agy");
   });

@@ -20,15 +20,27 @@ function findSessionId(value: unknown, depth = 0): string | undefined {
 export function parseCodexJsonLines(output: string): {
   output: string;
   sessionId?: string;
+  error?: string;
 } {
   let sessionId: string | undefined;
   const messages: string[] = [];
+  let error: string | undefined;
 
   for (const line of output.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line) as Record<string, unknown>;
       sessionId = findSessionId(event) || sessionId;
+      if (event.type === "error" || event.error) {
+        error =
+          typeof event.error === "string"
+            ? event.error
+            : event.error && typeof event.error === "object" && typeof (event.error as Record<string, unknown>).message === "string"
+              ? String((event.error as Record<string, unknown>).message)
+              : typeof event.message === "string"
+                ? event.message
+                : "Codex returned an error event";
+      }
       const item = event.item;
       if (item && typeof item === "object") {
         const record = item as Record<string, unknown>;
@@ -41,7 +53,7 @@ export function parseCodexJsonLines(output: string): {
     }
   }
 
-  return { output: messages.join("\n\n"), sessionId };
+  return { output: messages.join("\n\n"), sessionId, error };
 }
 
 export class CodexAdapter extends BaseAdapter {
@@ -74,6 +86,8 @@ export class CodexAdapter extends BaseAdapter {
         "-c",
         'sandbox_mode="read-only"'
       );
+    } else {
+      mcpArgs.push("-c", 'sandbox_mode="workspace-write"');
     }
 
     const mcpRes = await executeViaMcpClient({
@@ -136,6 +150,7 @@ export class CodexAdapter extends BaseAdapter {
       if (options.nativeSessionId) {
         args.push("resume", options.nativeSessionId);
       }
+      args.push("-c", 'sandbox_mode="workspace-write"');
       args.push("--json");
       if (options.extraArgs && options.extraArgs.length > 0) {
         args.push(...options.extraArgs);
@@ -169,13 +184,19 @@ export class CodexAdapter extends BaseAdapter {
         .join("\n")
         .trim();
       const nativeSessionId = parsed.sessionId || options.nativeSessionId;
+      const stderrSemanticError =
+        !parsed.output && /(?:\bERROR\b|patch rejected|writing is blocked|rejected by user approval)/i.test(res.stderr)
+          ? res.stderr.trim()
+          : undefined;
+      const semanticError = parsed.error || stderrSemanticError;
 
-      if (res.exitCode !== 0) {
+      if (res.exitCode !== 0 || semanticError) {
         return {
           status: "failed",
           agent: this.name,
           output: fullOutput,
-          summary: `Codex exited with code ${res.exitCode}`,
+          summary: semanticError || `Codex exited with code ${res.exitCode}`,
+          error: semanticError,
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
@@ -185,6 +206,7 @@ export class CodexAdapter extends BaseAdapter {
       return this.formatSuccessResult(fullOutput, startTime, {
         nativeSessionId,
         exitCode: res.exitCode,
+        finalAnswer: parsed.output || undefined,
         role,
       });
     } catch (err) {
@@ -209,7 +231,7 @@ export class CodexAdapter extends BaseAdapter {
     return this.parseJsonLines(output).sessionId;
   }
 
-  private parseJsonLines(output: string): { output: string; sessionId?: string } {
+  private parseJsonLines(output: string): { output: string; sessionId?: string; error?: string } {
     return parseCodexJsonLines(output);
   }
 }

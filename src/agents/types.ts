@@ -50,6 +50,8 @@ export interface AgentResult {
   agent: AgentName;
   summary: string;
   output: string;
+  /** Normalized final agent response, excluding CLI logs and transport metadata. */
+  finalAnswer?: string;
   sessionId?: string;
   nativeSessionId?: string;
   exitCode?: number;

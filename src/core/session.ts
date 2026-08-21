@@ -16,12 +16,22 @@ const AgentNameSchema = z.enum([
   "zcode",
 ]);
 const AgentRoleSchema = z.enum(["worker", "reviewer", "tester"]);
+const ReviewFindingSchema = z.object({
+  severity: z.enum(["critical", "high", "medium", "low"]),
+  file: z.string(),
+  line: z.union([z.number(), z.string()]).optional(),
+  issue: z.string(),
+  suggestion: z.string().optional(),
+});
 const SessionHistoryEntrySchema = z.object({
   role: AgentRoleSchema,
   task: z.string(),
   timestamp: z.string().datetime(),
   status: z.enum(["success", "failed"]),
   summary: z.string().optional(),
+  finalAnswer: z.string().optional(),
+  findings: z.array(ReviewFindingSchema).optional(),
+  nativeSessionId: z.string().min(1).optional(),
 });
 const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),

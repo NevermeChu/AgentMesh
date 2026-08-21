@@ -44,6 +44,7 @@ class TestAdapter extends BaseAdapter {
       nativeSessionId: options.nativeSessionId || "native_sess_999",
       exitCode: 0,
       summary: `Task completed: ${options.task}`,
+      finalAnswer: `Executed successfully: ${options.task}`,
       role: options.role,
     });
   }
@@ -95,6 +96,7 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("continue_task");
     expect(toolNames).toContain("list_agents");
     expect(toolNames).toContain("get_session");
+    expect(toolNames).toContain("get_role_config");
   });
 
   it("should execute delegate_task via MCP callTool", async () => {
@@ -112,7 +114,8 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("Status: SUCCESS");
     expect(content[0]?.text).toContain("Summary: Task completed: Implement user registration");
     expect(content[0]?.text).not.toContain("Output:");
-    expect(content[0]?.text).not.toContain("Executed successfully: Implement user registration");
+    expect(content[0]?.text).toContain("Final Answer:");
+    expect(content[0]?.text).toContain("Executed successfully: Implement user registration");
   });
 
   it("should execute review_changes via MCP callTool on PASS", async () => {
@@ -244,5 +247,19 @@ describe("mcp/tools protocol integration", () => {
       arguments: { agent: "codex", task: "Valid task", timeoutMs: -1 },
     });
     expect(invalidTimeout.isError).toBe(true);
+  });
+
+  it("should accept an omitted agent and report a missing project role assignment", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        task: "Use configured worker",
+        role: "worker",
+        cwd: process.cwd(),
+      },
+    });
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("is not configured");
   });
 });

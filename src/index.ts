@@ -57,6 +57,17 @@ export {
 export type { ParsedReviewOutput } from "./core/prompts.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
+export {
+  findProjectConfigPath,
+  loadProjectConfig,
+  resolveRoleAssignment,
+} from "./core/config.js";
+export type {
+  AgentMeshProjectConfig,
+  ConfigurableRole,
+  LoadedProjectConfig,
+  RoleAssignment,
+} from "./core/config.js";
 
 export {
   MultiAgentRunner,

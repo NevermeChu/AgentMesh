@@ -3,6 +3,63 @@ import type { AgentName, AgentResult, RunAgentOptions, SandboxMechanism, Transpo
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
 
+export interface ParsedOpenCodeOutput {
+  output: string;
+  sessionId?: string;
+  error?: string;
+}
+
+function findStringField(value: unknown, keys: ReadonlySet<string>, depth = 0): string | undefined {
+  if (!value || typeof value !== "object" || depth > 6) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const [key, nested] of Object.entries(record)) {
+    if (keys.has(key) && typeof nested === "string" && nested.trim()) return nested;
+  }
+  for (const nested of Object.values(record)) {
+    const found = findStringField(nested, keys, depth + 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
+  const answers: string[] = [];
+  let sessionId: string | undefined;
+  let error: string | undefined;
+  let parsedAny = false;
+
+  for (const line of output.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+    try {
+      const event = JSON.parse(line) as Record<string, unknown>;
+      parsedAny = true;
+      sessionId ||= findStringField(event, new Set(["sessionID", "sessionId", "session_id"]));
+      const type = typeof event.type === "string" ? event.type.toLowerCase() : "";
+      const part = event.part && typeof event.part === "object" ? event.part as Record<string, unknown> : undefined;
+      const text =
+        type === "text" && typeof part?.text === "string"
+          ? part.text
+          : typeof event.result === "string"
+            ? event.result
+            : undefined;
+      if (text?.trim()) answers.push(text.trim());
+      if (type === "error" || event.error) {
+        error =
+          typeof event.error === "string"
+            ? event.error
+            : findStringField(event.error, new Set(["message", "name", "code"])) || "OpenCode returned an error event";
+      }
+    } catch {
+      // Preserve compatibility with older/default output if a CLI emits mixed lines.
+    }
+  }
+
+  return {
+    output: answers.join("\n\n") || (parsedAny ? "" : output.trim()),
+    sessionId,
+    error,
+  };
+}
+
 export class OpenCodeAdapter extends BaseAdapter {
   readonly name: AgentName = "opencode";
   readonly displayName = "OpenCode";
@@ -12,6 +69,20 @@ export class OpenCodeAdapter extends BaseAdapter {
   readonly envBinOverride = "OPENCODE_BIN";
   readonly defaultExecutableName = "opencode";
 
+  public buildCliArgs(options: RunAgentOptions): string[] {
+    const role = options.role ?? "worker";
+    const prompt = buildRolePrompt(options.task, role, {
+      baseCommit: options.baseCommit,
+      cwd: options.cwd,
+      historyContext: options.historyContext,
+    });
+    const args = ["run", prompt, "--format", "json"];
+    if (options.nativeSessionId) args.push("--session", options.nativeSessionId);
+    if (role !== "reviewer") args.push("--auto");
+    if (options.extraArgs && options.extraArgs.length > 0) args.push(...options.extraArgs);
+    return args;
+  }
+
   /**
    * Runs OpenCode CLI (`opencode run <prompt> --auto`).
    */
@@ -19,17 +90,7 @@ export class OpenCodeAdapter extends BaseAdapter {
     const startTime = Date.now();
     const bin = await this.getExecutablePath();
     const role = options.role ?? "worker";
-    const prompt = buildRolePrompt(options.task, role, {
-      baseCommit: options.baseCommit,
-      cwd: options.cwd,
-      historyContext: options.historyContext,
-    });
-
-    const args: string[] = ["run", prompt, "--auto"];
-
-    if (options.extraArgs && options.extraArgs.length > 0) {
-      args.push(...options.extraArgs);
-    }
+    const args = this.buildCliArgs(options);
 
     try {
       const res = await executeCommand(bin, args, {
@@ -38,24 +99,27 @@ export class OpenCodeAdapter extends BaseAdapter {
         timeoutMs: options.timeoutMs,
       });
 
-      const fullOutput = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();
-      const nativeSessionId = this.extractSessionId(fullOutput) || options.nativeSessionId;
+      const parsed = parseOpenCodeJsonLines(res.stdout);
+      const diagnosticOutput = [parsed.output || res.stdout, res.stderr].filter(Boolean).join("\n").trim();
+      const nativeSessionId = parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
-      if (res.exitCode !== 0) {
+      if (res.exitCode !== 0 || parsed.error) {
         return {
           status: "failed",
           agent: this.name,
-          output: fullOutput,
-          summary: `OpenCode exited with code ${res.exitCode}`,
+          output: diagnosticOutput,
+          summary: parsed.error || `OpenCode exited with code ${res.exitCode}`,
+          error: parsed.error,
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
         };
       }
 
-      return this.formatSuccessResult(fullOutput, startTime, {
+      return this.formatSuccessResult(parsed.output || diagnosticOutput, startTime, {
         nativeSessionId,
         exitCode: res.exitCode,
+        finalAnswer: parsed.output || undefined,
         role,
       });
     } catch (err) {

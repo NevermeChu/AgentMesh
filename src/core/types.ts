@@ -1,4 +1,4 @@
-import type { AgentName, AgentRole } from "../agents/types.js";
+import type { AgentName, AgentRole, ReviewFinding } from "../agents/types.js";
 
 export interface SessionHistoryEntry {
   role: AgentRole;
@@ -6,6 +6,9 @@ export interface SessionHistoryEntry {
   timestamp: string;
   status: "success" | "failed";
   summary?: string;
+  finalAnswer?: string;
+  findings?: ReviewFinding[];
+  nativeSessionId?: string;
 }
 
 export interface BridgeSession {
@@ -29,4 +32,3 @@ export interface RunnerOptions {
   defaultTimeoutMs?: number;
   sessionStoragePath?: string;
 }
-

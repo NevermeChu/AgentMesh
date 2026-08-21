@@ -22,3 +22,34 @@ export function parseTimeout(value: string): number {
   }
   return timeout;
 }
+
+export function resolveRunInput(
+  agentOrTask: string,
+  taskParts: string[],
+  explicitAgent?: string
+): { agent?: string; task: string } {
+  if (explicitAgent) {
+    return { agent: explicitAgent, task: [agentOrTask, ...taskParts].join(" ").trim() };
+  }
+  if (taskParts.length > 0) {
+    return { agent: agentOrTask, task: taskParts.join(" ").trim() };
+  }
+  return { task: agentOrTask.trim() };
+}
+
+export function resolveReviewInput(
+  agentOrTask: string | undefined,
+  taskParts: string[],
+  explicitAgent: string | undefined,
+  isKnownAgent: (value: string) => boolean
+): { agent?: string; task?: string } {
+  if (explicitAgent) {
+    const task = [agentOrTask, ...taskParts].filter(Boolean).join(" ").trim();
+    return { agent: explicitAgent, task: task || undefined };
+  }
+  if (agentOrTask && taskParts.length > 0) {
+    return { agent: agentOrTask, task: taskParts.join(" ").trim() || undefined };
+  }
+  if (agentOrTask && isKnownAgent(agentOrTask)) return { agent: agentOrTask };
+  return { task: agentOrTask?.trim() || undefined };
+}

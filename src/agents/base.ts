@@ -152,6 +152,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       nativeSessionId?: string;
       exitCode?: number;
       summary?: string;
+      finalAnswer?: string;
       role?: AgentRole;
     }
   ): AgentResult {
@@ -181,6 +182,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       status,
       agent: this.name,
       output,
+      finalAnswer: options?.finalAnswer,
       summary,
       nativeSessionId: options?.nativeSessionId,
       exitCode: options?.exitCode ?? 0,

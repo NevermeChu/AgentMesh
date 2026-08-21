@@ -22,6 +22,7 @@ export function findClaudeSessionId(value: unknown, depth = 0): string | undefin
 export function parseClaudeJsonOutput(output: string): {
   output: string;
   sessionId?: string;
+  error?: string;
 } {
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
@@ -32,7 +33,24 @@ export function parseClaudeJsonOutput(output: string): {
           ? parsed.sessionId
           : undefined;
     const result = typeof parsed.result === "string" ? parsed.result : output;
-    return { output: result, sessionId };
+    const status = typeof parsed.status === "string" ? parsed.status.toLowerCase() : undefined;
+    const subtype = typeof parsed.subtype === "string" ? parsed.subtype.toLowerCase() : undefined;
+    const explicitError =
+      typeof parsed.error === "string"
+        ? parsed.error
+        : parsed.error && typeof parsed.error === "object" && typeof (parsed.error as Record<string, unknown>).message === "string"
+          ? String((parsed.error as Record<string, unknown>).message)
+          : undefined;
+    const isError =
+      parsed.is_error === true ||
+      status === "error" ||
+      status === "failed" ||
+      subtype?.includes("error") === true;
+    return {
+      output: result,
+      sessionId,
+      error: explicitError || (isError ? result || "Claude returned an error result" : undefined),
+    };
   } catch {
     return { output };
   }
@@ -146,13 +164,20 @@ export class ClaudeAdapter extends BaseAdapter {
         .join("\n")
         .trim();
       const nativeSessionId = parsed.sessionId || options.nativeSessionId;
+      const stderrSemanticError = res.stderr.match(/\[claude-code:([^\]]+)\]\s*(.*)/i);
+      const semanticError =
+        parsed.error ||
+        (stderrSemanticError
+          ? `Claude ${stderrSemanticError[1]}: ${stderrSemanticError[2] || "semantic execution error"}`
+          : undefined);
 
-      if (res.exitCode !== 0) {
+      if (res.exitCode !== 0 || semanticError) {
         return {
           status: "failed",
           agent: this.name,
           output: fullOutput,
-          summary: `Claude exited with code ${res.exitCode}`,
+          summary: semanticError || `Claude exited with code ${res.exitCode}`,
+          error: semanticError,
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
@@ -162,6 +187,7 @@ export class ClaudeAdapter extends BaseAdapter {
       return this.formatSuccessResult(fullOutput, startTime, {
         nativeSessionId,
         exitCode: res.exitCode,
+        finalAnswer: parsed.output,
         role,
       });
     } catch (err) {
@@ -179,7 +205,7 @@ export class ClaudeAdapter extends BaseAdapter {
     }
   }
 
-  private parseJsonOutput(output: string): { output: string; sessionId?: string } {
+  private parseJsonOutput(output: string): { output: string; sessionId?: string; error?: string } {
     return parseClaudeJsonOutput(output);
   }
 

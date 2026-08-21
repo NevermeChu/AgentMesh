@@ -1,36 +1,66 @@
 import { Command } from "commander";
 import { defaultRunner } from "../core/runner.js";
+import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
-import { parseMode, parseRole, parseTimeout } from "./validation.js";
+import {
+  parseMode,
+  parseRole,
+  parseTimeout,
+  resolveReviewInput,
+  resolveRunInput,
+} from "./validation.js";
 
 const program = new Command();
 
 program
   .name("agentmesh")
-  .description("AgentMesh CLI: Multi-agent bridge to delegate tasks and code reviews to vendor Coding Agents")
+  .description("AgentMesh management CLI and stdio MCP server")
   .version("0.1.0");
 
-// Command: run
-program
-  .command("run <agent> <task>")
-  .description("Delegate a task to a designated agent (Codex, Antigravity, Grok, Claude Code, etc.)")
+const debugProgram = program
+  .command("debug")
+  .description(
+    "Direct execution commands for diagnostics only; normal workflows should use the MCP tools",
+  );
+
+// Debug command: run
+debugProgram
+  .command("run <agentOrTask> [task...]")
+  .description("Directly run a task outside an Orchestrator (diagnostics only)")
   .option("-c, --cwd <path>", "Working directory", process.cwd())
-  .option("-r, --role <role>", "Role: worker | reviewer | tester", parseRole, "worker")
-  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode, "auto")
-  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
+  .option("-r, --role <role>", "Role: worker | reviewer | tester", parseRole)
+  .option(
+    "-a, --agent <agent>",
+    "Explicit agent override for project role assignment",
+  )
+  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode)
+  .option(
+    "-t, --timeout <ms>",
+    "Execution timeout in milliseconds",
+    parseTimeout,
+  )
   .option("-s, --session <sessionId>", "Bridge session ID to attach")
+  .option(
+    "--context-session <sessionId>",
+    "Bridge session whose normalized context should be shared",
+  )
   .option("--base <commit>", "Git base branch/commit for diff comparison")
-  .action(async (agent: string, task: string, options) => {
+  .action(async (agentOrTask: string, taskParts: string[], options) => {
     try {
-      console.log(`[AgentMesh] Dispatching to '${agent}' (role: ${options.role}, mode: ${options.mode})...\n`);
+      const input = resolveRunInput(agentOrTask, taskParts, options.agent);
+      const role = options.role || "worker";
+      console.log(
+        `[AgentMesh] Dispatching ${input.agent ? `to '${input.agent}'` : `configured '${role}' role`} (role: ${role}, mode: ${options.mode || "configured/auto"})...\n`,
+      );
       const result = await defaultRunner.delegateTask({
-        agent,
-        task,
+        agent: input.agent,
+        task: input.task,
         cwd: options.cwd,
         role: options.role,
         mode: options.mode,
         timeoutMs: options.timeout,
         sessionId: options.session,
+        contextSessionId: options.contextSession,
         baseCommit: options.base,
       });
 
@@ -47,54 +77,113 @@ program
         process.exit(1);
       }
     } catch (err) {
-      console.error("Execution error:", err instanceof Error ? err.message : String(err));
+      console.error(
+        "Execution error:",
+        err instanceof Error ? err.message : String(err),
+      );
       process.exit(1);
     }
   });
 
-// Command: review
-program
-  .command("review <agent> [task]")
-  .description("Invoke an independent Reviewer agent to inspect code changes and git diff")
+// Debug command: review
+debugProgram
+  .command("review [agentOrTask] [task...]")
+  .description(
+    "Directly run a reviewer outside an Orchestrator (diagnostics only)",
+  )
   .option("-c, --cwd <path>", "Working directory", process.cwd())
+  .option("-a, --agent <agent>", "Explicit reviewer agent override")
   .option("--base <commit>", "Git base branch/commit to diff against")
-  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode, "auto")
-  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
-  .action(async (agent: string, task: string | undefined, options) => {
-    try {
-      console.log(`[AgentMesh] Initiating independent Code Review using '${agent}'...\n`);
-      const result = await defaultRunner.reviewChanges({
-        agent,
-        task,
-        cwd: options.cwd,
-        baseCommit: options.base,
-        mode: options.mode,
-        timeoutMs: options.timeout,
-      });
+  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode)
+  .option(
+    "-t, --timeout <ms>",
+    "Execution timeout in milliseconds",
+    parseTimeout,
+  )
+  .option(
+    "--context-session <sessionId>",
+    "Worker/tester Bridge session whose evidence should be shared",
+  )
+  .action(
+    async (agentOrTask: string | undefined, taskParts: string[], options) => {
+      try {
+        const input = resolveReviewInput(
+          agentOrTask,
+          taskParts,
+          options.agent,
+          (value) => defaultRegistry.resolveName(value) !== undefined,
+        );
+        console.log(
+          `[AgentMesh] Initiating independent Code Review using ${input.agent ? `'${input.agent}'` : "configured reviewer role"}...\n`,
+        );
+        const result = await defaultRunner.reviewChanges({
+          agent: input.agent,
+          task: input.task,
+          cwd: options.cwd,
+          baseCommit: options.base,
+          mode: options.mode,
+          timeoutMs: options.timeout,
+          contextSessionId: options.contextSession,
+        });
 
-      console.log(`----------------------------------------`);
-      console.log(`Reviewer:  ${result.agent}`);
-      console.log(`Status:    ${result.status.toUpperCase()}`);
-      console.log(`Session:   ${result.sessionId}`);
-      console.log(`Summary:   ${result.summary}`);
-      console.log(`----------------------------------------\n`);
-      console.log(result.output);
+        console.log(`----------------------------------------`);
+        console.log(`Reviewer:  ${result.agent}`);
+        console.log(`Status:    ${result.status.toUpperCase()}`);
+        console.log(`Session:   ${result.sessionId}`);
+        console.log(`Summary:   ${result.summary}`);
+        console.log(`----------------------------------------\n`);
+        console.log(result.output);
 
-      if (result.status === "failed") {
+        if (result.status === "failed") {
+          process.exit(1);
+        }
+      } catch (err) {
+        console.error(
+          "Review error:",
+          err instanceof Error ? err.message : String(err),
+        );
         process.exit(1);
       }
-    } catch (err) {
-      console.error("Review error:", err instanceof Error ? err.message : String(err));
-      process.exit(1);
+    },
+  );
+
+program
+  .command("config [cwd]")
+  .description("Show and validate the nearest project .agentmesh/config.json")
+  .action((cwd: string | undefined) => {
+    try {
+      const loaded = defaultRunner.getProjectConfiguration(
+        cwd || process.cwd(),
+      );
+      if (!loaded) {
+        console.error(
+          `No .agentmesh/config.json found for '${cwd || process.cwd()}'.`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      console.log(JSON.stringify(loaded, null, 2));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
     }
   });
 
-// Command: continue
-program
+// Debug command: continue
+debugProgram
   .command("continue <sessionId> <task>")
-  .description("Continue an existing session with follow-up tasks or fix requests")
-  .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode, "auto")
-  .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
+  .description("Directly continue a Bridge session for diagnostics")
+  .option(
+    "-m, --mode <mode>",
+    "Transport mode: auto | mcp | cli",
+    parseMode,
+    "auto",
+  )
+  .option(
+    "-t, --timeout <ms>",
+    "Execution timeout in milliseconds",
+    parseTimeout,
+  )
   .action(async (sessionId: string, task: string, options) => {
     try {
       console.log(`[AgentMesh] Continuing session '${sessionId}'...\n`);
@@ -117,7 +206,10 @@ program
         process.exit(1);
       }
     } catch (err) {
-      console.error("Continue error:", err instanceof Error ? err.message : String(err));
+      console.error(
+        "Continue error:",
+        err instanceof Error ? err.message : String(err),
+      );
       process.exit(1);
     }
   });
@@ -125,17 +217,19 @@ program
 // Command: list
 program
   .command("list")
-  .description("List all supported agents and their availability status on this system")
+  .description(
+    "List all supported agents and their availability status on this system",
+  )
   .action(async () => {
     try {
       const agents = await defaultRunner.listAgents();
       console.log("\nSupported Agent Adapters & System Status:\n");
       console.log(
         "NAME".padEnd(16) +
-        "DISPLAY NAME".padEnd(35) +
-        "STATUS".padEnd(14) +
-        "PREFERRED".padEnd(12) +
-        "PATH / NOTE"
+          "DISPLAY NAME".padEnd(35) +
+          "STATUS".padEnd(14) +
+          "PREFERRED".padEnd(12) +
+          "PATH / NOTE",
       );
       console.log("-".repeat(95));
 
@@ -144,15 +238,20 @@ program
         const pathStr = ag.info.path || ag.info.notes || "Not in PATH";
         console.log(
           ag.name.padEnd(16) +
-          ag.displayName.padEnd(35) +
-          statusStr.padEnd(14) +
-          ag.info.preferredTransport.toUpperCase().padEnd(12) +
-          pathStr
+            ag.displayName.padEnd(35) +
+            statusStr.padEnd(14) +
+            ag.info.preferredTransport.toUpperCase().padEnd(12) +
+            pathStr,
         );
       }
-      console.log("\nTip: You can specify custom binary locations using environment variables (e.g. CODEX_BIN, CLAUDE_BIN, AGY_BIN, GROK_BIN).\n");
+      console.log(
+        "\nTip: You can specify custom binary locations using environment variables (e.g. CODEX_BIN, CLAUDE_BIN, AGY_BIN, GROK_BIN).\n",
+      );
     } catch (err) {
-      console.error("Failed to list agents:", err instanceof Error ? err.message : String(err));
+      console.error(
+        "Failed to list agents:",
+        err instanceof Error ? err.message : String(err),
+      );
       process.exit(1);
     }
   });
@@ -183,26 +282,25 @@ program
     console.log(`\nStored Bridge Sessions (${sessions.length}):\n`);
     console.log(
       "SESSION ID".padEnd(28) +
-      "AGENT".padEnd(14) +
-      "ROLE".padEnd(12) +
-      "TURNS".padEnd(8) +
-      "UPDATED AT".padEnd(26) +
-      "CWD"
+        "AGENT".padEnd(14) +
+        "ROLE".padEnd(12) +
+        "TURNS".padEnd(8) +
+        "UPDATED AT".padEnd(26) +
+        "CWD",
     );
     console.log("-".repeat(100));
     for (const s of sessions) {
       console.log(
         s.id.padEnd(28) +
-        s.agent.padEnd(14) +
-        s.role.padEnd(12) +
-        String(s.history.length).padEnd(8) +
-        s.updatedAt.padEnd(26) +
-        s.cwd
+          s.agent.padEnd(14) +
+          s.role.padEnd(12) +
+          String(s.history.length).padEnd(8) +
+          s.updatedAt.padEnd(26) +
+          s.cwd,
       );
     }
     console.log();
   });
-
 
 // Command: serve (starts MCP server)
 program

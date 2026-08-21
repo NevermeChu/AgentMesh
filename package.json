@@ -12,7 +12,8 @@
     "multi-agent": "./dist/cli/index.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "PROBLEMS.md"
   ],
   "scripts": {
     "build": "tsup",

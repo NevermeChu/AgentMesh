@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it, expect } from "vitest";
 import { CodexAdapter, parseCodexJsonLines } from "../../src/agents/codex.js";
 import {
@@ -5,9 +8,16 @@ import {
   findClaudeSessionId,
   parseClaudeJsonOutput,
 } from "../../src/agents/claude.js";
-import { AntigravityAdapter } from "../../src/agents/antigravity.js";
+import {
+  AntigravityAdapter,
+  findWinGetAntigravityBinary,
+  parseAntigravityJsonOutput,
+} from "../../src/agents/antigravity.js";
 import { GrokAdapter } from "../../src/agents/grok.js";
-import { OpenCodeAdapter } from "../../src/agents/opencode.js";
+import {
+  OpenCodeAdapter,
+  parseOpenCodeJsonLines,
+} from "../../src/agents/opencode.js";
 import { ZCodeAdapter } from "../../src/agents/zcode.js";
 import type { RunAgentOptions } from "../../src/agents/types.js";
 
@@ -78,6 +88,25 @@ describe("agents/args construction", () => {
     delete process.env.AGY_BIN;
   });
 
+  it("should discover Antigravity installed in the WinGet package directory", () => {
+    const localAppData = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-winget-"));
+    try {
+      const packageDir = path.join(
+        localAppData,
+        "Microsoft",
+        "WinGet",
+        "Packages",
+        "Google.AntigravityCLI_Microsoft.Winget.Source_test"
+      );
+      fs.mkdirSync(packageDir, { recursive: true });
+      const binary = path.join(packageDir, "agy.exe");
+      fs.writeFileSync(binary, "test");
+      expect(findWinGetAntigravityBinary(localAppData)).toBe(binary);
+    } finally {
+      fs.rmSync(localAppData, { recursive: true, force: true });
+    }
+  });
+
   it("should configure GrokAdapter binary and environment overrides", async () => {
     process.env.GROK_BIN = "grok-build";
     const adapter = new InspectableGrokAdapter();
@@ -134,6 +163,7 @@ describe("agents/args construction", () => {
     expect(workerArgs[0]).toBe("exec");
     expect(workerArgs).not.toContain("resume");
     expect(workerArgs).toContain("--json");
+    expect(workerArgs).toContain('sandbox_mode="workspace-write"');
 
     const resumeArgs = adapter.buildCliArgs({
       task: "Fix review comments",
@@ -145,6 +175,7 @@ describe("agents/args construction", () => {
     expect(resumeArgs[2]).toBe("native_thread_xyz");
     expect(resumeArgs).not.toContain("--resume");
     expect(resumeArgs).toContain("--json");
+    expect(resumeArgs).toContain('sandbox_mode="workspace-write"');
   });
 
   it("should generate correct Claude CLI args for Reviewer and Worker", () => {
@@ -173,6 +204,40 @@ describe("agents/args construction", () => {
     expect(workerArgs).toContain("--dangerously-skip-permissions");
   });
 
+  it("should generate structured Antigravity args with native resume and reviewer sandbox", () => {
+    const adapter = new AntigravityAdapter();
+    const args = adapter.buildCliArgs({
+      task: "Review changes",
+      role: "reviewer",
+      nativeSessionId: "conversation-12345678",
+    });
+
+    expect(args).toContain("--output-format");
+    expect(args).toContain("json");
+    expect(args).toContain("--conversation");
+    expect(args).toContain("conversation-12345678");
+    if (process.platform === "win32") expect(args).not.toContain("--sandbox");
+    else expect(args).toContain("--sandbox");
+    expect(args).toContain("--dangerously-skip-permissions");
+    expect(args).toContain("plan");
+  });
+
+  it("should generate structured OpenCode args and avoid auto approval for reviewers", () => {
+    const adapter = new OpenCodeAdapter();
+    const reviewerArgs = adapter.buildCliArgs({
+      task: "Review changes",
+      role: "reviewer",
+      nativeSessionId: "ses_12345678",
+    });
+    expect(reviewerArgs).toContain("--format");
+    expect(reviewerArgs).toContain("json");
+    expect(reviewerArgs).toContain("--session");
+    expect(reviewerArgs).toContain("ses_12345678");
+    expect(reviewerArgs).not.toContain("--auto");
+
+    expect(adapter.buildCliArgs({ task: "Implement", role: "worker" })).toContain("--auto");
+  });
+
   it("should parse native session IDs from structured Codex and Claude output", () => {
     const codex = parseCodexJsonLines(
       [
@@ -186,6 +251,11 @@ describe("agents/args construction", () => {
     expect(codex.sessionId).toBe("thread-12345678");
     expect(codex.output).toBe("Implemented safely.");
 
+    const codexError = parseCodexJsonLines(
+      JSON.stringify({ type: "error", message: "workspace write rejected" })
+    );
+    expect(codexError.error).toBe("workspace write rejected");
+
     const claude = parseClaudeJsonOutput(
       JSON.stringify({ session_id: "claude-12345678", result: "Review complete." })
     );
@@ -195,5 +265,43 @@ describe("agents/args construction", () => {
     expect(
       findClaudeSessionId({ content: [{ metadata: { session_id: "claude-mcp-87654321" } }] })
     ).toBe("claude-mcp-87654321");
+  });
+
+  it("should parse normalized Antigravity and OpenCode final answers", () => {
+    const antigravity = parseAntigravityJsonOutput(JSON.stringify({
+      conversation_id: "agy-conversation-12345678",
+      status: "SUCCESS",
+      response: "Implemented safely.\n",
+    }));
+    expect(antigravity.sessionId).toBe("agy-conversation-12345678");
+    expect(antigravity.output).toBe("Implemented safely.");
+    expect(antigravity.error).toBeUndefined();
+
+    const opencode = parseOpenCodeJsonLines([
+      JSON.stringify({ type: "step_start", sessionID: "ses_opencode_12345678" }),
+      JSON.stringify({
+        type: "text",
+        sessionID: "ses_opencode_12345678",
+        part: { type: "text", text: "Implemented safely." },
+      }),
+    ].join("\n"));
+    expect(opencode.sessionId).toBe("ses_opencode_12345678");
+    expect(opencode.output).toBe("Implemented safely.");
+  });
+
+  it("should expose semantic errors from successful JSON transports", () => {
+    const antigravity = parseAntigravityJsonOutput(JSON.stringify({
+      status: "FAILED",
+      message: "Model unavailable",
+      response: "",
+    }));
+    expect(antigravity.error).toBe("Model unavailable");
+
+    const claude = parseClaudeJsonOutput(JSON.stringify({
+      session_id: "claude-12345678",
+      is_error: true,
+      result: "unrecognized model",
+    }));
+    expect(claude.error).toBe("unrecognized model");
   });
 });

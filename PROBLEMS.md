@@ -251,3 +251,23 @@
 **解决方法**：提取 `buildChildEnvironment(cwd, overrides)` 统一构造子进程环境：Windows 上删除非原生的 `PWD`/`OLDPWD`，其他平台把 `PWD` 重写为实际 spawn 目录；CLI 执行器与 MCP client 传输共用该函数。
 
 **状态**：已解决。通过 `env -u PWD` 与默认环境的对照实验定位根因；`buildChildEnvironment` 行为有单元测试，真实 opencode 调用已验证回到目标目录。
+
+## P-026 Codex MCP 工具调用在 Windows 沙箱下挂起导致整轮重跑
+
+**问题**：真实 MCP 编排中，Worker（codex MCP 首选传输）报告成功但耗时 706 秒：rollout 显示 codex 线程 60 秒内就完成了补丁，随后在 `npm test`（sandbox 禁止 Node 创建测试子进程，spawn EPERM）上挂起，MCP 工具调用 600 秒不返回，`auto` 模式降级到 CLI 用原始任务重新执行了一遍并成功。
+
+**根因**：codex MCP 通道内的 exec 在 Windows sandbox 下遇到 spawn EPERM 时挂起而非快速失败（CLI `codex exec` 通道同样报 EPERM 但立即返回错误，agent 可改用 `node --test --test-isolation=none` 绕过）。等待期间无法区分"仍在工作"与"已经挂死"。
+
+**解决方法**：保留 auto 降级作为兜底（本次实际挽救了任务），并记录该平台差异：Windows 上 codex sandbox 会阻止测试子进程创建，测试类任务应优先使用 CLI 传输或提示 agent 使用 `--test-isolation=none`。
+
+**状态**：已缓解。降级链路真实生效；MCP 通道挂起属于 vendor 行为，等待上游修复。
+
+## P-027 Claude 辅助调用的 stderr 诊断被误判为执行失败
+
+**问题**：真实评审中 Claude Reviewer 整体失败，错误为 `unrecognized_model: {"query_source":"generate_session_title"}`，但同一进程的主任务实际成功（`is_error:false`，exit 0，结果完整）。
+
+**根因**：用户级 `~/.claude/settings.json` 将 haiku 类模型映射为代理模型名，会话标题生成等辅助调用失败并在 stderr 输出 `[claude-code:...]` 诊断；适配器把任何该模式行都当作致命语义错误，覆盖了 stdout 中权威的成功 JSON（codex 适配器有"无解析输出才看 stderr"的保护，claude 缺失）。
+
+**解决方法**：结构化输出优先——只有当 stdout 没有解析出有效结果时，才把 `[claude-code:...]` stderr 模式升级为语义错误，与 codex 对齐。
+
+**状态**：已解决。用真实 claude 会话验证主任务成功且辅助诊断不再导致失败；fake-CLI 进程级回归测试覆盖该场景。

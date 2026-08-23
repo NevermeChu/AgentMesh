@@ -41,6 +41,7 @@ export {
   escapeCmdArg,
   buildCmdCommandLine,
   resolveCommandInvocation,
+  buildChildEnvironment,
   ProcessExecutionError,
 } from "./core/executor.js";
 export type { CommandInvocation, ExecutionOptions, ExecutionResult } from "./core/executor.js";

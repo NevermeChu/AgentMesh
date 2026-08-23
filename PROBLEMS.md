@@ -241,3 +241,13 @@
 **解决方法**：`MultiAgentRunner` 接受 `RunnerOptions` 作为第三个构造参数：`defaultTimeoutMs` 缺省 600000ms（`DEFAULT_RUN_TIMEOUT_MS`）作为超时解析的最后一层；`sessionStoragePath` 在未注入 SessionManager 时用于构造持久化管理器。
 
 **状态**：已解决。默认超时与 `RunnerOptions` 覆盖行为均有测试覆盖，README 记录了默认值与覆盖方式。
+
+## P-025 Shell 注入的 PWD 环境变量让子进程在错误仓库执行
+
+**问题**：真实 MCP 编排测试中，Tester（opencode）的 `cwd` 明确指向演示仓库，但它实际在 AgentMesh 自己的仓库里运行了 `npm test` 并报告了错误的绿灯结果；手工在同一目录直接运行 opencode 却正常。
+
+**根因**：从 POSIX shell（如 Git Bash）启动 AgentMesh 时，shell 会向 `process.env` 注入 `PWD`/`OLDPWD`。执行器用 `{...process.env, ...options.env}` 全量继承环境，spawn 的 `cwd` 是目标目录但 env 中的 `PWD` 仍是启动器目录；OpenCode 等 vendor CLI 优先信任 `PWD` 而不是 `process.cwd()`，于是解析到了错误的项目目录。
+
+**解决方法**：提取 `buildChildEnvironment(cwd, overrides)` 统一构造子进程环境：Windows 上删除非原生的 `PWD`/`OLDPWD`，其他平台把 `PWD` 重写为实际 spawn 目录；CLI 执行器与 MCP client 传输共用该函数。
+
+**状态**：已解决。通过 `env -u PWD` 与默认环境的对照实验定位根因；`buildChildEnvironment` 行为有单元测试，真实 opencode 调用已验证回到目标目录。

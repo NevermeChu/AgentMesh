@@ -33,7 +33,7 @@
 
 > 底层 Agent CLI 只需已经安装、可执行并完成各自所需的登录或授权，不需要全部预先启动。AgentMesh 在收到任务后只会按角色配置启动本次使用的 CLI 或原生 MCP Server。
 
-> `mode=auto` 会优先使用适配器的首选传输，并在支持时自动降级；显式指定 `mode=mcp` 或 `mode=cli` 时严格执行该选择，不支持的模式直接返回结构化错误。Windows 上 npm 生成的 `.cmd` CLI shim 会被解析为对应的 Node.js 或包内原生可执行入口，Prompt 不经过 `cmd.exe`；无法安全识别的任意 `.cmd` / `.bat` 会被拒绝。
+> `mode=auto` 会优先使用适配器的首选传输，并在支持时自动降级；显式指定 `mode=mcp` 或 `mode=cli` 时严格执行该选择，不支持的模式直接返回结构化错误。Windows 上 npm 生成的 `.cmd` CLI shim 会被解析为对应的 Node.js 或包内原生可执行入口，Prompt 不经过 `cmd.exe`；无法安全识别的任意 `.cmd` / `.bat` 会被拒绝。子进程环境继承时会移除 Shell 注入的 `PWD`/`OLDPWD`（POSIX 上按 spawn 目录重写 `PWD`），避免信任这些变量的 Agent CLI（如 OpenCode）在错误的项目目录中执行。
 
 ---
 

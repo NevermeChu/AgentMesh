@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { resolveCommandInvocation } from "./executor.js";
+import { resolveCommandInvocation, buildChildEnvironment } from "./executor.js";
 import { VERSION } from "../version.js";
 
 export interface McpClientExecutionOptions {
@@ -34,12 +34,9 @@ export async function executeViaMcpClient(
   const resolvedCwd = options.cwd ? path.resolve(options.cwd) : undefined;
   const invocation = await resolveCommandInvocation(options.command, options.args);
 
-  const cleanEnv: Record<string, string> = {};
-  for (const [key, value] of Object.entries({ ...process.env, ...options.env })) {
-    if (typeof value === "string") {
-      cleanEnv[key] = value;
-    }
-  }
+  // buildChildEnvironment drops shell-injected PWD/OLDPWD so vendor CLIs cannot
+  // resolve a different project directory than the spawned working directory.
+  const cleanEnv = buildChildEnvironment(resolvedCwd, options.env);
 
   const transport = new StdioClientTransport({
     command: invocation.command,

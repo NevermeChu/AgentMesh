@@ -27,6 +27,7 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Shell-injected `PWD`/`OLDPWD` are no longer inherited by spawned agents; vendor CLIs that trust `PWD` over the spawned cwd (observed with OpenCode) previously operated on the wrong repository.
 - MCP `delegate_task` / `continue_task` mark inherited reviewer `FAIL` verdicts as tool errors.
 - Explicit `shell: false` resolves Windows npm shims exactly like the default path, and signal-terminated processes report `128 + signum` exit codes.
 

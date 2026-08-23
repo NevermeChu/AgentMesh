@@ -8,6 +8,7 @@ import {
   escapeCmdArg,
   buildCmdCommandLine,
   resolveCommandInvocation,
+  buildChildEnvironment,
 } from "../../src/core/executor.js";
 
 describe("core/executor", () => {
@@ -145,4 +146,28 @@ describe("core/executor", () => {
       }
     },
   );
+
+  it("drops shell-injected PWD so child CLIs cannot resolve the wrong project", () => {
+    const previousPwd = process.env.PWD;
+    const previousOldPwd = process.env.OLDPWD;
+    const spawnCwd = path.resolve(os.tmpdir(), "agentmesh-target-project");
+    try {
+      process.env.PWD = "D:\\launcher\\directory";
+      process.env.OLDPWD = "D:\\launcher\\previous";
+      const env = buildChildEnvironment(spawnCwd, { TASK_MARKER: "1" });
+
+      expect(env.TASK_MARKER).toBe("1");
+      if (process.platform === "win32") {
+        expect(env.PWD).toBeUndefined();
+        expect(env.OLDPWD).toBeUndefined();
+      } else {
+        expect(env.PWD).toBe(spawnCwd);
+      }
+    } finally {
+      if (previousPwd === undefined) delete process.env.PWD;
+      else process.env.PWD = previousPwd;
+      if (previousOldPwd === undefined) delete process.env.OLDPWD;
+      else process.env.OLDPWD = previousOldPwd;
+    }
+  });
 });

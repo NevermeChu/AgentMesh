@@ -13,7 +13,12 @@ import type { AgentRegistry } from "../agents/registry.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
-import type { BridgeSession, RepositoryStateEvidence, RunnerOptions } from "./types.js";
+import type {
+  BridgeSession,
+  RepositoryStateEvidence,
+  RunnerOptions,
+  SessionHistoryEntry,
+} from "./types.js";
 
 /** Upper bound for one delegated agent process when no timeout is configured anywhere. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
@@ -28,7 +33,10 @@ export interface DelegateTaskParams {
   env?: Record<string, string>;
   extraArgs?: string[];
   sessionId?: string;
+  /** Single source session whose normalized history should be injected (legacy form). */
   contextSessionId?: string;
+  /** Source sessions (max 4) whose normalized history is injected first-hand, in the given order. */
+  contextSessionIds?: string[];
   baseCommit?: string;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
@@ -42,7 +50,10 @@ export interface ReviewChangesParams {
   mode?: TransportMode;
   timeoutMs?: number;
   env?: Record<string, string>;
+  /** Single source session whose normalized history should be injected (legacy form). */
   contextSessionId?: string;
+  /** Source sessions (max 4) whose normalized history is injected first-hand, in the given order. */
+  contextSessionIds?: string[];
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
 }
@@ -54,17 +65,19 @@ export interface ContinueTaskParams {
   timeoutMs?: number;
   env?: Record<string, string>;
   extraArgs?: string[];
+  /** Source sessions (max 4) injected alongside the session's own native resume. */
+  contextSessionIds?: string[];
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
 }
 
 const MAX_SHARED_TURNS = 8;
 const MAX_SHARED_ANSWER_CHARS = 4_000;
+const MAX_SHARED_CONTEXT_CHARS = 24_000;
+const MAX_CONTEXT_SOURCES = 4;
 
-function truncateSharedText(value: string): string {
-  return value.length <= MAX_SHARED_ANSWER_CHARS
-    ? value
-    : `${value.slice(0, MAX_SHARED_ANSWER_CHARS - 3)}...`;
+function truncateSharedText(value: string, maxChars: number = MAX_SHARED_ANSWER_CHARS): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 3)}... [truncated]`;
 }
 
 function formatRepositoryState(evidence: RepositoryStateEvidence): string {
@@ -74,54 +87,108 @@ function formatRepositoryState(evidence: RepositoryStateEvidence): string {
   return `head=${evidence.head || "unborn"}; dirty=${evidence.dirty}; fingerprint=${evidence.fingerprint}${changed}`;
 }
 
-function buildHistoryContext(
+function formatFreshness(
   session: BridgeSession,
+  current: RepositoryStateEvidence | undefined,
+): string {
+  const previous = session.history.at(-1)?.evidence?.repositoryAfter;
+  if (previous && current) {
+    return previous.repositoryRoot === current.repositoryRoot &&
+      previous.fingerprint === current.fingerprint
+      ? "MATCHED: the current working tree matches the last recorded handoff state."
+      : "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence.";
+  }
+  return "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.";
+}
+
+function renderSharedTurn(
+  history: SessionHistoryEntry,
+  session: BridgeSession,
+  turnNumber: number,
+): string {
+  const details = [
+    `[Shared Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
+    `Task: ${history.task}`,
+  ];
+  if (history.summary) details.push(`Summary: ${history.summary}`);
+  if (history.finalAnswer) details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+  if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
+  if (history.evidence?.repositoryBefore) {
+    details.push(`Repository before: ${formatRepositoryState(history.evidence.repositoryBefore)}`);
+  }
+  if (history.evidence?.repositoryAfter) {
+    details.push(`Repository after: ${formatRepositoryState(history.evidence.repositoryAfter)}`);
+  }
+  if (history.evidence) {
+    details.push(
+      `Execution evidence: transport=${history.evidence.transportUsed || "unknown"}; exitCode=${history.evidence.exitCode ?? "unknown"}; durationMs=${history.evidence.durationMs ?? "unknown"}`,
+    );
+  }
+  if (history.reviewerSafety) {
+    details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
+  }
+  return details.join("\n");
+}
+
+function renderSourceBlock(
+  session: BridgeSession,
+  index: number,
+  total: number,
+  budget: number,
+  current: RepositoryStateEvidence | undefined,
+): string {
+  const header = [
+    `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`,
+    `Context freshness: ${formatFreshness(session, current)}`,
+  ].join("\n");
+
+  let turns = session.history.slice(-MAX_SHARED_TURNS);
+  let omittedTurns = session.history.length - turns.length;
+  const render = () =>
+    turns
+      .map((history, offset) =>
+        renderSharedTurn(history, session, session.history.length - turns.length + offset + 1),
+      )
+      .join("\n\n");
+
+  let body = render();
+  // Oldest turns are dropped first so the most recent handoff state survives.
+  while (body.length > budget && turns.length > 1) {
+    turns = turns.slice(1);
+    omittedTurns += 1;
+    body = render();
+  }
+  if (body.length > budget) {
+    body = truncateSharedText(body, budget);
+  }
+  const omissionNote =
+    omittedTurns > 0 ? `[${omittedTurns} older turn(s) omitted within the context budget]` : "";
+  return [header, body, omissionNote].filter(Boolean).join("\n\n");
+}
+
+/**
+ * Renders the normalized history of one or more source sessions as first-hand
+ * shared context, replacing orchestrator-side relay through task text. Each
+ * source keeps its own freshness verdict and a bounded character budget.
+ */
+export function buildSharedContext(
+  sources: BridgeSession[],
   currentRepositoryState?: RepositoryStateEvidence,
 ): string | undefined {
-  if (session.history.length === 0) return undefined;
-  const turns = session.history.slice(-MAX_SHARED_TURNS).map((history, index) => {
-    const details = [
-      `[Shared Turn ${session.history.length - Math.min(session.history.length, MAX_SHARED_TURNS) + index + 1} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
-      `Task: ${history.task}`,
-    ];
-    if (history.summary) details.push(`Summary: ${history.summary}`);
-    if (history.finalAnswer)
-      details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
-    if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
-    if (history.evidence?.repositoryBefore) {
-      details.push(
-        `Repository before: ${formatRepositoryState(history.evidence.repositoryBefore)}`,
-      );
-    }
-    if (history.evidence?.repositoryAfter) {
-      details.push(`Repository after: ${formatRepositoryState(history.evidence.repositoryAfter)}`);
-    }
-    if (history.evidence) {
-      details.push(
-        `Execution evidence: transport=${history.evidence.transportUsed || "unknown"}; exitCode=${history.evidence.exitCode ?? "unknown"}; durationMs=${history.evidence.durationMs ?? "unknown"}`,
-      );
-    }
-    if (history.reviewerSafety) {
-      details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
-    }
-    return details.join("\n");
-  });
-  const previousRepositoryState = session.history.at(-1)?.evidence?.repositoryAfter;
-  const freshness =
-    previousRepositoryState && currentRepositoryState
-      ? previousRepositoryState.repositoryRoot === currentRepositoryState.repositoryRoot &&
-        previousRepositoryState.fingerprint === currentRepositoryState.fingerprint
-        ? "MATCHED: the current working tree matches the last recorded handoff state."
-        : "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence."
-      : "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.";
+  const usable = sources.filter((session) => session.history.length > 0);
+  if (usable.length === 0) return undefined;
+  const perSourceBudget = Math.max(2_000, Math.floor(MAX_SHARED_CONTEXT_CHARS / usable.length));
+  const header =
+    usable.length === 1 ? "## Shared Context" : `## Shared Context (${usable.length} sources)`;
   return [
-    "## Shared Context",
-    `Context freshness: ${freshness}`,
+    header,
+    "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence.",
     currentRepositoryState
       ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
       : "Current repository: unavailable",
-    "Reuse successful prior results and explicit findings only when freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence.",
-    ...turns,
+    ...usable.map((session, index) =>
+      renderSourceBlock(session, index, usable.length, perSourceBudget, currentRepositoryState),
+    ),
   ].join("\n\n");
 }
 
@@ -305,32 +372,52 @@ export class MultiAgentRunner {
       };
     }
 
-    const contextSession = params.contextSessionId
-      ? this.sessionManager.getSession(params.contextSessionId)
-      : undefined;
-    if (params.contextSessionId && !contextSession) {
+    const requestedContextIds = [
+      ...(params.contextSessionIds ?? []),
+      ...(params.contextSessionId ? [params.contextSessionId] : []),
+    ];
+    if (requestedContextIds.length > MAX_CONTEXT_SOURCES) {
+      const message = `At most ${MAX_CONTEXT_SOURCES} context sessions are supported, but ${requestedContextIds.length} were requested.`;
       return {
         status: "failed",
         agent: adapter.name,
-        summary: `Context session '${params.contextSessionId}' not found.`,
-        output: `Cannot share context: No Bridge session with ID '${params.contextSessionId}'.`,
-        error: `Context session '${params.contextSessionId}' not found`,
+        summary: message,
+        output: message,
+        error: message,
         durationMs: Date.now() - startTime,
       };
     }
-    if (
-      contextSession &&
-      !params.sessionId &&
-      path.resolve(contextSession.cwd) !== path.resolve(params.cwd || process.cwd())
-    ) {
-      return {
-        status: "failed",
-        agent: adapter.name,
-        summary: `Context session cwd mismatch: Context '${contextSession.id}' belongs to '${contextSession.cwd}', but the target session uses '${params.cwd || process.cwd()}'.`,
-        output: "Cannot share context across different working directories.",
-        error: "Context session cwd mismatch",
-        durationMs: Date.now() - startTime,
-      };
+    const contextSessions: BridgeSession[] = [];
+    for (const contextId of requestedContextIds) {
+      const found = this.sessionManager.getSession(contextId);
+      if (!found) {
+        return {
+          status: "failed",
+          agent: adapter.name,
+          summary: `Context session '${contextId}' not found.`,
+          output: `Cannot share context: No Bridge session with ID '${contextId}'.`,
+          error: `Context session '${contextId}' not found`,
+          durationMs: Date.now() - startTime,
+        };
+      }
+      // New sessions must be validated before creation so an invalid reference
+      // cannot leave an orphaned session behind.
+      if (
+        !params.sessionId &&
+        path.resolve(found.cwd) !== path.resolve(params.cwd || process.cwd())
+      ) {
+        return {
+          status: "failed",
+          agent: adapter.name,
+          summary: `Context session cwd mismatch: Context '${found.id}' belongs to '${found.cwd}', but the target session uses '${params.cwd || process.cwd()}'.`,
+          output: "Cannot share context across different working directories.",
+          error: "Context session cwd mismatch",
+          durationMs: Date.now() - startTime,
+        };
+      }
+      if (!contextSessions.some((existing) => existing.id === found.id)) {
+        contextSessions.push(found);
+      }
     }
 
     // Manage or create bridge session with consistency validation
@@ -400,23 +487,25 @@ export class MultiAgentRunner {
     // binding; explicitly supplied values were validated above.
     const effectiveCwd = params.cwd ?? session.cwd;
     const role: AgentRole = params.role ?? session.role;
-    if (contextSession && path.resolve(contextSession.cwd) !== path.resolve(effectiveCwd)) {
-      return {
-        status: "failed",
-        agent: adapter.name,
-        summary: `Context session cwd mismatch: Context '${contextSession.id}' belongs to '${contextSession.cwd}', but the target session uses '${effectiveCwd}'.`,
-        output: `Cannot share context across different working directories.`,
-        error: `Context session cwd mismatch`,
-        durationMs: Date.now() - startTime,
-      };
+    for (const source of contextSessions) {
+      if (path.resolve(source.cwd) !== path.resolve(effectiveCwd)) {
+        return {
+          status: "failed",
+          agent: adapter.name,
+          summary: `Context session cwd mismatch: Context '${source.id}' belongs to '${source.cwd}', but the target session uses '${effectiveCwd}'.`,
+          output: "Cannot share context across different working directories.",
+          error: "Context session cwd mismatch",
+          durationMs: Date.now() - startTime,
+        };
+      }
     }
 
     const repositoryBefore = await captureRepositoryState(effectiveCwd);
-    const historyContext = contextSession
-      ? buildHistoryContext(contextSession, repositoryBefore)
-      : session.nativeSessionId
-        ? undefined
-        : buildHistoryContext(session, repositoryBefore);
+    // Native resume covers the target session's OWN history only; explicit
+    // context sources always inject so cross-session facts arrive first-hand.
+    const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
+    const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
+    const historyContext = buildSharedContext(injectionSources, repositoryBefore);
 
     const runOptions: RunAgentOptions = {
       task: params.task,
@@ -486,6 +575,13 @@ export class MultiAgentRunner {
         durationMs: result.durationMs,
       },
       reviewerSafety: result.reviewerSafety,
+      ...(injectionSources.some((source) => source.history.length > 0)
+        ? {
+            contextSources: injectionSources
+              .filter((source) => source.history.length > 0)
+              .map((source) => source.id),
+          }
+        : {}),
     });
 
     return result;
@@ -539,6 +635,49 @@ export class MultiAgentRunner {
       };
     }
 
+    const requestedContextIds = params.contextSessionIds ?? [];
+    if (requestedContextIds.length > MAX_CONTEXT_SOURCES) {
+      const message = `At most ${MAX_CONTEXT_SOURCES} context sessions are supported, but ${requestedContextIds.length} were requested.`;
+      return {
+        status: "failed",
+        agent: session.agent,
+        sessionId: session.id,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+      };
+    }
+    const contextSessions: BridgeSession[] = [];
+    for (const contextId of requestedContextIds) {
+      const found = this.sessionManager.getSession(contextId);
+      if (!found) {
+        return {
+          status: "failed",
+          agent: session.agent,
+          sessionId: session.id,
+          summary: `Context session '${contextId}' not found.`,
+          output: `Cannot share context: No Bridge session with ID '${contextId}'.`,
+          error: `Context session '${contextId}' not found`,
+          durationMs: Date.now() - startTime,
+        };
+      }
+      if (path.resolve(found.cwd) !== path.resolve(session.cwd)) {
+        return {
+          status: "failed",
+          agent: session.agent,
+          sessionId: session.id,
+          summary: `Context session cwd mismatch: Context '${found.id}' belongs to '${found.cwd}', but the target session uses '${session.cwd}'.`,
+          output: "Cannot share context across different working directories.",
+          error: "Context session cwd mismatch",
+          durationMs: Date.now() - startTime,
+        };
+      }
+      if (!contextSessions.some((existing) => existing.id === found.id)) {
+        contextSessions.push(found);
+      }
+    }
+
     const reviewerSafetyPolicy: ReviewerSafetyPolicy | undefined =
       session.role === "reviewer" ? readReviewerSafetyPolicy(session) || "best-effort" : undefined;
     if (reviewerSafetyPolicy === "enforced" && adapter.sandboxMechanism === "prompt-only") {
@@ -559,13 +698,12 @@ export class MultiAgentRunner {
       };
     }
 
-    // Generate structured history context from prior session turns
-    // Native conversations already contain their own history. Only inject the
-    // normalized Bridge context when a CLI cannot provide a native resume ID.
+    // Native resume carries the session's OWN history; explicit context sources
+    // inject alongside it so reviewer/tester feedback arrives first-hand.
     const repositoryBefore = await captureRepositoryState(session.cwd);
-    const historyContext = session.nativeSessionId
-      ? undefined
-      : buildHistoryContext(session, repositoryBefore);
+    const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
+    const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
+    const historyContext = buildSharedContext(injectionSources, repositoryBefore);
 
     let result: AgentResult;
     try {
@@ -647,6 +785,13 @@ export class MultiAgentRunner {
         durationMs: result.durationMs,
       },
       reviewerSafety: result.reviewerSafety,
+      ...(injectionSources.some((source) => source.history.length > 0)
+        ? {
+            contextSources: injectionSources
+              .filter((source) => source.history.length > 0)
+              .map((source) => source.id),
+          }
+        : {}),
     });
 
     return result;

@@ -29,6 +29,8 @@ export interface SessionHistoryEntry {
   nativeSessionId?: string;
   evidence?: SessionExecutionEvidence;
   reviewerSafety?: ReviewerSafetyReport;
+  /** Bridge sessions whose normalized history was injected into this turn's prompt. */
+  contextSources?: string[];
 }
 
 export interface BridgeSession {

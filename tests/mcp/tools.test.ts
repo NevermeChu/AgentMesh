@@ -22,7 +22,10 @@ class TestAdapter extends BaseAdapter {
   readonly envBinOverride = "TEST_CODEX_BIN";
   readonly defaultExecutableName = "node";
 
+  public lastRunOptions?: RunAgentOptions;
+
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+    this.lastRunOptions = options;
     if (options.task.includes("CANCEL_WAIT")) {
       await new Promise<void>((resolve) => {
         if (options.signal?.aborted) return resolve();
@@ -83,11 +86,12 @@ describe("mcp/tools protocol integration", () => {
   let clientTransport: InMemoryTransport;
   let serverTransport: InMemoryTransport;
   let runner: MultiAgentRunner;
+  let adapter: TestAdapter;
 
   beforeEach(async () => {
     const registry = new AgentRegistry();
     const sessionManager = new SessionManager({ persist: false });
-    const adapter = new TestAdapter();
+    adapter = new TestAdapter();
     registry.register(adapter);
     runner = new MultiAgentRunner(registry, sessionManager);
 
@@ -242,6 +246,23 @@ describe("mcp/tools protocol integration", () => {
     expect(res.isError).toBe(true);
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("Review Outcome: FAIL");
+  });
+
+  it("passes multi-source context ids through the MCP boundary", async () => {
+    const sourceRun = await runner.delegateTask({ agent: "codex", task: "Source turn" });
+
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Consume sources over MCP",
+        contextSessionIds: [sourceRun.sessionId!],
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(adapter.lastRunOptions?.historyContext).toContain(sourceRun.sessionId!);
+    expect(adapter.lastRunOptions?.historyContext).toContain("Shared Turn 1");
   });
 
   it("rejects invalid task and timeout inputs at the MCP boundary", async () => {

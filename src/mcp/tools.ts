@@ -125,8 +125,16 @@ export const DelegateTaskInputSchema = z.object({
     "Optional bridge session ID to associate or continue",
   ),
   contextSessionId: NonBlankString.optional().describe(
-    "Optional Bridge session whose normalized history should be shared with this new or existing agent session",
+    "Optional Bridge session whose normalized history should be shared with this new or existing agent session (legacy single-source form)",
   ),
+  contextSessionIds: z
+    .array(NonBlankString)
+    .min(1)
+    .max(4)
+    .optional()
+    .describe(
+      "Up to 4 Bridge sessions whose normalized history is injected first-hand in the given order, replacing relay through task text",
+    ),
   baseCommit: NonBlankString.optional().describe(
     "Optional git base branch/commit for diff comparison",
   ),
@@ -162,8 +170,16 @@ export const ReviewChangesInputSchema = z.object({
     .optional()
     .describe("Execution timeout in milliseconds"),
   contextSessionId: NonBlankString.optional().describe(
-    "Optional worker/tester Bridge session whose normalized evidence should be shared with the reviewer",
+    "Optional worker/tester Bridge session whose normalized evidence should be shared with the reviewer (legacy single-source form)",
   ),
+  contextSessionIds: z
+    .array(NonBlankString)
+    .min(1)
+    .max(4)
+    .optional()
+    .describe(
+      "Up to 4 Bridge sessions (e.g. worker and tester) injected first-hand so the reviewer reads their conclusions without relay",
+    ),
 });
 
 export const ContinueTaskInputSchema = z.object({
@@ -183,6 +199,14 @@ export const ContinueTaskInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
+  contextSessionIds: z
+    .array(NonBlankString)
+    .min(1)
+    .max(4)
+    .optional()
+    .describe(
+      "Up to 4 Bridge sessions (e.g. reviewer and tester) injected alongside the session's own native resume",
+    ),
 });
 
 export const GetSessionInputSchema = z.object({
@@ -213,6 +237,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             timeoutMs: args.timeoutMs,
             sessionId: args.sessionId,
             contextSessionId: args.contextSessionId,
+            contextSessionIds: args.contextSessionIds,
             baseCommit: args.baseCommit,
             signal: extra.signal,
           }),
@@ -296,6 +321,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             mode: args.mode,
             timeoutMs: args.timeoutMs,
             contextSessionId: args.contextSessionId,
+            contextSessionIds: args.contextSessionIds,
             signal: extra.signal,
           }),
         );
@@ -350,6 +376,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             task: args.task,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
+            contextSessionIds: args.contextSessionIds,
             signal: extra.signal,
           }),
         );

@@ -145,13 +145,13 @@ Orchestrator 调用 `delegate_task` / `review_changes` 时省略 `agent`，Agent
 
 1. **`delegate_task`**
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
-   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionId` (可选，用于共享另一个 Bridge Session 的规范化历史), `baseCommit` (可选)。
+   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选)。
 2. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果。
-   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionId` (可选，用于继承一个 Worker/Tester Bridge Session 的规范化上下文)。
+   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式)。
 3. **`continue_task`**
-   - 继续已有会话（Session Resume）。
-   - 参数：`sessionId` (必填), `task` (必填), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
+   - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
+   - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
 4. **`list_agents`**
    - 查询所有支持的 Agent 及其在当前系统中的安装状态。
    - 无参数。
@@ -185,14 +185,16 @@ Orchestrator 调用 `delegate_task` / `review_changes` 时省略 `agent`，Agent
 
 ```text
 delegate_task(role=worker) → 返回 Worker Session
-review_changes(contextSessionId=Worker Session) → 独立审查
-delegate_task(role=tester, contextSessionId=Reviewer Session) → 测试验证
-continue_task(Worker Session, task=Orchestrator 整理的审查/测试反馈) → 原 Worker 会话修复
+review_changes(contextSessionIds=[Worker Session]) → 独立审查
+delegate_task(role=tester, contextSessionIds=[Worker Session, Reviewer Session]) → 测试验证
+continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Session], task=修复要求) → 原 Worker 会话一手接收全部反馈
 ```
 
-这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机。`contextSessionId` 一次引用一个 Bridge Session，并把该 Session 的规范化历史注入目标角色；它不会合并所有会话，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
+这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。
+`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
 
 ### 长任务超时
 

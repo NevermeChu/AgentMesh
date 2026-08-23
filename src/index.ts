@@ -76,6 +76,7 @@ export {
   AgentMeshRunner,
   defaultRunner,
   DEFAULT_RUN_TIMEOUT_MS,
+  buildSharedContext,
 } from "./core/runner.js";
 export type { DelegateTaskParams, ReviewChangesParams, ContinueTaskParams } from "./core/runner.js";
 

@@ -18,6 +18,7 @@ interface RunCommandOptions {
   agent?: string;
   base?: string;
   contextSession?: string;
+  contextSessions?: string[];
   cwd: string;
   mode?: TransportMode;
   role?: AgentRole;
@@ -29,12 +30,14 @@ interface ReviewCommandOptions {
   agent?: string;
   base?: string;
   contextSession?: string;
+  contextSessions?: string[];
   cwd: string;
   mode?: TransportMode;
   timeout?: number;
 }
 
 interface ContinueCommandOptions {
+  contextSessions?: string[];
   mode: TransportMode;
   timeout?: number;
 }
@@ -64,6 +67,10 @@ debugProgram
     "--context-session <sessionId>",
     "Bridge session whose normalized context should be shared",
   )
+  .option(
+    "--context-sessions <sessionIds...>",
+    "Up to 4 Bridge sessions injected first-hand, in the given order",
+  )
   .option("--base <commit>", "Git base branch/commit for diff comparison")
   .action(async (agentOrTask: string, taskParts: string[], options: RunCommandOptions) => {
     try {
@@ -81,6 +88,7 @@ debugProgram
         timeoutMs: options.timeout,
         sessionId: options.session,
         contextSessionId: options.contextSession,
+        contextSessionIds: options.contextSessions,
         baseCommit: options.base,
       });
 
@@ -115,6 +123,10 @@ debugProgram
     "--context-session <sessionId>",
     "Worker/tester Bridge session whose evidence should be shared",
   )
+  .option(
+    "--context-sessions <sessionIds...>",
+    "Up to 4 Bridge sessions injected first-hand, in the given order",
+  )
   .action(
     async (agentOrTask: string | undefined, taskParts: string[], options: ReviewCommandOptions) => {
       try {
@@ -135,6 +147,7 @@ debugProgram
           mode: options.mode,
           timeoutMs: options.timeout,
           contextSessionId: options.contextSession,
+          contextSessionIds: options.contextSessions,
         });
 
         console.log(`----------------------------------------`);
@@ -179,6 +192,10 @@ debugProgram
   .description("Directly continue a Bridge session for diagnostics")
   .option("-m, --mode <mode>", "Transport mode: auto | mcp | cli", parseMode, "auto")
   .option("-t, --timeout <ms>", "Execution timeout in milliseconds", parseTimeout)
+  .option(
+    "--context-sessions <sessionIds...>",
+    "Up to 4 Bridge sessions injected alongside this session's own history",
+  )
   .action(async (sessionId: string, task: string, options: ContinueCommandOptions) => {
     try {
       console.log(`[AgentMesh] Continuing session '${sessionId}'...\n`);
@@ -187,6 +204,7 @@ debugProgram
         task,
         mode: options.mode,
         timeoutMs: options.timeout,
+        contextSessionIds: options.contextSessions,
       });
 
       console.log(`----------------------------------------`);

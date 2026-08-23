@@ -14,6 +14,7 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - Quarantining of corrupt session storage: an invalid `sessions.json` is renamed to `*.corrupt-<timestamp>` and replaced with an empty state instead of failing every command.
 - End-to-end cancellation: MCP client timeouts, cancellations, and disconnects now abort the underlying agent process tree (`AbortSignal` threaded from tool handlers through the runner, adapters, executor, and MCP client), record the turn as failed history with full evidence, and never trigger the auto CLI fallback. `ExecutionResult` gains an optional `aborted` flag.
 - MCP tool responses include a bounded `Raw Output` section (8000 chars) with vendor CLI stdout/stderr so remote failures remain diagnosable.
+- Multi-source context injection: `contextSessionIds` (up to 4) on `delegate_task`, `review_changes`, and `continue_task` injects several sessions' normalized history first-hand with per-source `MATCHED`/`STALE`/`UNKNOWN` freshness, a global 24k character budget with explicit `[truncated]` markers, and a `contextSources` record on each history entry. `continue_task` now accepts context sources alongside the session's own native resume, and an explicit context source no longer suppresses the target session's own bridge history when it has no native session to resume.
 
 ### Changed
 

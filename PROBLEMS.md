@@ -291,3 +291,13 @@
 **解决方法**：响应在 Summary 与 Final Answer 之外增加 `Raw Output` 段：内容为 vendor 原始输出，截断到 8000 字符；与最终回答一致时省略，避免重复。
 
 **状态**：已解决。协议测试覆盖 Raw Output 的出现与省略两种情形。
+
+## P-030 单源上下文引用迫使 Orchestrator 链式转述
+
+**问题**：真实编排中 Reviewer 同时需要 Worker 与 Tester 的结论，但 `contextSessionId` 一次只能引用一个会话，`continue_task` 更是没有任何上下文参数——Orchestrator 只能把 Tester 的响应文本粘贴进任务描述，经 Worker 摘要二次转述后才被 Reviewer 读到，每一层转述都是有损压缩，且各层还叠加 MCP 响应截断（Final Answer 12000 / Raw Output 8000 字符）。
+
+**根因**：注入机制按"单会话"设计（`buildHistoryContext` 只接受一个 session）；"有原生 Session ID 就完全不注入"的二选一规则在反馈回流场景下把跨会话事实挡在门外——原生续接只覆盖会话自身的历史，从不覆盖其他会话的反馈，两者本应正交。
+
+**解决方法**：`contextSessionIds`（最多 4 个，按给定顺序）在 `delegate_task` / `review_changes` / `continue_task` 上多源一手注入：每个来源渲染为带 Session ID/Agent/轮数标签的独立块并各自计算 MATCHED/STALE/UNKNOWN 新鲜度；全局 24k 字符预算按源均分，超限先丢较旧轮次并显式标注 `[truncated]`；实际注入的来源记入历史条目的 `contextSources` 字段。注入规则改为"原生续接只免除自会话历史，显式来源照常注入"。`contextSessionId` 保留为单源兼容形式，超出 4 个或引用不存在的会话整体 fail-fast。
+
+**状态**：已解决。多源注入内容与顺序、独立新鲜度、截断标记、continue 与原生续接并存、超限与缺失引用的 fail-fast、单参数兼容与 MCP 边界透传均有测试覆盖。

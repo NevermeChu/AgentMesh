@@ -530,6 +530,111 @@ describe("core/runner", () => {
     expect(mock.lastRunOptions?.signal).toBe(controller.signal);
   });
 
+  function seededSession(agent: AgentName, role: "worker" | "reviewer" | "tester", task: string) {
+    const created = sessionManager.createSession({
+      agent,
+      cwd: process.cwd(),
+      role,
+    });
+    sessionManager.addHistory(created.id, {
+      role,
+      task,
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: `Summary for ${task}`,
+      finalAnswer: `Final answer for ${task}`,
+    });
+    return sessionManager.getSession(created.id)!;
+  }
+
+  it("injects multiple context sources first-hand with per-source freshness", async () => {
+    const workerSource = seededSession("codex", "worker", "Worker implemented the feature");
+    const testerSource = seededSession("claude", "tester", "Tester ran the suite");
+
+    const result = await runner.delegateTask({
+      agent: "codex",
+      task: "Consume two sources",
+      contextSessionIds: [workerSource.id, testerSource.id],
+    });
+
+    expect(result.status).toBe("success");
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain("## Shared Context (2 sources)");
+    expect(context).toContain(`### Source 1 of 2 [Session: ${workerSource.id}`);
+    expect(context).toContain(`### Source 2 of 2 [Session: ${testerSource.id}`);
+    expect(context.match(/Context freshness:/g)?.length).toBe(2);
+    expect(context.indexOf(workerSource.id)).toBeLessThan(context.indexOf(testerSource.id));
+
+    const target = runner.getSession(result.sessionId!)!;
+    expect(target.history[0]?.contextSources).toEqual([workerSource.id, testerSource.id]);
+  });
+
+  it("fails fast when one of several context sessions is missing", async () => {
+    const source = seededSession("codex", "worker", "Valid source");
+    const res = await runner.delegateTask({
+      agent: "codex",
+      task: "Invalid reference",
+      contextSessionIds: [source.id, "bridge-sess_missing"],
+    });
+
+    expect(res.status).toBe("failed");
+    expect(res.summary).toContain("Context session 'bridge-sess_missing' not found");
+  });
+
+  it("rejects more context sources than supported", async () => {
+    const source = seededSession("codex", "worker", "Valid source");
+    const res = await runner.delegateTask({
+      agent: "codex",
+      task: "Too many sources",
+      contextSessionIds: [source.id, source.id, source.id, source.id, source.id],
+    });
+
+    expect(res.status).toBe("failed");
+    expect(res.summary).toContain("At most 4 context sessions");
+  });
+
+  it("continues with injected sources alongside a native resume", async () => {
+    const first = await runner.delegateTask({ agent: "codex", task: "Initial feature" });
+    const reviewerSource = seededSession("claude", "reviewer", "Review found edge cases");
+
+    await runner.continueTask({
+      sessionId: first.sessionId!,
+      task: "Apply reviewer feedback",
+      contextSessionIds: [reviewerSource.id],
+    });
+
+    // The worker session has a native id, so only the reviewer source injects.
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain(reviewerSource.id);
+    expect(context).not.toContain("Initial feature");
+    const session = runner.getSession(first.sessionId!)!;
+    expect(session.history.at(-1)?.contextSources).toEqual([reviewerSource.id]);
+  });
+
+  it("marks truncated shared answers explicitly", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Long report",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "Long",
+      finalAnswer: "x".repeat(5_000),
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume long source",
+      contextSessionId: created.id,
+    });
+
+    expect(mock.lastRunOptions?.historyContext).toContain("[truncated]");
+  });
+
   it("honors RunnerOptions timeout and session storage overrides", async () => {
     const sessionStoragePath = path.join(
       os.tmpdir(),

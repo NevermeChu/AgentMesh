@@ -58,6 +58,7 @@ const SessionHistoryEntrySchema = z.object({
   nativeSessionId: z.string().min(1).optional(),
   evidence: SessionExecutionEvidenceSchema.optional(),
   reviewerSafety: ReviewerSafetyReportSchema.optional(),
+  contextSources: z.array(z.string()).optional(),
 });
 const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),

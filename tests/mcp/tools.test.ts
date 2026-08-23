@@ -23,6 +23,28 @@ class TestAdapter extends BaseAdapter {
   readonly defaultExecutableName = "node";
 
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+    if (options.task.includes("CANCEL_WAIT")) {
+      await new Promise<void>((resolve) => {
+        if (options.signal?.aborted) return resolve();
+        options.signal?.addEventListener("abort", () => resolve(), { once: true });
+        setTimeout(resolve, 15_000);
+      });
+      return this.formatSuccessResult("Finished after cancellation", Date.now(), {
+        nativeSessionId: "native_cancel",
+        exitCode: 0,
+        summary: "Completed",
+        role: options.role,
+      });
+    }
+    if (options.task.includes("RAW_OUTPUT_TRIGGER")) {
+      return this.formatSuccessResult("vendor log line A\nvendor log line B", Date.now(), {
+        nativeSessionId: "native_raw",
+        exitCode: 0,
+        summary: "Task completed: RAW_OUTPUT_TRIGGER",
+        finalAnswer: "Clean final answer",
+        role: options.role,
+      });
+    }
     if (options.role === "reviewer") {
       if (options.task.includes("UNKNOWN_TRIGGER")) {
         return this.formatSuccessResult("Review finished without a verdict.", Date.now(), {
@@ -112,7 +134,8 @@ describe("mcp/tools protocol integration", () => {
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("Status: SUCCESS");
     expect(content[0]?.text).toContain("Summary: Task completed: Implement user registration");
-    expect(content[0]?.text).not.toContain("Output:");
+    // Output equals the final answer here, so no separate Raw Output section is added.
+    expect(content[0]?.text).not.toContain("Raw Output:");
     expect(content[0]?.text).toContain("Final Answer:");
     expect(content[0]?.text).toContain("Executed successfully: Implement user registration");
   });
@@ -233,6 +256,45 @@ describe("mcp/tools protocol integration", () => {
       arguments: { agent: "codex", task: "Valid task", timeoutMs: -1 },
     });
     expect(invalidTimeout.isError).toBe(true);
+  });
+
+  it("includes bounded vendor raw output for remote diagnostics", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: { agent: "codex", task: "RAW_OUTPUT_TRIGGER", role: "worker" },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("Final Answer:\nClean final answer");
+    expect(content[0]?.text).toContain("Raw Output:\nvendor log line A");
+  });
+
+  it("records a cancelled turn as failed history instead of losing it", async () => {
+    const callPromise = client
+      .callTool({
+        name: "delegate_task",
+        arguments: { agent: "codex", task: "CANCEL_WAIT slow task" },
+        _meta: { progressToken: "cancel-test" },
+      })
+      .catch(() => "connection closed");
+
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    await clientTransport.close();
+    await callPromise;
+
+    for (let attempt = 0; attempt < 50; attempt++) {
+      const target = runner
+        .listSessions()
+        .find((session) => session.history.some((turn) => turn.task.includes("CANCEL_WAIT")));
+      if (target) {
+        const turn = target.history.find((entry) => entry.task.includes("CANCEL_WAIT"));
+        expect(turn?.status).toBe("failed");
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("cancelled turn was never recorded in session history");
   });
 
   it("reports a missing project role assignment when agent is omitted", async () => {

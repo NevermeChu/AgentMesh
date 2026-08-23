@@ -134,6 +134,7 @@ export class CodexAdapter extends BaseAdapter {
       timeoutMs: options.timeoutMs,
       toolName: toolCall.toolName,
       toolArguments: toolCall.toolArguments,
+      signal: options.signal,
     });
 
     const nativeSessionId =
@@ -207,6 +208,7 @@ export class CodexAdapter extends BaseAdapter {
         cwd: options.cwd,
         env: options.env,
         timeoutMs: options.timeoutMs,
+        signal: options.signal,
       });
 
       const parsed = this.parseJsonLines(res.stdout);

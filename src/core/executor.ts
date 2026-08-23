@@ -1,4 +1,4 @@
-import { spawn, type SpawnOptions } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -8,6 +8,8 @@ export interface ExecutionOptions {
   timeoutMs?: number;
   input?: string;
   shell?: boolean;
+  /** Aborts the run: the process tree is terminated and the result resolves with `aborted: true`. */
+  signal?: AbortSignal;
 }
 
 export interface ExecutionResult {
@@ -16,6 +18,7 @@ export interface ExecutionResult {
   exitCode: number;
   durationMs: number;
   timedOut: boolean;
+  aborted?: boolean;
 }
 
 export interface CommandInvocation {
@@ -294,11 +297,54 @@ export async function executeCommand(
     const readStderr = () => Buffer.concat(stderrChunks).toString("utf8");
     let isSettled = false;
     let timedOut = false;
+    let aborted = false;
     let timer: NodeJS.Timeout | null = null;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let hardSettleTimer: NodeJS.Timeout | null = null;
 
-    let childProcess;
+    const clearTimers = () => {
+      if (timer) clearTimeout(timer);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      if (hardSettleTimer) clearTimeout(hardSettleTimer);
+    };
+    const terminateProcessTree = () => {
+      try {
+        if (isWindows && childProcess.pid) {
+          // Windows kill task tree cleanly
+          spawn("taskkill", ["/pid", childProcess.pid.toString(), "/T", "/F"], {
+            shell: false,
+            stdio: "ignore",
+          });
+        } else {
+          childProcess.kill("SIGTERM");
+        }
+      } catch {
+        // ignore kill errors
+      }
+      forceKillTimer = setTimeout(() => {
+        if (isSettled) return;
+        try {
+          childProcess.kill("SIGKILL");
+        } catch {
+          // The hard-settle timer below still bounds the caller's wait.
+        }
+      }, 1_000);
+      hardSettleTimer = setTimeout(() => {
+        if (isSettled) return;
+        isSettled = true;
+        clearTimers();
+        resolve({
+          stdout: readStdout(),
+          stderr: readStderr(),
+          exitCode: 124,
+          durationMs: Date.now() - startTime,
+          timedOut,
+          aborted,
+        });
+      }, 3_000);
+    };
+
+    let childProcess: ChildProcess;
     try {
       childProcess = spawn(actualCmd, actualArgs, spawnOptions);
     } catch (err) {
@@ -323,43 +369,25 @@ export async function executeCommand(
       }
     }
 
+    if (options.signal?.aborted) {
+      aborted = true;
+      terminateProcessTree();
+    } else {
+      options.signal?.addEventListener(
+        "abort",
+        () => {
+          if (isSettled) return;
+          aborted = true;
+          terminateProcessTree();
+        },
+        { once: true },
+      );
+    }
+
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        try {
-          if (isWindows && childProcess.pid) {
-            // Windows kill task tree cleanly
-            spawn("taskkill", ["/pid", childProcess.pid.toString(), "/T", "/F"], {
-              shell: false,
-              stdio: "ignore",
-            });
-          } else {
-            childProcess.kill("SIGTERM");
-          }
-        } catch {
-          // ignore kill errors
-        }
-
-        forceKillTimer = setTimeout(() => {
-          if (isSettled) return;
-          try {
-            childProcess.kill("SIGKILL");
-          } catch {
-            // The hard-settle timer below still bounds the caller's wait.
-          }
-        }, 1_000);
-
-        hardSettleTimer = setTimeout(() => {
-          if (isSettled) return;
-          isSettled = true;
-          resolve({
-            stdout: readStdout(),
-            stderr: readStderr(),
-            exitCode: 124,
-            durationMs: Date.now() - startTime,
-            timedOut: true,
-          });
-        }, 3_000);
+        terminateProcessTree();
       }, timeoutMs);
     }
 
@@ -374,9 +402,7 @@ export async function executeCommand(
     childProcess.on("error", (err: Error) => {
       if (isSettled) return;
       isSettled = true;
-      if (timer) clearTimeout(timer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (hardSettleTimer) clearTimeout(hardSettleTimer);
+      clearTimers();
       reject(
         new ProcessExecutionError(`Process '${command}' encountered error: ${err.message}`, {
           exitCode: 1,
@@ -390,9 +416,7 @@ export async function executeCommand(
     childProcess.on("close", (code: number | null, signal: string | null) => {
       if (isSettled) return;
       isSettled = true;
-      if (timer) clearTimeout(timer);
-      if (forceKillTimer) clearTimeout(forceKillTimer);
-      if (hardSettleTimer) clearTimeout(hardSettleTimer);
+      clearTimers();
       const durationMs = Date.now() - startTime;
       const exitCode = timedOut
         ? 124
@@ -408,6 +432,7 @@ export async function executeCommand(
         exitCode,
         durationMs,
         timedOut,
+        aborted,
       });
     });
   });

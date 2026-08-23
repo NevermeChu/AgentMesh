@@ -76,6 +76,20 @@ export abstract class BaseAdapter implements AgentAdapter {
    * Main entry point for executing a task with the agent.
    */
   public async run(options: RunAgentOptions): Promise<AgentResult> {
+    const result = await this.runUnchecked(options);
+    if (!options.signal?.aborted) return result;
+    // The client cancelled mid-run; surface that instead of a bare exit code and
+    // never let a cancelled run report success.
+    const note = "Run cancelled by the requesting client.";
+    return {
+      ...result,
+      status: "failed",
+      summary: `${result.summary} (${note})`,
+      error: result.error ? `${result.error}; ${note}` : note,
+    };
+  }
+
+  private async runUnchecked(options: RunAgentOptions): Promise<AgentResult> {
     const startTime = Date.now();
     const mode = options.mode || "auto";
 
@@ -111,8 +125,9 @@ export abstract class BaseAdapter implements AgentAdapter {
           durationMs: Date.now() - startTime,
         };
       } catch (err) {
-        // If mode is 'auto', fall back gracefully to CLI
-        if (mode === "auto" && this.supportedModes.includes("cli")) {
+        // If mode is 'auto', fall back gracefully to CLI — unless the caller
+        // cancelled, in which case re-running the task would ignore the cancel.
+        if (mode === "auto" && this.supportedModes.includes("cli") && !options.signal?.aborted) {
           try {
             const fallbackRes = await this.runViaCli(options);
             return {
@@ -154,6 +169,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       extraArgs: options.extraArgs,
       nativeSessionId: options.nativeSessionId,
       historyContext: options.historyContext,
+      signal: options.signal,
     });
   }
 

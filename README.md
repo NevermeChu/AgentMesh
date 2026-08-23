@@ -215,6 +215,16 @@ await client.callTool(params, undefined, {
 });
 ```
 
+> **注意**：请只通过 `onprogress` 回调接收进度。不要再额外调用 `setNotificationHandler(ProgressNotificationSchema, ...)` 注册全局进度处理器——在实测的 TS SDK 行为中，全局处理器会接管进度路由，`onprogress` 不再触发，`resetTimeoutOnProgress` 也随之失效，客户端会在基础超时处误判请求超时。
+
+### 客户端取消与断连
+
+MCP 客户端超时、发送取消通知或直接断开连接时，AgentMesh 会终止底层 Agent 进程树（Windows 上 `taskkill /T /F`），该轮执行在 Bridge Session 历史中记录为失败并保留执行证据（`Run cancelled by the requesting client.`），不会留下"代码已修改但会话无记录"的孤儿状态。取消后 `auto` 模式不会再用 CLI 重跑同一任务。
+
+### 结果中的原始诊断输出
+
+MCP 工具响应在 `Summary` / `Final Answer` 之外，还会包含截断到 8000 字符的 `Raw Output` 段（vendor CLI 的原始输出与 stderr），用于远程排查底层 Agent 失败；当原始输出与最终回答一致时该段省略。
+
 具体配置入口取决于 Orchestrator；若客户端不请求 Progress 且固定在较短超时，即使 `.agentmesh/config.json` 已设置更长的 `timeoutMs`，外层请求仍会先取消。同步 MCP 链路通过 Progress 提供实时状态和失败结果；跨请求或离线 webhook 不属于当前本地 stdio Bridge 的职责。
 
 ---

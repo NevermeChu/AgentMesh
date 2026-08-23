@@ -42,6 +42,7 @@ export class GrokAdapter extends BaseAdapter {
         cwd: options.cwd,
         env: options.env,
         timeoutMs: options.timeoutMs,
+        signal: options.signal,
       });
 
       const fullOutput = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();

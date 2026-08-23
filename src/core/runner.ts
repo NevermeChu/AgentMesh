@@ -30,6 +30,8 @@ export interface DelegateTaskParams {
   sessionId?: string;
   contextSessionId?: string;
   baseCommit?: string;
+  /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
+  signal?: AbortSignal;
 }
 
 export interface ReviewChangesParams {
@@ -41,6 +43,8 @@ export interface ReviewChangesParams {
   timeoutMs?: number;
   env?: Record<string, string>;
   contextSessionId?: string;
+  /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
+  signal?: AbortSignal;
 }
 
 export interface ContinueTaskParams {
@@ -50,6 +54,8 @@ export interface ContinueTaskParams {
   timeoutMs?: number;
   env?: Record<string, string>;
   extraArgs?: string[];
+  /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
+  signal?: AbortSignal;
 }
 
 const MAX_SHARED_TURNS = 8;
@@ -423,6 +429,7 @@ export class MultiAgentRunner {
       nativeSessionId: session.nativeSessionId,
       baseCommit: params.baseCommit,
       historyContext,
+      signal: params.signal,
     };
 
     let result: AgentResult;
@@ -498,6 +505,7 @@ export class MultiAgentRunner {
       timeoutMs: params.timeoutMs,
       env: params.env,
       contextSessionId: params.contextSessionId,
+      signal: params.signal,
     });
   }
 
@@ -573,6 +581,7 @@ export class MultiAgentRunner {
           env: params.env,
           extraArgs: params.extraArgs,
           historyContext,
+          signal: params.signal,
         });
       } else {
         // Fallback to run with context
@@ -586,6 +595,7 @@ export class MultiAgentRunner {
           extraArgs: params.extraArgs,
           nativeSessionId: session.nativeSessionId,
           historyContext,
+          signal: params.signal,
         });
       }
     } catch (err) {

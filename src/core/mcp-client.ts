@@ -14,6 +14,8 @@ export interface McpClientExecutionOptions {
   promptName?: string;
   promptArguments?: Record<string, string>;
   timeoutMs?: number;
+  /** Aborts the call: the transport closes, terminating the vendor MCP server process tree. */
+  signal?: AbortSignal;
 }
 
 export interface McpClientExecutionResult {
@@ -57,6 +59,13 @@ export async function executeViaMcpClient(
   );
 
   let timer: NodeJS.Timeout | null = null;
+
+  // Closing the stdio transport terminates the vendor server process tree, so an
+  // aborted caller request cannot leave a detached agent process running.
+  const onAbort = () => {
+    void transport.close().catch(() => {});
+  };
+  options.signal?.addEventListener("abort", onAbort, { once: true });
 
   try {
     const connectPromise = async () => {
@@ -131,6 +140,7 @@ export async function executeViaMcpClient(
     return await Promise.race([connectPromise(), timeoutPromise]);
   } finally {
     if (timer) clearTimeout(timer);
+    options.signal?.removeEventListener("abort", onAbort);
     try {
       await client.close();
     } catch {

@@ -170,4 +170,19 @@ describe("core/executor", () => {
       else process.env.OLDPWD = previousOldPwd;
     }
   });
+
+  it("terminates the process tree and resolves when the abort signal fires", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const startedAt = Date.now();
+    const result = await executeCommand(
+      process.execPath,
+      ["-e", "setTimeout(() => process.exit(0), 30000)"],
+      { timeoutMs: 30_000, signal: controller.signal },
+    );
+
+    expect(result.aborted).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+  });
 });

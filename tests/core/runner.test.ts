@@ -510,6 +510,26 @@ describe("core/runner", () => {
     expect(mock.lastRunOptions?.timeoutMs).toBe(DEFAULT_RUN_TIMEOUT_MS);
   });
 
+  it("forwards the cancellation signal to the adapter", async () => {
+    const controller = new AbortController();
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Signal passthrough",
+      signal: controller.signal,
+    });
+
+    expect(mock.lastRunOptions?.signal).toBe(controller.signal);
+
+    const sessionId = runner.listSessions()[0]!.id;
+    const contRes = await runner.continueTask({
+      sessionId,
+      task: "Signal passthrough continue",
+      signal: controller.signal,
+    });
+    expect(contRes.status).toBe("success");
+    expect(mock.lastRunOptions?.signal).toBe(controller.signal);
+  });
+
   it("honors RunnerOptions timeout and session storage overrides", async () => {
     const sessionStoragePath = path.join(
       os.tmpdir(),

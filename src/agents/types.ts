@@ -23,6 +23,8 @@ export interface RunAgentOptions {
   nativeSessionId?: string;
   baseCommit?: string;
   historyContext?: string;
+  /** Aborts the underlying agent process; the run resolves as a cancelled failure. */
+  signal?: AbortSignal;
 }
 
 export interface ContinueAgentOptions {
@@ -36,6 +38,8 @@ export interface ContinueAgentOptions {
   env?: Record<string, string>;
   extraArgs?: string[];
   historyContext?: string;
+  /** Aborts the underlying agent process; the run resolves as a cancelled failure. */
+  signal?: AbortSignal;
 }
 
 export interface ReviewFinding {

@@ -7,6 +7,7 @@ import type { AgentResult } from "../agents/types.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
+const MAX_RAW_OUTPUT_CHARS = 8_000;
 const PROGRESS_INTERVAL_MS = 15_000;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z
@@ -16,17 +17,26 @@ const NonBlankString = z
     message: "Value must not be blank",
   });
 
+function truncateText(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 3)}...`;
+}
+
 function formatNormalizedResult(result: AgentResult): string[] {
   const details = [`Summary: ${result.summary}`];
   if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
-    const finalAnswer = result.finalAnswer.trim();
     details.push(
-      `Final Answer:\n${
-        finalAnswer.length <= MAX_FINAL_ANSWER_CHARS
-          ? finalAnswer
-          : `${finalAnswer.slice(0, MAX_FINAL_ANSWER_CHARS - 3)}...`
-      }`,
+      `Final Answer:\n${truncateText(result.finalAnswer.trim(), MAX_FINAL_ANSWER_CHARS)}`,
     );
+  }
+  // Vendor logs and stderr stay diagnosable over MCP instead of being dropped
+  // by normalization; without them, remote failures carry no actionable detail.
+  const rawOutput = result.output?.trim();
+  if (
+    rawOutput &&
+    rawOutput !== result.finalAnswer?.trim() &&
+    rawOutput !== result.summary.trim()
+  ) {
+    details.push(`Raw Output:\n${truncateText(rawOutput, MAX_RAW_OUTPUT_CHARS)}`);
   }
   if (result.error) details.push(`Error: ${result.error}`);
   if (result.exitCode !== undefined) details.push(`Exit Code: ${result.exitCode}`);
@@ -204,6 +214,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             sessionId: args.sessionId,
             contextSessionId: args.contextSessionId,
             baseCommit: args.baseCommit,
+            signal: extra.signal,
           }),
         );
 
@@ -285,6 +296,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             mode: args.mode,
             timeoutMs: args.timeoutMs,
             contextSessionId: args.contextSessionId,
+            signal: extra.signal,
           }),
         );
 
@@ -338,6 +350,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             task: args.task,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
+            signal: extra.signal,
           }),
         );
 

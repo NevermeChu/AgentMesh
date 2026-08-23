@@ -12,6 +12,8 @@ AgentMesh follows [Semantic Versioning](https://semver.org/).
 - Configurable Reviewer safety policy, protection reporting, and working-tree mutation detection.
 - Default run timeout (`DEFAULT_RUN_TIMEOUT_MS`, 10 minutes) wired through `RunnerOptions.defaultTimeoutMs` and `sessionStoragePath`, so unconfigured CLI executions can no longer hang forever.
 - Quarantining of corrupt session storage: an invalid `sessions.json` is renamed to `*.corrupt-<timestamp>` and replaced with an empty state instead of failing every command.
+- End-to-end cancellation: MCP client timeouts, cancellations, and disconnects now abort the underlying agent process tree (`AbortSignal` threaded from tool handlers through the runner, adapters, executor, and MCP client), record the turn as failed history with full evidence, and never trigger the auto CLI fallback. `ExecutionResult` gains an optional `aborted` flag.
+- MCP tool responses include a bounded `Raw Output` section (8000 chars) with vendor CLI stdout/stderr so remote failures remain diagnosable.
 
 ### Changed
 

@@ -169,6 +169,7 @@ export class AntigravityAdapter extends BaseAdapter {
         cwd: options.cwd,
         env: options.env,
         timeoutMs: options.timeoutMs,
+        signal: options.signal,
       });
 
       const parsed = parseAntigravityJsonOutput(res.stdout);

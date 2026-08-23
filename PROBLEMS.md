@@ -271,3 +271,23 @@
 **解决方法**：结构化输出优先——只有当 stdout 没有解析出有效结果时，才把 `[claude-code:...]` stderr 模式升级为语义错误，与 codex 对齐。
 
 **状态**：已解决。用真实 claude 会话验证主任务成功且辅助诊断不再导致失败；fake-CLI 进程级回归测试覆盖该场景。
+
+## P-028 MCP 客户端超时不取消服务端工作，留下无记录的孤儿执行
+
+**问题**：真实编排第一轮中，编排端 60 秒请求超时后，服务端委托任务继续执行：codex 实际修改了演示仓库代码，但 AgentMesh 服务进程随后随连接退出，Bridge Session 该轮 0 条历史、无 nativeSessionId——出现"代码已改但证据全丢"的孤儿状态，且被取消的 Agent 进程可能继续在后台运行。
+
+**根因**：工具处理器没有消费 MCP SDK 提供的请求级 `AbortSignal`（客户端超时会发送 `notifications/cancelled`，断连时 SDK 也会 abort 所有在途请求的 signal）；执行器与 MCP client 传输也没有任何取消通道，进程树无法按需终止。
+
+**解决方法**：把 `AbortSignal` 从 MCP 工具处理器一路穿透到 runner、适配器、CLI 执行器与 MCP client：执行器 abort 时终止进程树（Windows `taskkill /T /F`）并以 `aborted` 标记结束；MCP client abort 时关闭 stdio transport 终止 vendor MCP server 进程树；取消后该轮以失败（`Run cancelled by the requesting client.`）记入会话历史并保留证据，同时禁止 `auto` 模式在取消后再用 CLI 重跑。
+
+**状态**：已解决。进程级 abort、信号透传、取消后历史留痕与"不降级重跑"均有测试覆盖。
+
+## P-029 归一化 MCP 响应丢弃 vendor 原始输出导致远程不可诊断
+
+**问题**：真实链路中 Antigravity Reviewer 失败时，MCP 响应只有一句通用的 `Agent execution terminated due to error.`，vendor stderr 的真正原因（Google API 地域限制）完全丢失，只能登录本机手工复现排查。
+
+**根因**：MCP 工具响应只输出归一化的 Summary/Final Answer/findings，`AgentResult.output` 携带的 vendor CLI 原始 stdout/stderr 从不进入响应；设计初衷是控制响应体积，但把诊断信息一并裁掉了。
+
+**解决方法**：响应在 Summary 与 Final Answer 之外增加 `Raw Output` 段：内容为 vendor 原始输出，截断到 8000 字符；与最终回答一致时省略，避免重复。
+
+**状态**：已解决。协议测试覆盖 Raw Output 的出现与省略两种情形。

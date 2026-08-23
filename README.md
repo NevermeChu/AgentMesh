@@ -219,7 +219,9 @@ await client.callTool(params, undefined, {
 
 ### 客户端取消与断连
 
-MCP 客户端超时、发送取消通知或直接断开连接时，AgentMesh 会终止底层 Agent 进程树（Windows 上 `taskkill /T /F`），该轮执行在 Bridge Session 历史中记录为失败并保留执行证据（`Run cancelled by the requesting client.`），不会留下"代码已修改但会话无记录"的孤儿状态。取消后 `auto` 模式不会再用 CLI 重跑同一任务。
+MCP 客户端**请求超时或发送取消通知**时，AgentMesh 会终止底层 Agent 进程树（Windows 上 `taskkill /T /F`），该轮执行在 Bridge Session 历史中记录为失败并保留执行证据（`Run cancelled by the requesting client.`），不会留下"代码已修改但会话无记录"的孤儿状态；取消后 `auto` 模式不会再用 CLI 重跑同一任务。
+
+边界：如果客户端**直接关闭连接**（而非超时/取消），MCP SDK 的 stdio 客户端会立即终止 AgentMesh 服务进程，服务端可能来不及写入该轮记录。编排方应依赖请求超时 + 取消通知来取消长任务，而不是强行断开。
 
 ### 结果中的原始诊断输出
 

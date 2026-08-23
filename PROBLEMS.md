@@ -280,7 +280,7 @@
 
 **解决方法**：把 `AbortSignal` 从 MCP 工具处理器一路穿透到 runner、适配器、CLI 执行器与 MCP client：执行器 abort 时终止进程树（Windows `taskkill /T /F`）并以 `aborted` 标记结束；MCP client abort 时关闭 stdio transport 终止 vendor MCP server 进程树；取消后该轮以失败（`Run cancelled by the requesting client.`）记入会话历史并保留证据，同时禁止 `auto` 模式在取消后再用 CLI 重跑。
 
-**状态**：已解决。进程级 abort、信号透传、取消后历史留痕与"不降级重跑"均有测试覆盖。
+**状态**：已解决，附一条边界。进程级 abort、信号透传、取消后历史留痕与"不降级重跑"均有测试覆盖，并用真实 Antigravity 任务验证：客户端 12 秒请求超时后该轮以 `Run cancelled by the requesting client.` 失败记录落盘且证据完整。边界：客户端直接 `close()` 连接时，MCP SDK 的 stdio 客户端会立即终止 AgentMesh 服务进程，服务端可能来不及写入该轮记录——取消长任务必须走请求超时/取消通知路径（已在 README 注明）。
 
 ## P-029 归一化 MCP 响应丢弃 vendor 原始输出导致远程不可诊断
 

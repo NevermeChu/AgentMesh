@@ -141,8 +141,23 @@ describe("core/session", () => {
   it.each([
     ["malformed JSON", "{not valid json"],
     ["invalid schema", JSON.stringify([{ id: "bridge-sess_invalid", agent: "codex" }])],
-  ])("rejects %s in persistent storage", (_case, contents) => {
+  ])("quarantines %s in persistent storage instead of failing to load", (_case, contents) => {
     fs.writeFileSync(tempStoragePath, contents, "utf-8");
+    const manager = new SessionManager({ storagePath: tempStoragePath, persist: true });
+
+    expect(manager.listSessions()).toEqual([]);
+    const quarantined = fs
+      .readdirSync(path.dirname(tempStoragePath))
+      .filter(
+        (name) => name.startsWith(path.basename(tempStoragePath)) && name.includes(".corrupt-"),
+      );
+    expect(quarantined.length).toBe(1);
+  });
+
+  it("rejects unreadable persistent storage that is not corrupt", () => {
+    // A directory at the storage path fails reads for IO reasons, not corruption,
+    // so it must keep failing loudly instead of being quarantined.
+    fs.mkdirSync(tempStoragePath);
     expect(() => new SessionManager({ storagePath: tempStoragePath, persist: true })).toThrow(
       "Failed to load AgentMesh sessions",
     );

@@ -143,7 +143,7 @@ export abstract class BaseAdapter implements AgentAdapter {
   /**
    * Default continue implementation.
    */
-  public async continue?(options: ContinueAgentOptions): Promise<AgentResult> {
+  public async continue(options: ContinueAgentOptions): Promise<AgentResult> {
     return this.run({
       task: options.task,
       cwd: options.cwd,

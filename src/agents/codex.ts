@@ -64,6 +64,33 @@ export function parseCodexJsonLines(output: string): {
   return { output: finalMessage, sessionId, error };
 }
 
+export interface CodexMcpToolCall {
+  toolName: "codex" | "codex-reply";
+  toolArguments: Record<string, string>;
+}
+
+/**
+ * Maps a run onto the exact `codex` / `codex-reply` MCP tool schemas. Both tools
+ * reject unknown arguments (`additionalProperties: false`), so only schema
+ * fields may be forwarded.
+ */
+export function buildCodexMcpToolCall(options: RunAgentOptions, prompt: string): CodexMcpToolCall {
+  if (options.nativeSessionId) {
+    return {
+      toolName: "codex-reply",
+      toolArguments: { threadId: options.nativeSessionId, prompt },
+    };
+  }
+  return {
+    toolName: "codex",
+    toolArguments: {
+      prompt,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      sandbox: options.role === "reviewer" ? "read-only" : "workspace-write",
+    },
+  };
+}
+
 export class CodexAdapter extends BaseAdapter {
   readonly name: AgentName = "codex";
   readonly displayName = "OpenAI Codex";
@@ -98,19 +125,15 @@ export class CodexAdapter extends BaseAdapter {
       mcpArgs.push("-c", 'sandbox_mode="workspace-write"');
     }
 
+    const toolCall = buildCodexMcpToolCall(options, prompt);
     const mcpRes = await executeViaMcpClient({
       command: bin,
       args: mcpArgs,
       cwd: options.cwd,
       env: options.env,
       timeoutMs: options.timeoutMs,
-      toolArguments: {
-        prompt,
-        task: prompt,
-        cwd: options.cwd,
-        role: options.role,
-        sessionId: options.nativeSessionId,
-      },
+      toolName: toolCall.toolName,
+      toolArguments: toolCall.toolArguments,
     });
 
     const nativeSessionId =

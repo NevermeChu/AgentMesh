@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, it, expect, beforeEach } from "vitest";
-import { MultiAgentRunner } from "../../src/core/runner.js";
+import { MultiAgentRunner, DEFAULT_RUN_TIMEOUT_MS } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
 import { BaseAdapter } from "../../src/agents/base.js";
@@ -502,5 +502,37 @@ describe("core/runner", () => {
 
     expect(res.status).toBe("failed");
     expect(res.error).toContain("Simulated agent error");
+  });
+
+  it("applies the default run timeout when none is configured", async () => {
+    await runner.delegateTask({ agent: "codex", task: "Default timeout" });
+
+    expect(mock.lastRunOptions?.timeoutMs).toBe(DEFAULT_RUN_TIMEOUT_MS);
+  });
+
+  it("honors RunnerOptions timeout and session storage overrides", async () => {
+    const sessionStoragePath = path.join(
+      os.tmpdir(),
+      `agentmesh_runner_opts_${Date.now()}_${Math.random().toString(36).slice(2)}.json`,
+    );
+    try {
+      const customRunner = new MultiAgentRunner(registry, undefined, {
+        defaultTimeoutMs: 12_345,
+        sessionStoragePath,
+      });
+      const res = await customRunner.delegateTask({ agent: "codex", task: "Custom timeout" });
+
+      expect(mock.lastRunOptions?.timeoutMs).toBe(12_345);
+      expect(fs.existsSync(sessionStoragePath)).toBe(true);
+      expect(customRunner.getSession(res.sessionId!)?.agent).toBe("codex");
+    } finally {
+      for (const suffix of ["", ".lock"]) {
+        try {
+          fs.unlinkSync(`${sessionStoragePath}${suffix}`);
+        } catch {
+          // ignore cleanup errors
+        }
+      }
+    }
   });
 });

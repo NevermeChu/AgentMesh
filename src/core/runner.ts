@@ -10,11 +10,13 @@ import type {
 } from "../agents/types.js";
 import { defaultRegistry } from "../agents/registry.js";
 import type { AgentRegistry } from "../agents/registry.js";
-import { defaultSessionManager } from "./session.js";
-import type { SessionManager } from "./session.js";
+import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
-import type { BridgeSession, RepositoryStateEvidence } from "./types.js";
+import type { BridgeSession, RepositoryStateEvidence, RunnerOptions } from "./types.js";
+
+/** Upper bound for one delegated agent process when no timeout is configured anywhere. */
+export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
 
 export interface DelegateTaskParams {
   agent?: string;
@@ -193,13 +195,20 @@ function applyReviewerSafety(result: AgentResult, report: ReviewerSafetyReport):
 export class MultiAgentRunner {
   private registry: AgentRegistry;
   private sessionManager: SessionManager;
+  private readonly defaultTimeoutMs: number;
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
-    sessionManager: SessionManager = defaultSessionManager,
+    sessionManager?: SessionManager,
+    options: RunnerOptions = {},
   ) {
     this.registry = registry;
-    this.sessionManager = sessionManager;
+    this.sessionManager =
+      sessionManager ??
+      (options.sessionStoragePath
+        ? new SessionManager({ storagePath: options.sessionStoragePath })
+        : defaultSessionManager);
+    this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   }
 
   /**
@@ -408,7 +417,7 @@ export class MultiAgentRunner {
       cwd: effectiveCwd,
       role,
       mode: params.mode ?? roleResolution.assignment?.mode,
-      timeoutMs: params.timeoutMs ?? roleResolution.assignment?.timeoutMs,
+      timeoutMs: params.timeoutMs ?? roleResolution.assignment?.timeoutMs ?? this.defaultTimeoutMs,
       env: params.env,
       extraArgs: params.extraArgs,
       nativeSessionId: session.nativeSessionId,
@@ -560,7 +569,7 @@ export class MultiAgentRunner {
           cwd: session.cwd,
           role: session.role,
           mode: params.mode,
-          timeoutMs: params.timeoutMs,
+          timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
           env: params.env,
           extraArgs: params.extraArgs,
           historyContext,
@@ -572,7 +581,7 @@ export class MultiAgentRunner {
           cwd: session.cwd,
           role: session.role,
           mode: params.mode,
-          timeoutMs: params.timeoutMs,
+          timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
           env: params.env,
           extraArgs: params.extraArgs,
           nativeSessionId: session.nativeSessionId,

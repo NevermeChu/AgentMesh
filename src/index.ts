@@ -24,7 +24,8 @@ export type {
 
 // Adapters
 export { BaseAdapter } from "./agents/base.js";
-export { CodexAdapter } from "./agents/codex.js";
+export { CodexAdapter, buildCodexMcpToolCall } from "./agents/codex.js";
+export type { CodexMcpToolCall } from "./agents/codex.js";
 export { ClaudeAdapter } from "./agents/claude.js";
 export { AntigravityAdapter } from "./agents/antigravity.js";
 export { GrokAdapter } from "./agents/grok.js";
@@ -69,7 +70,12 @@ export type {
   RoleAssignment,
 } from "./core/config.js";
 
-export { MultiAgentRunner, AgentMeshRunner, defaultRunner } from "./core/runner.js";
+export {
+  MultiAgentRunner,
+  AgentMeshRunner,
+  defaultRunner,
+  DEFAULT_RUN_TIMEOUT_MS,
+} from "./core/runner.js";
 export type { DelegateTaskParams, ReviewChangesParams, ContinueTaskParams } from "./core/runner.js";
 
 // MCP Server

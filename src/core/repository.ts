@@ -28,6 +28,15 @@ interface ChangedPathEntry {
   status: string;
 }
 
+/**
+ * Per-path content fingerprints are kept only while the change set stays small
+ * enough to fingerprint cheaply. Beyond the cap the evidence degrades to the
+ * coarse changed-path list, keeping every capture bounded.
+ */
+const MAX_FINGERPRINTED_PATHS = 100;
+/** Untracked files beyond this count contribute path+size only, not full content. */
+const MAX_UNTRACKED_CONTENT_HASHES = 500;
+
 function parsePorcelainEntries(output: string): ChangedPathEntry[] {
   const entries = output.split("\0").filter(Boolean);
   const changedPaths: ChangedPathEntry[] = [];
@@ -99,8 +108,10 @@ export async function captureRepositoryState(
     const head = headResult.exitCode === 0 ? headResult.stdout.trim() : undefined;
     const changedEntries = parsePorcelainEntries(statusResult.stdout);
     const changedPaths = [...new Set(changedEntries.map((entry) => entry.path))].slice(0, 100);
+    const fingerprintEntries =
+      changedEntries.length <= MAX_FINGERPRINTED_PATHS ? changedEntries : undefined;
     const pathFingerprints: Record<string, string> = {};
-    for (const entry of changedEntries) {
+    for (const entry of fingerprintEntries ?? []) {
       const fingerprint = await fingerprintChangedPath(root, entry);
       if (fingerprint) pathFingerprints[entry.path] = fingerprint;
     }
@@ -109,11 +120,22 @@ export async function captureRepositoryState(
     hash.update(`head\0${head || "unborn"}\0status\0${statusResult.stdout}`);
     hash.update(`\0tracked\0${trackedDiffResult.stdout}\0staged\0${stagedDiffResult.stdout}`);
 
-    for (const relativePath of untrackedPaths) {
+    for (const [index, relativePath] of untrackedPaths.entries()) {
       const absolutePath = path.resolve(root, relativePath);
       const relation = path.relative(root, absolutePath);
       if (relation.startsWith("..") || path.isAbsolute(relation)) continue;
       hash.update(`\0untracked\0${relativePath}\0`);
+      if (index >= MAX_UNTRACKED_CONTENT_HASHES) {
+        // Oversized untracked sets fall back to path+size so captures stay bounded.
+        try {
+          const stat = await fs.promises.lstat(absolutePath);
+          hash.update(`stat\0${stat.size}\0`);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code || "unknown";
+          hash.update(`unreadable:${code}`);
+        }
+        continue;
+      }
       try {
         await hashFile(absolutePath, hash);
       } catch (error) {
@@ -129,7 +151,7 @@ export async function captureRepositoryState(
       dirty: statusResult.stdout.length > 0,
       fingerprint: hash.digest("hex"),
       changedPaths,
-      pathFingerprints,
+      pathFingerprints: fingerprintEntries ? pathFingerprints : undefined,
     };
   } catch {
     return undefined;

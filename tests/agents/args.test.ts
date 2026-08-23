@@ -2,7 +2,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it, expect } from "vitest";
-import { CodexAdapter, parseCodexJsonLines } from "../../src/agents/codex.js";
+import {
+  CodexAdapter,
+  parseCodexJsonLines,
+  buildCodexMcpToolCall,
+} from "../../src/agents/codex.js";
 import {
   ClaudeAdapter,
   findClaudeSessionId,
@@ -247,5 +251,36 @@ describe("agents/args construction", () => {
       }),
     );
     expect(claude.error).toBe("unrecognized model");
+  });
+
+  it("maps runs onto the exact codex MCP tool schemas", () => {
+    const worker = buildCodexMcpToolCall({ task: "T" }, "PROMPT");
+    expect(worker).toEqual({
+      toolName: "codex",
+      toolArguments: { prompt: "PROMPT", sandbox: "workspace-write" },
+    });
+
+    const reviewer = buildCodexMcpToolCall(
+      { task: "T", role: "reviewer", cwd: "D:/repo" },
+      "PROMPT",
+    );
+    expect(reviewer).toEqual({
+      toolName: "codex",
+      toolArguments: { prompt: "PROMPT", cwd: "D:/repo", sandbox: "read-only" },
+    });
+
+    const resume = buildCodexMcpToolCall({ task: "T", nativeSessionId: "th_123" }, "PROMPT");
+    expect(resume).toEqual({
+      toolName: "codex-reply",
+      toolArguments: { threadId: "th_123", prompt: "PROMPT" },
+    });
+  });
+
+  it("rejects Claude MCP mode because the vendor server has no one-shot task tool", async () => {
+    const result = await new ClaudeAdapter().run({ task: "Probe transport", mode: "mcp" });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("MCP mode is not supported by Anthropic Claude Code");
+    expect(new ClaudeAdapter().supportedModes).toEqual(["cli"]);
   });
 });

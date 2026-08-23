@@ -7,7 +7,6 @@ import type {
   TransportMode,
 } from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
-import { executeViaMcpClient } from "../core/mcp-client.js";
 import { buildRolePrompt } from "../core/prompts.js";
 
 export function findClaudeSessionId(value: unknown, depth = 0): string | undefined {
@@ -68,52 +67,20 @@ export class ClaudeAdapter extends BaseAdapter {
   readonly name: AgentName = "claude";
   readonly displayName = "Anthropic Claude Code";
   readonly aliases = ["claude-code", "anthropic-claude"] as const;
-  readonly supportedModes: readonly TransportMode[] = ["mcp", "cli"];
+  // Claude Code's MCP server exposes its raw toolset (Read/Edit/Agent/...) for an
+  // interactive host instead of a one-shot task tool, so AgentMesh drives the CLI.
+  readonly supportedModes: readonly TransportMode[] = ["cli"];
   readonly sandboxMechanism: SandboxMechanism = "tool-filtering";
   readonly envBinOverride = "CLAUDE_BIN";
   readonly defaultExecutableName = "claude";
 
-  /**
-   * Runs Claude Code via official MCP server (`claude mcp serve`).
-   */
-  protected override async runViaMcp(options: RunAgentOptions): Promise<AgentResult> {
-    if (options.role === "reviewer") {
-      throw new Error(
-        "Claude MCP reviewer mode is disabled because it cannot enforce a read-only tool boundary.",
-      );
-    }
-    const startTime = Date.now();
-    const bin = await this.getExecutablePath();
-    const prompt = buildRolePrompt(options.task, options.role, {
-      baseCommit: options.baseCommit,
-      cwd: options.cwd,
-      historyContext: options.historyContext,
-    });
-
-    const mcpRes = await executeViaMcpClient({
-      command: bin,
-      args: ["mcp", "serve"],
-      cwd: options.cwd,
-      env: options.env,
-      timeoutMs: options.timeoutMs,
-      toolArguments: {
-        prompt,
-        task: prompt,
-        cwd: options.cwd,
-        role: options.role,
-        sessionId: options.nativeSessionId,
-      },
-    });
-
-    const nativeSessionId =
-      findClaudeSessionId(mcpRes.structuredResult) ||
-      this.extractSessionId(mcpRes.output) ||
-      options.nativeSessionId;
-
-    return this.formatSuccessResult(mcpRes.output, startTime, {
-      nativeSessionId,
-      role: options.role,
-    });
+  protected override runViaMcp(options: RunAgentOptions): Promise<AgentResult> {
+    void options;
+    return Promise.reject(
+      new Error(
+        "Claude MCP transport is unavailable: 'claude mcp serve' exposes its raw toolset instead of a one-shot task tool. Use the CLI transport.",
+      ),
+    );
   }
 
   /**
@@ -215,9 +182,5 @@ export class ClaudeAdapter extends BaseAdapter {
 
   private parseJsonOutput(output: string): { output: string; sessionId?: string; error?: string } {
     return parseClaudeJsonOutput(output);
-  }
-
-  private extractSessionId(output: string): string | undefined {
-    return this.parseJsonOutput(output).sessionId;
   }
 }

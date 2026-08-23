@@ -213,6 +213,16 @@ export async function resolveCommandInvocation(
   );
 }
 
+/** Exit-code contributions of the signals we may deliver, following the 128+signum convention. */
+const SIGNAL_EXIT_CODES: Record<string, number> = {
+  SIGHUP: 1,
+  SIGINT: 2,
+  SIGQUIT: 3,
+  SIGABRT: 6,
+  SIGKILL: 9,
+  SIGTERM: 15,
+};
+
 /**
  * Executes a command with cross-platform support and timeout safety.
  */
@@ -232,13 +242,15 @@ export async function executeCommand(
   const useShell = options.shell ?? false;
   let windowsVerbatim = false;
 
-  if (options.shell === undefined) {
+  if (useShell) {
+    actualCmd = (await findExecutableOnPath(command)) || command;
+  } else {
+    // Both an omitted and an explicit `shell: false` must resolve Windows shims
+    // identically; spawning a .cmd raw would fail with EINVAL on Node >= 22.
     const invocation = await resolveCommandInvocation(command, args);
     actualCmd = invocation.command;
     actualArgs = invocation.args;
     windowsVerbatim = invocation.windowsVerbatimArguments ?? false;
-  } else {
-    actualCmd = (await findExecutableOnPath(command)) || command;
   }
 
   const spawnOptions: SpawnOptions = {
@@ -359,7 +371,13 @@ export async function executeCommand(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (hardSettleTimer) clearTimeout(hardSettleTimer);
       const durationMs = Date.now() - startTime;
-      const exitCode = timedOut ? 124 : code !== null ? code : signal ? 128 : 0;
+      const exitCode = timedOut
+        ? 124
+        : code !== null
+          ? code
+          : signal
+            ? 128 + (SIGNAL_EXIT_CODES[signal] ?? 0)
+            : 0;
 
       resolve({
         stdout: readStdout(),

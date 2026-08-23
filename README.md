@@ -23,13 +23,13 @@
 | Agent 名称        | 别名 (Aliases)                                         | 默认二进制       | 首选模式 (Preferred)        | 降级/备选模式 (Fallback)            | 环境变量覆盖             |
 | :---------------- | :----------------------------------------------------- | :--------------- | :-------------------------- | :---------------------------------- | :----------------------- |
 | **`codex`**       | `openai-codex`, `codex-cli`                            | `codex`          | MCP (`codex mcp-server`)    | CLI (`codex exec` / `codex review`) | `CODEX_BIN`              |
-| **`claude`**      | `claude-code`, `anthropic-claude`                      | `claude`         | MCP (`claude mcp serve`)    | CLI (`claude -p`)                   | `CLAUDE_BIN`             |
+| **`claude`**      | `claude-code`, `anthropic-claude`                      | `claude`         | CLI (`claude -p`)           | —                                   | `CLAUDE_BIN`             |
 | **`antigravity`** | `gemini`, `agy`, `google-gemini`, `google-antigravity` | `agy` / `gemini` | CLI (`agy -p`)              | —                                   | `AGY_BIN` / `GEMINI_BIN` |
 | **`grok`**        | `xai-grok`, `grok-cli`, `grok-build`                   | `grok`           | CLI (`grok -p`)             | —                                   | `GROK_BIN`               |
 | **`opencode`**    | `opencode-ai`, `opencode-cli`                          | `opencode`       | CLI (`opencode run --auto`) | —                                   | `OPENCODE_BIN`           |
 | **`zcode`**       | `z-code`, `zcode-cli`                                  | `zcode`          | CLI (`zcode <prompt>`)      | —                                   | `ZCODE_BIN`              |
 
-> Claude Reviewer 在 `auto` 模式下会从 MCP 自动降级到 CLI，并移除 Bash/Edit/Write 等可写工具。显式指定 `mode=mcp` 的 Claude Reviewer 会返回错误，因为该路径目前无法建立可靠的只读边界。Antigravity Reviewer 在非 Windows 平台使用原生 `--sandbox` 与 `plan` 模式；Windows 上因原生沙箱可能在受保护工具链路径初始化失败，目前降级为 `plan` + `prompt-only`。所有标记为 `prompt-only` 的适配器都不能视为运行时只读沙箱。
+> Claude 适配器目前仅使用 CLI 传输：当前版本的 `claude mcp serve` 暴露的是 Claude Code 的原始工具集（Read/Edit/Agent 等）而非一次性任务入口，因此显式 `mode=mcp` 会返回结构化错误。Claude Reviewer 在 CLI 中通过 `--tools` 只保留只读工具并移除 Bash/Edit/Write 等可写工具。Codex 的 MCP 调用严格遵循服务端 schema（`additionalProperties: false`），原生续接使用 `codex-reply(threadId)`。Antigravity Reviewer 在非 Windows 平台使用原生 `--sandbox` 与 `plan` 模式；Windows 上因原生沙箱可能在受保护工具链路径初始化失败，目前降级为 `plan` + `prompt-only`。所有标记为 `prompt-only` 的适配器都不能视为运行时只读沙箱。
 
 > 底层 Agent CLI 只需已经安装、可执行并完成各自所需的登录或授权，不需要全部预先启动。AgentMesh 在收到任务后只会按角色配置启动本次使用的 CLI 或原生 MCP Server。
 
@@ -201,6 +201,8 @@ AgentMesh Tool 的 `timeoutMs` 控制底层 Agent 进程或 Agent 原生 MCP 调
 ```text
 Orchestrator MCP request timeout > AgentMesh timeoutMs > 预期 Agent 执行时间
 ```
+
+未显式传入 `timeoutMs` 且项目角色配置也未设置时，AgentMesh 会对底层执行应用 10 分钟（600000ms）的默认超时（`DEFAULT_RUN_TIMEOUT_MS`），避免挂死的 Agent 进程无限占用请求；程序化使用时可通过 `MultiAgentRunner` 的 `RunnerOptions.defaultTimeoutMs` 覆盖。
 
 AgentMesh 在客户端请求 Progress 时会在任务开始、每 15 秒和完成时发送标准 MCP Progress 通知。使用 MCP SDK 直接调用时，应同时注册进度回调、允许进度重置空闲超时，并设置总超时上限：
 

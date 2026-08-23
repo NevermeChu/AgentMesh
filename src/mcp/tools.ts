@@ -207,9 +207,9 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           }),
         );
 
-        const isError =
-          result.status === "failed" ||
-          (args.role === "reviewer" && result.reviewOutcome === "FAIL");
+        // A FAIL verdict must surface as an MCP error even when the reviewer
+        // role was inherited from the session rather than requested explicitly.
+        const isError = result.status === "failed" || result.reviewOutcome === "FAIL";
 
         const formattedText = [
           `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()}${result.reviewOutcome ? ` | Review Outcome: ${result.reviewOutcome}` : ""} | Session: ${result.sessionId || "none"}]`,
@@ -342,7 +342,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
         );
 
         const formattedText = [
-          `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()} | Session: ${result.sessionId}]`,
+          `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()}${result.reviewOutcome ? ` | Review Outcome: ${result.reviewOutcome}` : ""} | Session: ${result.sessionId}]`,
           ...formatNormalizedResult(result),
           `Duration: ${result.durationMs ?? 0}ms`,
         ].join("\n");
@@ -354,7 +354,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
               text: formattedText,
             },
           ],
-          isError: result.status === "failed",
+          isError: result.status === "failed" || result.reviewOutcome === "FAIL",
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);

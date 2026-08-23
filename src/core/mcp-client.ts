@@ -74,12 +74,14 @@ export async function executeViaMcpClient(
         else if (toolNames.includes("delegate_task")) targetTool = "delegate_task";
         else if (toolNames.includes("run_task")) targetTool = "run_task";
         else if (toolNames.includes("prompt")) targetTool = "prompt";
-        else if (toolNames.length > 0) targetTool = toolNames[0];
       }
 
       if (!targetTool) {
+        // Never guess: calling an arbitrary tool with task-shaped arguments can
+        // trigger strict schema validation failures or unintended side effects.
         throw new Error(
-          `No tools found on MCP server '${options.command}'. Available tools: [${toolNames.join(", ")}]`,
+          `No recognizable task tool on MCP server '${options.command}'. ` +
+            `Pass toolName explicitly. Available tools: [${toolNames.join(", ")}]`,
         );
       }
 
@@ -133,9 +135,13 @@ export async function executeViaMcpClient(
   } finally {
     if (timer) clearTimeout(timer);
     try {
-      await transport.close();
+      await client.close();
     } catch {
-      // Ignore cleanup errors
+      try {
+        await transport.close();
+      } catch {
+        // Ignore cleanup errors
+      }
     }
   }
 }

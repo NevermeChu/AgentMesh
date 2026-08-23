@@ -205,6 +205,22 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain(firstRun.sessionId!);
   });
 
+  it("marks an inherited reviewer FAIL verdict as an MCP error on continuation", async () => {
+    const reviewRun = await runner.reviewChanges({ agent: "codex", task: "Review PR #42" });
+
+    const res = await client.callTool({
+      name: "continue_task",
+      arguments: {
+        sessionId: reviewRun.sessionId!,
+        task: "Re-review after fixes FAIL_TRIGGER",
+      },
+    });
+
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("Review Outcome: FAIL");
+  });
+
   it("rejects invalid task and timeout inputs at the MCP boundary", async () => {
     const blankTask = await client.callTool({
       name: "delegate_task",

@@ -58,4 +58,27 @@ describe("core/mcp-client", () => {
       }),
     ).rejects.toThrow("Simulated internal failure");
   });
+
+  it("refuses to guess a tool when no recognizable task tool exists", async () => {
+    const serverScript = `
+      import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+      import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+      const server = new McpServer({ name: "unrelated-test", version: "1.0.0" });
+      server.tool("unrelated_tool", {}, async () => ({
+        content: [{ type: "text", text: "side effect" }],
+      }));
+
+      const transport = new StdioServerTransport();
+      await server.connect(transport);
+    `;
+
+    await expect(
+      executeViaMcpClient({
+        command: process.execPath,
+        args: ["--input-type=module", "-e", serverScript],
+        timeoutMs: 10_000,
+      }),
+    ).rejects.toThrow("No recognizable task tool");
+  });
 });

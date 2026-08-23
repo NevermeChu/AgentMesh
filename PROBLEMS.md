@@ -211,3 +211,33 @@
 **解决方法**：先保存原始 Buffer 分块，在进程结束或超时后通过 `Buffer.concat` 合并，再统一进行一次 UTF-8 解码；仓库指纹继续基于完整内容计算。
 
 **状态**：已解决。回归测试强制把一个中文字符拆成两个进程输出块；连续六次仓库状态采集得到相同指纹，Reviewer 协议测试不再出现误报。
+
+## P-022 Vendor MCP 工具 schema 严格拒绝适配器的猜测式参数
+
+**问题**：通过 MCP 传输调用 Codex 或 Claude 时，适配器把 `prompt`、`task`、`role`、`sessionId` 等键一起发给自动发现的工具；真实服务端校验失败或调用了不相关的工具。
+
+**根因**：适配器没有读取 vendor 工具的真实 schema。Codex 0.149 的 `codex` 工具是 `additionalProperties: false`（仅接受 `prompt`/`cwd`/`sandbox` 等字段，续接必须用 `codex-reply(threadId)`）；Claude 2.x 的 `claude mcp serve` 已改为暴露 Claude Code 原始工具集（Read/Edit/Agent 等），不再提供一次性任务入口。MCP 客户端在没有匹配到已知工具名时还会盲选第一个工具。
+
+**解决方法**：用 SDK 探测真实服务端的 `listTools` schema 作为唯一事实源。Codex 适配器精确构造 `codex`（`prompt`/`cwd`/`sandbox`，Reviewer 用 `read-only`）与 `codex-reply`（`threadId`/`prompt`）调用；Claude 适配器降级为 CLI-only 并返回解释性结构化错误；MCP 客户端不再盲选工具，找不到可识别任务工具时报错并列出可用工具。
+
+**状态**：已解决。`buildCodexMcpToolCall` 映射、Claude 模式拒绝与 MCP 客户端拒绝盲选均有测试覆盖。
+
+## P-023 损坏的 sessions.json 会让所有 AgentMesh 命令不可用
+
+**问题**：会话存储文件损坏（JSON 截断或 schema 不匹配）时，`SessionManager` 构造函数抛出异常；由于 `defaultSessionManager` 在模块顶层实例化，导入链导致 CLI 全部命令和 MCP Server 在启动阶段直接崩溃，包括本应用来诊断的 `agentmesh sessions`。
+
+**根因**：加载失败一律按致命错误处理；而 Windows 写入回退路径 `copyFileSync` 是非原子操作，进程中断时恰好可能产生残缺 JSON，即写入策略自己制造了触发数据。重试只针对并发写窗口，无法区分“暂时不可读”与“确定损坏”。
+
+**解决方法**：区分错误类型——`SyntaxError`（JSON 解析失败）与 `ZodError`（schema 不匹配）视为确定损坏，把文件重命名为 `*.corrupt-<timestamp>` 隔离、输出告警并以空状态继续；其他 IO 错误保持重试后抛出的原行为。
+
+**状态**：已解决。损坏存储的隔离与空启动、非损坏 IO 错误的保留行为均有测试覆盖。
+
+## P-024 CLI 传输没有默认超时导致请求可能无限挂起
+
+**问题**：调用方和项目配置都没有设置 `timeoutMs` 时，CLI 传输的子进程没有任何超时；一个挂死的 vendor CLI 会永久占用 delegate/continue 请求。对比之下 MCP 传输默认 120 秒，行为不对称。公共类型 `RunnerOptions` 声明了 `defaultTimeoutMs`/`sessionStoragePath` 却没有接线到任何实现。
+
+**根因**：执行器把 `timeoutMs` 缺省视为 0（不超时），runner 只回退到调用参数与角色配置两层，缺少最终兜底；`RunnerOptions` 是先声明后实现的悬空公共契约。
+
+**解决方法**：`MultiAgentRunner` 接受 `RunnerOptions` 作为第三个构造参数：`defaultTimeoutMs` 缺省 600000ms（`DEFAULT_RUN_TIMEOUT_MS`）作为超时解析的最后一层；`sessionStoragePath` 在未注入 SessionManager 时用于构造持久化管理器。
+
+**状态**：已解决。默认超时与 `RunnerOptions` 覆盖行为均有测试覆盖，README 记录了默认值与覆盖方式。

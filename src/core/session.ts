@@ -2,7 +2,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { z } from "zod";
+import { ZodError, z } from "zod";
 import type { AgentName, AgentRole } from "../agents/types.js";
 import type { BridgeSession, SessionHistoryEntry, SessionManagerOptions } from "./types.js";
 
@@ -96,6 +96,10 @@ export class SessionManager {
 
   /**
    * Loads sessions from the persisted JSON storage file with retry resilience for concurrent writes.
+   *
+   * A file that is definitively corrupt (invalid JSON or failed schema validation)
+   * is quarantined next to the storage file and replaced with an empty state so a
+   * single damaged write cannot brick every AgentMesh command.
    */
   private loadFromFile(): void {
     let lastErr: unknown;
@@ -116,6 +120,10 @@ export class SessionManager {
         return;
       } catch (err) {
         lastErr = err;
+        if (err instanceof SyntaxError || err instanceof ZodError) {
+          this.quarantineCorruptStorage(err);
+          return;
+        }
         // Brief pause to yield if another process is in the middle of atomic rename
         if (attempt < 4) {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 15);
@@ -124,6 +132,20 @@ export class SessionManager {
     }
     const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
     throw new Error(`Failed to load AgentMesh sessions from '${this.storagePath}': ${message}`);
+  }
+
+  private quarantineCorruptStorage(error: Error): void {
+    const quarantinePath = `${this.storagePath}.corrupt-${Date.now()}`;
+    try {
+      fs.renameSync(this.storagePath, quarantinePath);
+    } catch {
+      // Even without quarantine rights we still start empty rather than fail to load.
+    }
+    this.sessions.clear();
+    process.stderr.write(
+      `AgentMesh session storage '${this.storagePath}' is corrupt (${error.message}). ` +
+        `It was quarantined as '${quarantinePath}' and an empty session list was loaded.\n`,
+    );
   }
 
   /**

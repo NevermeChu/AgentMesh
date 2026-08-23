@@ -139,11 +139,13 @@ export class ClaudeAdapter extends BaseAdapter {
         .join("\n")
         .trim();
       const nativeSessionId = parsed.sessionId || options.nativeSessionId;
-      const stderrSemanticError = res.stderr.match(/\[claude-code:([^\]]+)\]\s*(.*)/i);
+      // The structured result is authoritative: stderr diagnostics from auxiliary
+      // calls (e.g. session-title generation) must not override a successful run.
+      const stderrMatch = res.stderr.match(/\[claude-code:([^\]]+)\]\s*(.*)/i);
       const semanticError =
         parsed.error ||
-        (stderrSemanticError
-          ? `Claude ${stderrSemanticError[1]}: ${stderrSemanticError[2] || "semantic execution error"}`
+        (!parsed.output && stderrMatch
+          ? `Claude ${stderrMatch[1]}: ${stderrMatch[2] || "semantic execution error"}`
           : undefined);
 
       if (res.exitCode !== 0 || semanticError) {

@@ -3,21 +3,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AntigravityAdapter } from "../../src/agents/antigravity.js";
+import { ClaudeAdapter } from "../../src/agents/claude.js";
 import { CodexAdapter } from "../../src/agents/codex.js";
 
 describe("CLI adapter process integration", () => {
   let temporaryDirectory: string;
   let originalAgyBin: string | undefined;
+  let originalClaudeBin: string | undefined;
   let originalCodexBin: string | undefined;
 
   beforeEach(async () => {
     temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "agentmesh-adapter-integ-"));
     originalAgyBin = process.env.AGY_BIN;
+    originalClaudeBin = process.env.CLAUDE_BIN;
     originalCodexBin = process.env.CODEX_BIN;
   });
 
   afterEach(async () => {
     restoreEnvironment("AGY_BIN", originalAgyBin);
+    restoreEnvironment("CLAUDE_BIN", originalClaudeBin);
     restoreEnvironment("CODEX_BIN", originalCodexBin);
     await fs.rm(temporaryDirectory, { recursive: true, force: true });
   });
@@ -94,6 +98,36 @@ describe("CLI adapter process integration", () => {
     } else {
       expect(args).toEqual(expect.arrayContaining(["--sandbox"]));
     }
+  });
+
+  it("keeps a successful Claude run despite auxiliary stderr diagnostics", async () => {
+    const executable = await createFakeExecutable(temporaryDirectory);
+    const capturePath = path.join(temporaryDirectory, "claude-args.json");
+    process.env.CLAUDE_BIN = executable;
+
+    const result = await new ClaudeAdapter().run({
+      task: "Review the diff",
+      cwd: temporaryDirectory,
+      role: "reviewer",
+      mode: "cli",
+      env: {
+        FAKE_CAPTURE_PATH: capturePath,
+        FAKE_STDOUT: JSON.stringify({
+          session_id: "claude-integ-12345678",
+          is_error: false,
+          result: "PASS\nReview completed cleanly.",
+        }),
+        FAKE_STDERR:
+          '[claude-code:unrecognized_model] {"model":"proxy-model","query_source":"generate_session_title"}',
+      },
+    });
+
+    expect(result).toMatchObject({
+      status: "success",
+      reviewOutcome: "PASS",
+      nativeSessionId: "claude-integ-12345678",
+      transportUsed: "cli",
+    });
   });
 });
 

@@ -112,12 +112,23 @@ try {
 }
 
 function runNpm(args, cwd) {
-  const npmCli = process.env.npm_execpath;
+  const npmCli = process.env.npm_execpath || findNpmCli();
   if (npmCli) {
     return execFileSync(process.execPath, [npmCli, ...args], { cwd, encoding: "utf8" });
   }
-  return execFileSync(process.platform === "win32" ? "npm.cmd" : "npm", args, {
-    cwd,
-    encoding: "utf8",
-  });
+  if (process.platform === "win32") {
+    throw new Error("Unable to locate npm-cli.js for shell-free package verification on Windows.");
+  }
+  return execFileSync("npm", args, { cwd, encoding: "utf8" });
+}
+
+function findNpmCli() {
+  const candidates = [
+    path.join(path.dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js"),
+    ...String(process.env.PATH || "")
+      .split(path.delimiter)
+      .filter(Boolean)
+      .map((directory) => path.join(directory, "node_modules", "npm", "bin", "npm-cli.js")),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate));
 }

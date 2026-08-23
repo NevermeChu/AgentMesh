@@ -91,7 +91,8 @@ export class OpenCodeAdapter extends BaseAdapter {
     });
     const args = ["run", prompt, "--format", "json"];
     if (options.nativeSessionId) args.push("--session", options.nativeSessionId);
-    if (role !== "reviewer") args.push("--auto");
+    if (role === "reviewer") args.push("--agent", "plan");
+    else args.push("--auto");
     if (options.extraArgs && options.extraArgs.length > 0) args.push(...options.extraArgs);
     return args;
   }

@@ -9,11 +9,15 @@ export type {
   AgentExecutableInfo,
   AgentAdapter,
   ReviewFinding,
+  ReviewerSafetyPolicy,
+  ReviewerSafetyReport,
 } from "./agents/types.js";
 
 export type {
   BridgeSession,
   SessionHistoryEntry,
+  RepositoryStateEvidence,
+  SessionExecutionEvidence,
   SessionManagerOptions,
   RunnerOptions,
 } from "./core/types.js";
@@ -35,9 +39,10 @@ export {
   isCommandAvailable,
   escapeCmdArg,
   buildCmdCommandLine,
+  resolveCommandInvocation,
   ProcessExecutionError,
 } from "./core/executor.js";
-export type { ExecutionOptions, ExecutionResult } from "./core/executor.js";
+export type { CommandInvocation, ExecutionOptions, ExecutionResult } from "./core/executor.js";
 
 export { executeViaMcpClient } from "./core/mcp-client.js";
 export type { McpClientExecutionOptions, McpClientExecutionResult } from "./core/mcp-client.js";
@@ -55,6 +60,7 @@ export type { ParsedReviewOutput } from "./core/prompts.js";
 export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
+export { captureRepositoryState } from "./core/repository.js";
 export { findProjectConfigPath, loadProjectConfig, resolveRoleAssignment } from "./core/config.js";
 export type {
   AgentMeshProjectConfig,

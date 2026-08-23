@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { findExecutableOnPath, buildCmdCommandLine } from "./executor.js";
+import { resolveCommandInvocation } from "./executor.js";
 import { VERSION } from "../version.js";
 
 export interface McpClientExecutionOptions {
@@ -32,22 +32,7 @@ export async function executeViaMcpClient(
   const startTime = Date.now();
   const timeoutMs = options.timeoutMs ?? 120_000;
   const resolvedCwd = options.cwd ? path.resolve(options.cwd) : undefined;
-  const isWindows = process.platform === "win32";
-
-  // Resolve executable command path on PATH
-  const resolvedCmd = (await findExecutableOnPath(options.command)) || options.command;
-  let transportCommand = resolvedCmd;
-  let transportArgs = options.args;
-
-  // On Windows, route .cmd/.bat through cmd.exe for StdioClientTransport
-  if (isWindows) {
-    const lowerCmd = resolvedCmd.toLowerCase();
-    if (lowerCmd.endsWith(".cmd") || lowerCmd.endsWith(".bat")) {
-      const comSpec = process.env.ComSpec || "cmd.exe";
-      transportCommand = comSpec;
-      transportArgs = ["/d", "/s", "/c", buildCmdCommandLine(resolvedCmd, options.args)];
-    }
-  }
+  const invocation = await resolveCommandInvocation(options.command, options.args);
 
   const cleanEnv: Record<string, string> = {};
   for (const [key, value] of Object.entries({ ...process.env, ...options.env })) {
@@ -57,8 +42,8 @@ export async function executeViaMcpClient(
   }
 
   const transport = new StdioClientTransport({
-    command: transportCommand,
-    args: transportArgs,
+    command: invocation.command,
+    args: invocation.args,
     env: cleanEnv,
     cwd: resolvedCwd,
     stderr: "pipe",
@@ -98,10 +83,18 @@ export async function executeViaMcpClient(
         );
       }
 
-      const toolResult = await client.callTool({
-        name: targetTool,
-        arguments: options.toolArguments || {},
-      });
+      const toolResult = await client.callTool(
+        {
+          name: targetTool,
+          arguments: options.toolArguments || {},
+        },
+        undefined,
+        {
+          timeout: timeoutMs,
+          resetTimeoutOnProgress: true,
+          maxTotalTimeout: timeoutMs,
+        },
+      );
 
       const content: unknown = toolResult.content;
       const textOutput = Array.isArray(content)

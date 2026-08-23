@@ -10,6 +10,7 @@ export type AgentName =
 export type AgentRole = "worker" | "reviewer" | "tester";
 
 export type TransportMode = "auto" | "mcp" | "cli";
+export type ReviewerSafetyPolicy = "best-effort" | "enforced";
 
 export interface RunAgentOptions {
   task: string;
@@ -60,9 +61,19 @@ export interface AgentResult {
   transportUsed?: "mcp" | "cli";
   reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
   findings?: ReviewFinding[];
+  reviewerSafety?: ReviewerSafetyReport;
 }
 
 export type SandboxMechanism = "native-sandbox" | "tool-filtering" | "prompt-only";
+
+export interface ReviewerSafetyReport {
+  requested: ReviewerSafetyPolicy;
+  mechanism: SandboxMechanism;
+  enforced: boolean;
+  workspaceChanged?: boolean;
+  changedPaths?: string[];
+  warning?: string;
+}
 
 export interface AgentExecutableInfo {
   available: boolean;

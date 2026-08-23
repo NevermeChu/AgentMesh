@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import type { AgentRole, TransportMode } from "../agents/types.js";
+import type { AgentRole, ReviewerSafetyPolicy, TransportMode } from "../agents/types.js";
 
 export type ConfigurableRole = AgentRole | "orchestrator";
 
@@ -9,6 +9,7 @@ export interface RoleAssignment {
   agent: string;
   mode?: TransportMode;
   timeoutMs?: number;
+  safety?: ReviewerSafetyPolicy;
 }
 
 export interface AgentMeshProjectConfig {
@@ -23,15 +24,19 @@ export interface LoadedProjectConfig {
 }
 
 const NonBlankString = z.string().trim().min(1);
-const RoleAssignmentSchema = z.union([
+const AssignmentObjectSchema = z
+  .object({
+    agent: NonBlankString,
+    mode: z.enum(["auto", "mcp", "cli"]).optional(),
+    timeoutMs: z.number().int().positive().max(3_600_000).optional(),
+  })
+  .strict();
+const RoleAssignmentSchema = z.union([NonBlankString, AssignmentObjectSchema]);
+const ReviewerRoleAssignmentSchema = z.union([
   NonBlankString,
-  z
-    .object({
-      agent: NonBlankString,
-      mode: z.enum(["auto", "mcp", "cli"]).optional(),
-      timeoutMs: z.number().int().positive().max(3_600_000).optional(),
-    })
-    .strict(),
+  AssignmentObjectSchema.extend({
+    safety: z.enum(["best-effort", "enforced"]).optional(),
+  }).strict(),
 ]);
 
 const ProjectConfigSchema = z
@@ -41,7 +46,7 @@ const ProjectConfigSchema = z
       .object({
         orchestrator: RoleAssignmentSchema.optional(),
         worker: RoleAssignmentSchema.optional(),
-        reviewer: RoleAssignmentSchema.optional(),
+        reviewer: ReviewerRoleAssignmentSchema.optional(),
         tester: RoleAssignmentSchema.optional(),
       })
       .strict(),
@@ -49,7 +54,10 @@ const ProjectConfigSchema = z
   .strict();
 
 function normalizeAssignment(
-  value: z.infer<typeof RoleAssignmentSchema> | undefined,
+  value:
+    | z.infer<typeof RoleAssignmentSchema>
+    | z.infer<typeof ReviewerRoleAssignmentSchema>
+    | undefined,
 ): RoleAssignment | undefined {
   return typeof value === "string" ? { agent: value } : value;
 }

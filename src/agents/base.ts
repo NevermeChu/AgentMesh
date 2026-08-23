@@ -79,6 +79,24 @@ export abstract class BaseAdapter implements AgentAdapter {
     const startTime = Date.now();
     const mode = options.mode || "auto";
 
+    if (options.role === "reviewer" && options.extraArgs?.length) {
+      return this.formatErrorResult(
+        new Error(
+          `Additional CLI arguments are not allowed for ${this.displayName} Reviewer tasks because they could override safety controls.`,
+        ),
+        startTime,
+      );
+    }
+
+    if (mode !== "auto" && !this.supportedModes.includes(mode)) {
+      return this.formatErrorResult(
+        new Error(
+          `${mode.toUpperCase()} mode is not supported by ${this.displayName}. Supported modes: ${this.supportedModes.join(", ")}.`,
+        ),
+        startTime,
+      );
+    }
+
     // Determine whether to use MCP or CLI
     const useMcp =
       (mode === "mcp" && this.supportedModes.includes("mcp")) ||
@@ -176,7 +194,11 @@ export abstract class BaseAdapter implements AgentAdapter {
     }
 
     if (!summary) {
-      summary = extractSummary(output, "Execution completed", options?.role);
+      summary = extractSummary(
+        options?.finalAnswer || output,
+        "Execution completed",
+        options?.role,
+      );
     }
 
     return {

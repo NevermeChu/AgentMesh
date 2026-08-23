@@ -18,6 +18,12 @@ export interface ExecutionResult {
   timedOut: boolean;
 }
 
+export interface CommandInvocation {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
 export class ProcessExecutionError extends Error {
   readonly exitCode: number;
   readonly stdout: string;
@@ -152,6 +158,62 @@ export function buildCmdCommandLine(command: string, args: string[]): string {
 }
 
 /**
+ * Resolves a command into a shell-free process invocation.
+ *
+ * npm-generated Windows shims are unwrapped to their JavaScript entry point so
+ * prompts never pass through cmd.exe parsing. Arbitrary batch files are rejected
+ * because cmd.exe cannot preserve untrusted multiline arguments safely.
+ */
+export async function resolveCommandInvocation(
+  command: string,
+  args: string[],
+): Promise<CommandInvocation> {
+  const resolvedCommand = (await findExecutableOnPath(command)) || command;
+  if (process.platform !== "win32") {
+    return { command: resolvedCommand, args };
+  }
+
+  const lowerCommand = resolvedCommand.toLowerCase();
+  if (lowerCommand.endsWith(".ps1")) {
+    return {
+      command: "powershell.exe",
+      args: ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", resolvedCommand, ...args],
+    };
+  }
+
+  if (!lowerCommand.endsWith(".cmd") && !lowerCommand.endsWith(".bat")) {
+    return { command: resolvedCommand, args };
+  }
+
+  let shimContents: string;
+  try {
+    shimContents = fs.readFileSync(resolvedCommand, "utf8");
+  } catch (error) {
+    throw new Error(`Failed to read Windows command shim '${resolvedCommand}'.`, { cause: error });
+  }
+
+  const entryPattern = /(?:%~dp0|%dp0%)[\\/]([^"\r\n]+?\.(?:exe|com|(?:c|m)?js))["']?/gi;
+  const candidates = Array.from(shimContents.matchAll(entryPattern));
+  for (const match of candidates.reverse()) {
+    const relativeEntry = match[1];
+    if (!relativeEntry) continue;
+    const entryPath = path.resolve(path.dirname(resolvedCommand), relativeEntry);
+    if (!fs.existsSync(entryPath) || !fs.statSync(entryPath).isFile()) continue;
+    if (/\.(?:exe|com)$/i.test(entryPath)) {
+      return { command: entryPath, args };
+    }
+    const adjacentNode = path.join(path.dirname(resolvedCommand), "node.exe");
+    const nodeCommand = fs.existsSync(adjacentNode) ? adjacentNode : process.execPath;
+    return { command: nodeCommand, args: [entryPath, ...args] };
+  }
+
+  throw new Error(
+    `Windows batch command '${resolvedCommand}' is not a recognized Node.js CLI shim. ` +
+      "Use a native executable, PowerShell script, or npm-generated .cmd shim to preserve arguments safely.",
+  );
+}
+
+/**
  * Executes a command with cross-platform support and timeout safety.
  */
 export async function executeCommand(
@@ -162,31 +224,21 @@ export async function executeCommand(
   const startTime = Date.now();
   const isWindows = process.platform === "win32";
 
-  // Resolve binary if possible
-  const resolvedCmd = (await findExecutableOnPath(command)) || command;
   const cwd = options.cwd ? path.resolve(options.cwd) : process.cwd();
   const timeoutMs = options.timeoutMs ?? 0;
 
-  let actualCmd = resolvedCmd;
+  let actualCmd = command;
   let actualArgs = args;
-  let useShell = options.shell ?? false;
+  const useShell = options.shell ?? false;
   let windowsVerbatim = false;
 
-  // On Windows, route .cmd/.bat through cmd.exe with verbatim argument escaping
-  // to avoid Node.js DEP0190 and prevent shell metacharacter injection (&, |, <, >).
-  if (isWindows && options.shell === undefined) {
-    const lowerCmd = resolvedCmd.toLowerCase();
-    if (lowerCmd.endsWith(".cmd") || lowerCmd.endsWith(".bat")) {
-      const comSpec = process.env.ComSpec || "cmd.exe";
-      actualCmd = comSpec;
-      actualArgs = ["/d", "/s", "/c", buildCmdCommandLine(resolvedCmd, args)];
-      useShell = false;
-      windowsVerbatim = true;
-    } else if (lowerCmd.endsWith(".ps1")) {
-      actualCmd = "powershell.exe";
-      actualArgs = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", resolvedCmd, ...args];
-      useShell = false;
-    }
+  if (options.shell === undefined) {
+    const invocation = await resolveCommandInvocation(command, args);
+    actualCmd = invocation.command;
+    actualArgs = invocation.args;
+    windowsVerbatim = invocation.windowsVerbatimArguments ?? false;
+  } else {
+    actualCmd = (await findExecutableOnPath(command)) || command;
   }
 
   const spawnOptions: SpawnOptions = {
@@ -201,8 +253,10 @@ export async function executeCommand(
   };
 
   return new Promise<ExecutionResult>((resolve, reject) => {
-    let stdoutData = "";
-    let stderrData = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    const readStdout = () => Buffer.concat(stdoutChunks).toString("utf8");
+    const readStderr = () => Buffer.concat(stderrChunks).toString("utf8");
     let isSettled = false;
     let timedOut = false;
     let timer: NodeJS.Timeout | null = null;
@@ -264,8 +318,8 @@ export async function executeCommand(
           if (isSettled) return;
           isSettled = true;
           resolve({
-            stdout: stdoutData,
-            stderr: stderrData,
+            stdout: readStdout(),
+            stderr: readStderr(),
             exitCode: 124,
             durationMs: Date.now() - startTime,
             timedOut: true,
@@ -275,11 +329,11 @@ export async function executeCommand(
     }
 
     childProcess.stdout?.on("data", (chunk: Buffer) => {
-      stdoutData += chunk.toString("utf8");
+      stdoutChunks.push(chunk);
     });
 
     childProcess.stderr?.on("data", (chunk: Buffer) => {
-      stderrData += chunk.toString("utf8");
+      stderrChunks.push(chunk);
     });
 
     childProcess.on("error", (err: Error) => {
@@ -291,8 +345,8 @@ export async function executeCommand(
       reject(
         new ProcessExecutionError(`Process '${command}' encountered error: ${err.message}`, {
           exitCode: 1,
-          stdout: stdoutData,
-          stderr: stderrData || err.message,
+          stdout: readStdout(),
+          stderr: readStderr() || err.message,
           timedOut,
         }),
       );
@@ -308,8 +362,8 @@ export async function executeCommand(
       const exitCode = timedOut ? 124 : code !== null ? code : signal ? 128 : 0;
 
       resolve({
-        stdout: stdoutData,
-        stderr: stderrData,
+        stdout: readStdout(),
+        stderr: readStderr(),
         exitCode,
         durationMs,
         timedOut,

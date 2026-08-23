@@ -27,8 +27,9 @@ describe("CLI adapter process integration", () => {
     const capturePath = path.join(temporaryDirectory, "codex-args.json");
     process.env.CODEX_BIN = executable;
 
+    const task = 'Implement a cache\nPreserve "quotes", 100% values & literal | pipes!';
     const result = await new CodexAdapter().run({
-      task: "Implement a cache",
+      task,
       cwd: temporaryDirectory,
       role: "worker",
       mode: "cli",
@@ -51,11 +52,11 @@ describe("CLI adapter process integration", () => {
       nativeSessionId: "native-codex-integ",
       transportUsed: "cli",
     });
-    const sandboxConfig =
-      process.platform === "win32"
-        ? "sandbox_mode=workspace-write"
-        : 'sandbox_mode="workspace-write"';
+    const sandboxConfig = 'sandbox_mode="workspace-write"';
     expect(args).toEqual(expect.arrayContaining(["exec", "-c", sandboxConfig, "--json"]));
+    expect(Array.isArray(args) && args.some((argument) => String(argument).includes(task))).toBe(
+      true,
+    );
   });
 
   it("enforces Antigravity reviewer process arguments", async () => {
@@ -116,12 +117,8 @@ async function createFakeExecutable(directory: string): Promise<string> {
   );
 
   if (process.platform === "win32") {
-    const wrapperPath = path.join(directory, "fake-agent.ps1");
-    await fs.writeFile(
-      wrapperPath,
-      `& "${process.execPath}" "$PSScriptRoot/fake-agent.mjs" @args\nexit $LASTEXITCODE\n`,
-      "utf8",
-    );
+    const wrapperPath = path.join(directory, "fake-agent.cmd");
+    await fs.writeFile(wrapperPath, '@ECHO off\nnode "%~dp0\\fake-agent.mjs" %*\n', "utf8");
     return wrapperPath;
   }
 

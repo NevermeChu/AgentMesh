@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
 import { createMcpServer } from "../../src/mcp/server.js";
 import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
@@ -116,6 +117,22 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("Executed successfully: Implement user registration");
   });
 
+  it("emits MCP progress notifications for agent tasks", async () => {
+    const messages: string[] = [];
+    client.setNotificationHandler(ProgressNotificationSchema, (notification) => {
+      if (notification.params.message) messages.push(notification.params.message);
+    });
+
+    const result = await client.callTool({
+      name: "delegate_task",
+      arguments: { agent: "codex", task: "Report progress", role: "worker" },
+      _meta: { progressToken: "agentmesh-progress-test" },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(messages).toEqual(["Agent task started", "Agent task success"]);
+  });
+
   it("returns a successful reviewer verdict through MCP", async () => {
     const res = await client.callTool({
       name: "review_changes",
@@ -130,6 +147,8 @@ describe("mcp/tools protocol integration", () => {
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("[Reviewer: codex | Review Outcome: PASS | Status: SUCCESS");
     expect(content[0]?.text).toContain("PASS");
+    expect(content[0]?.text).toContain("Reviewer Safety:");
+    expect(content[0]?.text).toContain('"mechanism": "prompt-only"');
   });
 
   it("propagates reviewer findings as an MCP error", async () => {

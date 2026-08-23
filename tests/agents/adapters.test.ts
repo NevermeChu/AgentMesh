@@ -30,6 +30,21 @@ describe("agents/adapters", () => {
     delete process.env.GROK_BIN;
   });
 
+  it("rejects an explicitly unsupported transport without falling back", async () => {
+    process.env.GROK_BIN = "non_existent_binary_transport_probe";
+    const result = await new GrokAdapter().run({ task: "Probe transport", mode: "mcp" });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      exitCode: 1,
+    });
+    expect(result.error).toContain("MCP mode is not supported");
+    expect(result.transportUsed).toBeUndefined();
+    expect(result.output).not.toContain("ENOENT");
+
+    delete process.env.GROK_BIN;
+  });
+
   it("does not interpret worker test failures as a reviewer verdict", async () => {
     class MockWorkerAdapter extends BaseAdapter {
       readonly name = "codex" as const;
@@ -98,6 +113,32 @@ describe("agents/adapters", () => {
     expect(result.summary).toContain("Review FAILED");
   });
 
+  it("rejects reviewer extra arguments before invoking the CLI", async () => {
+    let invoked = false;
+    class ProtectedReviewerAdapter extends BaseAdapter {
+      readonly name = "codex" as const;
+      readonly displayName = "Protected Reviewer";
+      readonly supportedModes = ["cli"] as const;
+      readonly sandboxMechanism = "native-sandbox" as const;
+      readonly envBinOverride = "TEST_CODEX_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli() {
+        invoked = true;
+        return this.formatSuccessResult("PASS", Date.now(), { role: "reviewer" });
+      }
+    }
+
+    const result = await new ProtectedReviewerAdapter().run({
+      task: "Review",
+      role: "reviewer",
+      extraArgs: ["--dangerously-disable-sandbox"],
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("Additional CLI arguments are not allowed");
+    expect(invoked).toBe(false);
+  });
+
   it("fails closed when reviewer output has no verdict", async () => {
     class UnknownReviewerAdapter extends BaseAdapter {
       readonly name = "codex" as const;
@@ -121,5 +162,25 @@ describe("agents/adapters", () => {
     });
     expect(result.status).toBe("failed");
     expect(result.reviewOutcome).toBe("UNKNOWN");
+  });
+
+  it("derives summaries from the normalized final answer", async () => {
+    class FinalAnswerAdapter extends BaseAdapter {
+      readonly name = "codex" as const;
+      readonly displayName = "Mock Codex";
+      readonly supportedModes = ["cli"] as const;
+      readonly sandboxMechanism = "prompt-only" as const;
+      readonly envBinOverride = "TEST_CODEX_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli() {
+        return this.formatSuccessResult("Reading additional input from stdin...", Date.now(), {
+          finalAnswer: "Implemented the requested cache safely.",
+        });
+      }
+    }
+
+    const result = await new FinalAnswerAdapter().run({ task: "Implement cache" });
+    expect(result.summary).toBe("Implemented the requested cache safely.");
   });
 });

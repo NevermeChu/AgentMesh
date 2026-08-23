@@ -48,9 +48,9 @@
 
 **根因**：不同 Agent 的原生会话不能直接共享，AgentMesh 之前也没有生成适合跨 Agent 传递的规范化历史。
 
-**解决方法**：通过 `contextSessionId` 将前序会话最近若干轮的 task、summary、`finalAnswer` 和 findings 注入新会话，并明确要求后续角色复用仍然有效的结果，在仓库状态变化或证据冲突时再重新验证。
+**解决方法**：通过 `contextSessionId` 将前序会话最近若干轮的 task、summary、`finalAnswer` 和 findings 注入新会话；每轮同时记录执行前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时比较当前状态与来源会话最后状态，生成 `MATCHED`、`STALE` 或 `UNKNOWN` 新鲜度结论，只在匹配时直接复用结果。
 
-**状态**：受限可用。真实测试中 Reviewer 没有重试 Worker 已确认会失败的命令；Tester 复用了 Reviewer 的静态结论，没有再次审查源码。但当前上下文缺少 commit、diff、文件和命令结果的版本指纹，Reviewer 仍需重新读取关键文件并重跑关键测试。
+**状态**：已解决。测试覆盖未变化仓库的 `MATCHED` 交接和文件变化后的 `STALE` 交接；旧 Session 保持兼容并在缺少证据时明确标记为 `UNKNOWN`。
 
 ## P-006 Reviewer 的只读要求不能只依赖提示词
 
@@ -58,9 +58,9 @@
 
 **根因**：角色和提示词是语义约束，不是操作系统或 CLI 运行时权限；不同 Agent 的沙箱能力也不一致。
 
-**解决方法**：为适配器声明真实的沙箱机制；Codex Reviewer 使用原生只读沙箱，Codex Worker 使用工作区写入沙箱；无法强制只读的适配器明确标记为 `prompt-only`，避免把提示词约束描述成安全边界。
+**解决方法**：为适配器声明真实的沙箱机制；Codex Reviewer 使用原生只读沙箱，Claude 使用读取工具白名单，OpenCode Reviewer 使用 `plan` Agent，无法强制只读的适配器明确标记为 `prompt-only`。项目配置支持默认的 `best-effort` 和可选的 `enforced`；后者拒绝 prompt-only Reviewer。所有 Reviewer 禁止额外 CLI 参数，并比较执行前后的仓库指纹，检测到变化时返回 `FAIL` 且不自动回滚。
 
-**状态**：受限可用。Codex 的 Worker/Reviewer 权限已经按角色强制区分；真实 Reviewer 调用前后工作树没有变化。Antigravity 在 Windows 上仍有 P-010 所述限制。
+**状态**：受限可用。原生沙箱和工具过滤可以强制执行；`best-effort` 允许 Windows Antigravity 等 prompt-only Agent 并明确警告和检测误写，但仍不等同于操作系统级只读。需要严格边界时可配置 `enforced` 或使用 Codex Reviewer。
 
 ## P-007 进程退出码为 0 时仍可能发生语义失败
 
@@ -98,9 +98,9 @@
 
 **根因**：Antigravity 原生沙箱初始化会扫描或授权本机工具链路径，其中存在当前进程不能访问的受保护目录；调整 PATH 和 GOPATH 不能阻止该初始化行为。
 
-**解决方法**：非 Windows 保留 Antigravity 原生沙箱；Windows 暂时省略原生沙箱并明确标记为 `prompt-only`，Reviewer 继续使用 `plan` 模式，同时由 Orchestrator 检查调用前后的工作树状态。后续应支持沙箱目录白名单，或在临时 worktree/独立受限进程中执行审查。
+**解决方法**：非 Windows 保留 Antigravity 原生沙箱；Windows 暂时省略原生沙箱并明确标记为 `prompt-only`，Reviewer 继续使用 `plan` 模式。Runner 自动检查调用前后的工作树内容指纹，误写时将 Review 标记为失败；配置 `safety: enforced` 可以直接拒绝该平台上的 Antigravity Reviewer。
 
-**状态**：受限可用。真实 Reviewer 和 Tester 已走通，但 Windows Reviewer 目前不是操作系统级强制只读。
+**状态**：受限可用。真实 Reviewer 和 Tester 已走通，误写可以检测和阻断后续编排，但 Windows Reviewer 目前仍不是操作系统级强制只读。
 
 ## P-011 Agent 执行超时不能延长 MCP 请求超时
 
@@ -108,9 +108,9 @@
 
 **根因**：AgentMesh 的 `timeoutMs` 只控制底层 Agent 子进程；MCP SDK 的 request timeout 属于 Orchestrator 客户端，两者是独立的超时层级。
 
-**解决方法**：当前由 Orchestrator 在 `callTool` 时显式设置大于 Agent 超时的请求超时。后续应提供统一的超时配置说明，并考虑 MCP Progress 或异步任务句柄，避免长任务长期占用同步请求。
+**解决方法**：AgentMesh 在任务开始、每 15 秒和完成时发送标准 MCP Progress 通知；MCP 客户端注册 `onprogress` 并启用 `resetTimeoutOnProgress`，同时以 `maxTotalTimeout` 保留总时间上限。底层 `timeoutMs` 仍独立控制 Agent 进程。
 
-**状态**：受限可用。将 MCP 请求超时提高到 360 秒后，约 169 秒的真实 Worker 调用成功完成；AgentMesh 目前无法替外部 Orchestrator 修改其客户端超时。
+**状态**：已解决。协议测试确认任务会发送开始和完成通知；客户端仍需按文档请求 Progress，因为 AgentMesh 不能替外部 Orchestrator 修改本地请求选项。
 
 ## P-012 Codex 短摘要可能选中过程消息
 
@@ -118,9 +118,9 @@
 
 **根因**：摘要生成仍可能使用通用输出片段，没有只从最终 `agent_message` 或明确完成事件中取值，也没有过滤已知进度消息。
 
-**解决方法**：当前在 MCP 结果和跨角色上下文中保留完整 `finalAnswer`，不依赖短 summary 作关键判断；后续应从最后一个有效 Agent 消息生成摘要并过滤过程事件。
+**解决方法**：Codex JSON Lines 解析器只保留最后一个有效 `agent_message` 作为规范化最终回答；通用成功结果优先从 `finalAnswer` 生成摘要，不再从混杂的传输输出中选择过程文本。
 
-**状态**：待解决。不阻塞任务交接和结果判断，但影响 Session 列表及快速诊断的可读性。
+**状态**：已解决。回归测试覆盖过程消息之后出现最终回答，以及传输输出与 `finalAnswer` 不一致的情况。
 
 ## P-013 Session 历史只能查询，不能主动通知
 
@@ -128,9 +128,9 @@
 
 **根因**：当前 Session 能力是持久化和按需查询，没有事件订阅、webhook 或通知通道；工作流是否继续仍由 Orchestrator 检查工具结果后决定。
 
-**解决方法**：当前将失败作为 MCP 错误结果传播，并要求 Orchestrator 检查每次调用状态；Session 保存结构化历史供事后追溯。需要长期无人值守工作流时，再增加可选事件订阅、webhook 或结构化审计输出。
+**解决方法**：失败继续作为 MCP 错误结果传播，Session 保存结构化历史供追溯；同步执行期间通过标准 MCP Progress 发送开始、心跳和完成状态，使已订阅的 Orchestrator 能持续获知任务仍在运行。跨请求离线 webhook 明确不属于本地 stdio Bridge 的职责。
 
-**状态**：待解决。同步编排链路可以正确获知失败，但尚不具备主动告警能力。
+**状态**：已解决。同步 MCP 链路具备结构化结果和实时 Progress 通知；无人值守的跨系统告警应由外部 Orchestrator 或专门事件服务承担。
 
 ## P-014 真实测试中的命令在不同沙箱下表现不一致
 
@@ -171,3 +171,43 @@
 **解决方法**：分别捕获操作结果和清理错误，优先传播原始操作异常，仅在操作成功时报告清理失败；所有重新包装的错误保留 `cause`。
 
 **状态**：已解决。类型感知 ESLint 已将 `no-unsafe-finally` 和错误链保留纳入持续门禁，会话单元测试通过。
+
+## P-018 显式传输模式被静默替换
+
+**问题**：调用者为只支持 CLI 的 Agent 显式指定 `mode=mcp` 时，适配器仍然启动 CLI，并把实际传输报告为 `cli`。
+
+**根因**：传输选择逻辑只判断是否进入 MCP 分支，其余情况统一落入 CLI 分支，没有先区分显式选择和允许自动降级的 `auto`。
+
+**解决方法**：在任何进程启动前校验显式模式是否包含在适配器的 `supportedModes` 中；不支持时返回结构化失败，只有 `auto` 可以从首选 MCP 降级到 CLI。
+
+**状态**：已解决。回归测试确认 CLI-only 适配器收到 `mode=mcp` 时不会尝试启动 CLI，也不会错误填写 `transportUsed`。
+
+## P-019 Windows CMD shim 会破坏复杂 Prompt 参数
+
+**问题**：Windows 上通过 npm `.cmd` shim 启动 Agent 时，多行 Prompt、引号和 `&`、`|`、`%` 等字符可能被 `cmd.exe` 二次解析，造成参数丢失、拆分或命令注入风险。
+
+**根因**：执行器把命令及全部参数手工拼接为 `cmd.exe /d /s /c` 字符串；Windows CMD 的批处理展开和引号规则无法用普通反斜杠转义可靠覆盖。
+
+**解决方法**：识别 npm 生成的 CLI shim，解析其 JavaScript入口或包内原生 `.exe` 入口，并通过进程参数数组直接传递；不再让 Agent Prompt 经过 CMD。无法识别的任意 `.cmd` 或 `.bat` 明确拒绝，要求改用原生可执行文件、PowerShell 脚本或标准 npm shim。
+
+**状态**：已解决。Windows 真实子进程集成测试覆盖换行、双引号、百分号和 shell 元字符，并验证底层 Agent 收到完整的单一 Prompt 参数。
+
+## P-020 工具脚本和 MCP Server 生命周期依赖隐式进程环境
+
+**问题**：Windows 直接执行发布包验证脚本时，`spawnSync npm.cmd EINVAL` 导致失败；程序化重复启动并关闭 MCP Server 时，信号监听器不会移除。
+
+**根因**：包验证仅在 `npm run` 提供 `npm_execpath` 时走 Node 入口，独立执行回退到直接 spawn `.cmd`；MCP Server 将 SIGINT/SIGTERM 监听器注册到全局进程，却没有把清理绑定到正常 `server.close()`。
+
+**解决方法**：包验证从当前 Node 安装目录或 PATH 相邻目录解析 `npm-cli.js` 并用 Node 启动；MCP Server 的 `close()` 变为幂等清理入口，正常关闭和信号关闭都会移除监听器，并允许程序化调用通过 `handleSignals: false` 禁用全局处理。
+
+**状态**：已解决。`npm run test:package` 与直接执行 `node scripts/verify-package.mjs` 均纳入验证，服务器关闭不再遗留进程监听器。
+
+## P-021 子进程 UTF-8 分块解码导致仓库指纹假阳性
+
+**问题**：Reviewer 没有修改文件，但执行前后的仓库内容指纹偶发不同，导致正常 Review 被错误标记为工作区发生变化。
+
+**根因**：子进程执行器对每个 stdout/stderr Buffer 分块分别调用 `toString("utf8")`；中文等多字节字符被操作系统拆到两个数据块时会产生替换字符，导致同一份 `git diff` 文本出现不同解码结果和哈希。
+
+**解决方法**：先保存原始 Buffer 分块，在进程结束或超时后通过 `Buffer.concat` 合并，再统一进行一次 UTF-8 解码；仓库指纹继续基于完整内容计算。
+
+**状态**：已解决。回归测试强制把一个中文字符拆成两个进程输出块；连续六次仓库状态采集得到相同指纹，Reviewer 协议测试不再出现误报。

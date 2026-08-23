@@ -29,7 +29,7 @@ export function parseCodexJsonLines(output: string): {
   error?: string;
 } {
   let sessionId: string | undefined;
-  const messages: string[] = [];
+  let finalMessage = "";
   let error: string | undefined;
 
   for (const line of output.split(/\r?\n/)) {
@@ -53,7 +53,7 @@ export function parseCodexJsonLines(output: string): {
       if (item && typeof item === "object") {
         const record = item as Record<string, unknown>;
         if (record.type === "agent_message" && typeof record.text === "string") {
-          messages.push(record.text);
+          finalMessage = record.text;
         }
       }
     } catch {
@@ -61,7 +61,7 @@ export function parseCodexJsonLines(output: string): {
     }
   }
 
-  return { output: messages.join("\n\n"), sessionId, error };
+  return { output: finalMessage, sessionId, error };
 }
 
 export class CodexAdapter extends BaseAdapter {

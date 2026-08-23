@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { defaultRunner } from "../core/runner.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import { registerMcpTools } from "./tools.js";
@@ -9,6 +10,8 @@ export interface McpServerOptions {
   name?: string;
   version?: string;
   runner?: MultiAgentRunner;
+  handleSignals?: boolean;
+  transport?: Transport;
 }
 
 /**
@@ -31,18 +34,35 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
  */
 export async function startMcpServer(options: McpServerOptions = {}): Promise<McpServer> {
   const server = createMcpServer(options);
-  const transport = new StdioServerTransport();
+  const transport = options.transport || new StdioServerTransport();
 
   await server.connect(transport);
 
-  // Handle process signals for graceful shutdown
+  if (options.handleSignals === false) return server;
+
+  // Handle process signals for graceful shutdown. Unregister on normal close so
+  // repeated programmatic starts do not accumulate process listeners.
+  const originalClose = server.close.bind(server);
+  let closePromise: Promise<void> | undefined;
+  const removeSignalHandlers = () => {
+    process.off("SIGINT", handleExit);
+    process.off("SIGTERM", handleExit);
+  };
+  const closeServer = async () => {
+    if (!closePromise) {
+      removeSignalHandlers();
+      closePromise = originalClose();
+    }
+    await closePromise;
+  };
+
   const closeAndExit = async () => {
     try {
-      await server.close();
+      await closeServer();
     } catch {
       // Ignore
     }
-    process.exit(0);
+    process.exitCode = 0;
   };
 
   const handleExit = () => {
@@ -51,6 +71,7 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<Mc
 
   process.on("SIGINT", handleExit);
   process.on("SIGTERM", handleExit);
+  server.close = closeServer;
 
   return server;
 }

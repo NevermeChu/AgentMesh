@@ -1,9 +1,13 @@
 import { describe, it, expect } from "vitest";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   executeCommand,
   findExecutableOnPath,
   escapeCmdArg,
   buildCmdCommandLine,
+  resolveCommandInvocation,
 } from "../../src/core/executor.js";
 
 describe("core/executor", () => {
@@ -45,6 +49,14 @@ describe("core/executor", () => {
     expect(res.timedOut).toBe(false);
   });
 
+  it("preserves UTF-8 characters split across process chunks", async () => {
+    const res = await executeCommand("node", [
+      "-e",
+      "process.stdout.write(Buffer.from([0xe4])); setTimeout(() => process.stdout.write(Buffer.from([0xb8, 0xad])), 20)",
+    ]);
+    expect(res.stdout).toBe("中");
+  });
+
   it("captures non-zero exit code and stderr", async () => {
     const res = await executeCommand("node", [
       "-e",
@@ -75,4 +87,62 @@ describe("core/executor", () => {
     expect(cmdLine).toContain('"C:/path with spaces/bin.cmd"');
     expect(cmdLine).toContain('"auth & token"');
   });
+
+  it.runIf(process.platform === "win32")(
+    "unwraps npm-style command shims without cmd.exe parsing",
+    async () => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentmesh-cmd-shim-"));
+      try {
+        const entry = path.join(directory, "cli.mjs");
+        const shim = path.join(directory, "cli.cmd");
+        await fs.writeFile(entry, "", "utf8");
+        await fs.writeFile(shim, '@ECHO off\nnode "%~dp0\\cli.mjs" %*\n', "utf8");
+        const args = ['line one\nline two "quoted" & literal | pipe %value%!'];
+
+        const invocation = await resolveCommandInvocation(shim, args);
+
+        expect(invocation.command).toBe(process.execPath);
+        expect(invocation.args).toEqual([entry, ...args]);
+      } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "unwraps npm shims that point to packaged native executables",
+    async () => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentmesh-native-shim-"));
+      try {
+        const entry = path.join(directory, "agent.exe");
+        const shim = path.join(directory, "agent.cmd");
+        await fs.writeFile(entry, "", "utf8");
+        await fs.writeFile(shim, '@ECHO off\n"%~dp0\\agent.exe" %*\n', "utf8");
+        const args = ["review", "line one\nline two & literal"];
+
+        await expect(resolveCommandInvocation(shim, args)).resolves.toEqual({
+          command: entry,
+          args,
+        });
+      } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "rejects arbitrary batch files instead of interpolating untrusted arguments",
+    async () => {
+      const directory = await fs.mkdtemp(path.join(os.tmpdir(), "agentmesh-batch-reject-"));
+      try {
+        const batch = path.join(directory, "unsafe.cmd");
+        await fs.writeFile(batch, "@echo %*\n", "utf8");
+        await expect(resolveCommandInvocation(batch, ["safe & whoami"])).rejects.toThrow(
+          "not a recognized Node.js CLI shim",
+        );
+      } finally {
+        await fs.rm(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });

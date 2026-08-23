@@ -82,6 +82,25 @@ describe("core/session", () => {
       timestamp: new Date().toISOString(),
       status: "success",
       summary: "Created 5 tests",
+      evidence: {
+        transportUsed: "cli",
+        exitCode: 0,
+        durationMs: 125,
+        repositoryAfter: {
+          capturedAt: new Date().toISOString(),
+          repositoryRoot: "/my/project",
+          head: "abc123",
+          dirty: false,
+          fingerprint: "a".repeat(64),
+          changedPaths: [],
+        },
+      },
+      reviewerSafety: {
+        requested: "best-effort",
+        mechanism: "tool-filtering",
+        enforced: true,
+        workspaceChanged: false,
+      },
     });
 
     expect(fs.existsSync(tempStoragePath)).toBe(true);
@@ -99,6 +118,8 @@ describe("core/session", () => {
     expect(reloaded?.nativeSessionId).toBe("native_thread_456");
     expect(reloaded?.history.length).toBe(1);
     expect(reloaded?.history[0]?.summary).toBe("Created 5 tests");
+    expect(reloaded?.history[0]?.evidence?.repositoryAfter?.fingerprint).toBe("a".repeat(64));
+    expect(reloaded?.history[0]?.reviewerSafety?.mechanism).toBe("tool-filtering");
   });
 
   it("preserves updates from concurrent manager instances", () => {

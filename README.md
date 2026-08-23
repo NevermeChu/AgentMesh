@@ -33,6 +33,8 @@
 
 > 底层 Agent CLI 只需已经安装、可执行并完成各自所需的登录或授权，不需要全部预先启动。AgentMesh 在收到任务后只会按角色配置启动本次使用的 CLI 或原生 MCP Server。
 
+> `mode=auto` 会优先使用适配器的首选传输，并在支持时自动降级；显式指定 `mode=mcp` 或 `mode=cli` 时严格执行该选择，不支持的模式直接返回结构化错误。Windows 上 npm 生成的 `.cmd` CLI shim 会被解析为对应的 Node.js 或包内原生可执行入口，Prompt 不经过 `cmd.exe`；无法安全识别的任意 `.cmd` / `.bat` 会被拒绝。
+
 ---
 
 ## 🚀 快速开始
@@ -107,7 +109,8 @@ agentmesh debug continue bridge-sess_8f3d1a "继续诊断"
     "reviewer": {
       "agent": "claude",
       "mode": "cli",
-      "timeoutMs": 300000
+      "timeoutMs": 300000,
+      "safety": "best-effort"
     },
     "tester": "claude"
   }
@@ -115,6 +118,13 @@ agentmesh debug continue bridge-sess_8f3d1a "继续诊断"
 ```
 
 同一 Agent 可以配置到多个角色。Worker、Reviewer、Tester 启动新的角色任务时会创建独立的 Bridge Session，因此同一 CLI 的不同会话可以同时承担不同角色；显式传入 `sessionId` 时则继续并校验已有 Session。`orchestrator` 用于记录项目的主控 Agent，不会替代三个可执行角色。
+
+Reviewer 的 `safety` 支持：
+
+- `best-effort`（默认）：允许所有 Agent，使用适配器当前能提供的最强保护；`prompt-only` 会返回明确警告。
+- `enforced`：只允许 `native-sandbox` 或 `tool-filtering`，遇到 `prompt-only` Agent 时在启动前失败。
+
+所有 Reviewer 都禁止调用者追加 `extraArgs`，避免覆盖固定的沙箱、工具或权限参数。AgentMesh 会比较 Reviewer 执行前后的仓库内容指纹；工作树在执行期间发生变化时，Review 会返回 `FAIL`、列出变更路径且不会自动回滚，以免覆盖用户的并发修改。该检测能发现误写，但 `best-effort` 本身不是操作系统级只读隔离。
 
 ```bash
 # 查看并校验当前生效配置
@@ -182,6 +192,8 @@ continue_task(Worker Session, task=Orchestrator 整理的审查/测试反馈) �
 
 这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机。`contextSessionId` 一次引用一个 Bridge Session，并把该 Session 的规范化历史注入目标角色；它不会合并所有会话，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。
+
 ### 长任务超时
 
 AgentMesh Tool 的 `timeoutMs` 控制底层 Agent 进程或 Agent 原生 MCP 调用，不会修改 Orchestrator 自身 MCP 客户端的 request timeout。长任务必须同时满足：
@@ -190,13 +202,18 @@ AgentMesh Tool 的 `timeoutMs` 控制底层 Agent 进程或 Agent 原生 MCP 调
 Orchestrator MCP request timeout > AgentMesh timeoutMs > 预期 Agent 执行时间
 ```
 
-例如使用 MCP SDK 直接调用时，应在客户端调用选项中另外设置请求超时：
+AgentMesh 在客户端请求 Progress 时会在任务开始、每 15 秒和完成时发送标准 MCP Progress 通知。使用 MCP SDK 直接调用时，应同时注册进度回调、允许进度重置空闲超时，并设置总超时上限：
 
 ```ts
-await client.callTool(params, undefined, { timeout: 360_000 });
+await client.callTool(params, undefined, {
+  timeout: 30_000,
+  resetTimeoutOnProgress: true,
+  maxTotalTimeout: 360_000,
+  onprogress: ({ message }) => console.log(message),
+});
 ```
 
-具体配置入口取决于 Orchestrator；若客户端固定在较短超时，即使 `.agentmesh/config.json` 已设置更长的 `timeoutMs`，外层请求仍会先取消。
+具体配置入口取决于 Orchestrator；若客户端不请求 Progress 且固定在较短超时，即使 `.agentmesh/config.json` 已设置更长的 `timeoutMs`，外层请求仍会先取消。同步 MCP 链路通过 Progress 提供实时状态和失败结果；跨请求或离线 webhook 不属于当前本地 stdio Bridge 的职责。
 
 ---
 

@@ -155,6 +155,7 @@ describe("agents/args construction", () => {
     expect(reviewerArgs).toContain("--session");
     expect(reviewerArgs).toContain("ses_12345678");
     expect(reviewerArgs).not.toContain("--auto");
+    expect(reviewerArgs).toEqual(expect.arrayContaining(["--agent", "plan"]));
 
     expect(adapter.buildCliArgs({ task: "Implement", role: "worker" })).toContain("--auto");
   });
@@ -171,6 +172,20 @@ describe("agents/args construction", () => {
     );
     expect(codex.sessionId).toBe("thread-12345678");
     expect(codex.output).toBe("Implemented safely.");
+
+    const codexWithProgress = parseCodexJsonLines(
+      [
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "Reading additional input from stdin..." },
+        }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "Final implementation summary." },
+        }),
+      ].join("\n"),
+    );
+    expect(codexWithProgress.output).toBe("Final implementation summary.");
 
     const codexError = parseCodexJsonLines(
       JSON.stringify({ type: "error", message: "workspace write rejected" }),

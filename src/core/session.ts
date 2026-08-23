@@ -23,6 +23,30 @@ const ReviewFindingSchema = z.object({
   issue: z.string(),
   suggestion: z.string().optional(),
 });
+const RepositoryStateEvidenceSchema = z.object({
+  capturedAt: z.string().datetime(),
+  repositoryRoot: z.string().min(1),
+  head: z.string().min(1).optional(),
+  dirty: z.boolean(),
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  changedPaths: z.array(z.string()),
+  pathFingerprints: z.record(z.string().regex(/^[a-f0-9]{64}$/)).optional(),
+});
+const SessionExecutionEvidenceSchema = z.object({
+  repositoryBefore: RepositoryStateEvidenceSchema.optional(),
+  repositoryAfter: RepositoryStateEvidenceSchema.optional(),
+  transportUsed: z.enum(["mcp", "cli"]).optional(),
+  exitCode: z.number().int().optional(),
+  durationMs: z.number().nonnegative().optional(),
+});
+const ReviewerSafetyReportSchema = z.object({
+  requested: z.enum(["best-effort", "enforced"]),
+  mechanism: z.enum(["native-sandbox", "tool-filtering", "prompt-only"]),
+  enforced: z.boolean(),
+  workspaceChanged: z.boolean().optional(),
+  changedPaths: z.array(z.string()).optional(),
+  warning: z.string().optional(),
+});
 const SessionHistoryEntrySchema = z.object({
   role: AgentRoleSchema,
   task: z.string(),
@@ -32,6 +56,8 @@ const SessionHistoryEntrySchema = z.object({
   finalAnswer: z.string().optional(),
   findings: z.array(ReviewFindingSchema).optional(),
   nativeSessionId: z.string().min(1).optional(),
+  evidence: SessionExecutionEvidenceSchema.optional(),
+  reviewerSafety: ReviewerSafetyReportSchema.optional(),
 });
 const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),

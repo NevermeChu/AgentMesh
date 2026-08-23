@@ -36,7 +36,12 @@ describe("core/project config", () => {
       roles: {
         orchestrator: "antigravity",
         worker: "antigravity",
-        reviewer: { agent: "claude", mode: "cli", timeoutMs: 120000 },
+        reviewer: {
+          agent: "claude",
+          mode: "cli",
+          timeoutMs: 120000,
+          safety: "enforced",
+        },
         tester: "claude",
       },
     });
@@ -49,6 +54,7 @@ describe("core/project config", () => {
       agent: "claude",
       mode: "cli",
       timeoutMs: 120000,
+      safety: "enforced",
     });
     expect(resolveRoleAssignment(project.nested, "tester").assignment?.agent).toBe("claude");
   });
@@ -56,6 +62,14 @@ describe("core/project config", () => {
   it("fails with a precise error for invalid project config", () => {
     const project = createProject({ version: 1, roles: { reviewer: { agent: "" } } });
     expect(() => loadProjectConfig(project.root)).toThrow("Invalid AgentMesh project config");
+  });
+
+  it("rejects reviewer-only safety settings on other roles", () => {
+    const project = createProject({
+      version: 1,
+      roles: { worker: { agent: "codex", safety: "best-effort" } },
+    });
+    expect(() => loadProjectConfig(project.root)).toThrow("Unrecognized key");
   });
 
   it("does not inherit configuration beyond the nearest repository boundary", () => {

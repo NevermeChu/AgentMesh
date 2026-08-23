@@ -1,10 +1,14 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
+import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
+const PROGRESS_INTERVAL_MS = 15_000;
+type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z
   .string()
   .min(1)
@@ -29,7 +33,54 @@ function formatNormalizedResult(result: AgentResult): string[] {
   if (result.findings && result.findings.length > 0) {
     details.push(`Findings:\n${JSON.stringify(result.findings, null, 2)}`);
   }
+  if (result.reviewerSafety) {
+    details.push(`Reviewer Safety:\n${JSON.stringify(result.reviewerSafety, null, 2)}`);
+  }
   return details;
+}
+
+async function sendProgress(
+  extra: ToolRequestExtra,
+  progress: number,
+  message: string,
+): Promise<void> {
+  const progressToken = extra._meta?.progressToken;
+  if (progressToken === undefined) return;
+  try {
+    await extra.sendNotification({
+      method: "notifications/progress",
+      params: { progressToken, progress, message },
+    });
+  } catch {
+    // Progress is advisory and must not change the task outcome.
+  }
+}
+
+async function runWithProgress(
+  extra: ToolRequestExtra,
+  label: string,
+  operation: () => Promise<AgentResult>,
+): Promise<AgentResult> {
+  const startedAt = Date.now();
+  await sendProgress(extra, 0, `${label} started`);
+  const heartbeat = setInterval(() => {
+    const elapsedSeconds = Math.max(1, Math.floor((Date.now() - startedAt) / 1_000));
+    void sendProgress(extra, elapsedSeconds, `${label} is still running`);
+  }, PROGRESS_INTERVAL_MS);
+  heartbeat.unref();
+
+  try {
+    const result = await operation();
+    const elapsedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1_000));
+    await sendProgress(extra, elapsedSeconds, `${label} ${result.status}`);
+    return result;
+  } catch (error) {
+    const elapsedSeconds = Math.max(1, Math.ceil((Date.now() - startedAt) / 1_000));
+    await sendProgress(extra, elapsedSeconds, `${label} failed`);
+    throw error;
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 export const DelegateTaskInputSchema = z.object({
@@ -140,19 +191,21 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
     "delegate_task",
     "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json",
     DelegateTaskInputSchema.shape,
-    async (args: z.infer<typeof DelegateTaskInputSchema>) => {
+    async (args: z.infer<typeof DelegateTaskInputSchema>, extra) => {
       try {
-        const result = await runner.delegateTask({
-          agent: args.agent,
-          task: args.task,
-          cwd: args.cwd,
-          role: args.role,
-          mode: args.mode,
-          timeoutMs: args.timeoutMs,
-          sessionId: args.sessionId,
-          contextSessionId: args.contextSessionId,
-          baseCommit: args.baseCommit,
-        });
+        const result = await runWithProgress(extra, "Agent task", () =>
+          runner.delegateTask({
+            agent: args.agent,
+            task: args.task,
+            cwd: args.cwd,
+            role: args.role,
+            mode: args.mode,
+            timeoutMs: args.timeoutMs,
+            sessionId: args.sessionId,
+            contextSessionId: args.contextSessionId,
+            baseCommit: args.baseCommit,
+          }),
+        );
 
         const isError =
           result.status === "failed" ||
@@ -221,17 +274,19 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
     "review_changes",
     "Invokes an independent Reviewer Agent to inspect code changes, git diff, and report PASS / FAIL findings with line-level details",
     ReviewChangesInputSchema.shape,
-    async (args: z.infer<typeof ReviewChangesInputSchema>) => {
+    async (args: z.infer<typeof ReviewChangesInputSchema>, extra) => {
       try {
-        const result = await runner.reviewChanges({
-          agent: args.agent,
-          task: args.task,
-          cwd: args.cwd,
-          baseCommit: args.baseCommit,
-          mode: args.mode,
-          timeoutMs: args.timeoutMs,
-          contextSessionId: args.contextSessionId,
-        });
+        const result = await runWithProgress(extra, "Review", () =>
+          runner.reviewChanges({
+            agent: args.agent,
+            task: args.task,
+            cwd: args.cwd,
+            baseCommit: args.baseCommit,
+            mode: args.mode,
+            timeoutMs: args.timeoutMs,
+            contextSessionId: args.contextSessionId,
+          }),
+        );
 
         const isError = result.status === "failed" || result.reviewOutcome === "FAIL";
 
@@ -275,14 +330,16 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
     "continue_task",
     "Continues an ongoing task on a previous Agent session (e.g. to fix issues reported by a reviewer)",
     ContinueTaskInputSchema.shape,
-    async (args: z.infer<typeof ContinueTaskInputSchema>) => {
+    async (args: z.infer<typeof ContinueTaskInputSchema>, extra) => {
       try {
-        const result = await runner.continueTask({
-          sessionId: args.sessionId,
-          task: args.task,
-          mode: args.mode,
-          timeoutMs: args.timeoutMs,
-        });
+        const result = await runWithProgress(extra, "Continued agent task", () =>
+          runner.continueTask({
+            sessionId: args.sessionId,
+            task: args.task,
+            mode: args.mode,
+            timeoutMs: args.timeoutMs,
+          }),
+        );
 
         const formattedText = [
           `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()} | Session: ${result.sessionId}]`,

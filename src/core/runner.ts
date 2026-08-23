@@ -3,6 +3,8 @@ import type {
   AgentName,
   AgentResult,
   AgentRole,
+  ReviewerSafetyPolicy,
+  ReviewerSafetyReport,
   RunAgentOptions,
   TransportMode,
 } from "../agents/types.js";
@@ -11,7 +13,8 @@ import type { AgentRegistry } from "../agents/registry.js";
 import { defaultSessionManager } from "./session.js";
 import type { SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
-import type { BridgeSession } from "./types.js";
+import { captureRepositoryState } from "./repository.js";
+import type { BridgeSession, RepositoryStateEvidence } from "./types.js";
 
 export interface DelegateTaskParams {
   agent?: string;
@@ -56,7 +59,17 @@ function truncateSharedText(value: string): string {
     : `${value.slice(0, MAX_SHARED_ANSWER_CHARS - 3)}...`;
 }
 
-function buildHistoryContext(session: BridgeSession): string | undefined {
+function formatRepositoryState(evidence: RepositoryStateEvidence): string {
+  const changed = evidence.changedPaths.length
+    ? `; changed=${evidence.changedPaths.join(", ")}`
+    : "";
+  return `head=${evidence.head || "unborn"}; dirty=${evidence.dirty}; fingerprint=${evidence.fingerprint}${changed}`;
+}
+
+function buildHistoryContext(
+  session: BridgeSession,
+  currentRepositoryState?: RepositoryStateEvidence,
+): string | undefined {
   if (session.history.length === 0) return undefined;
   const turns = session.history.slice(-MAX_SHARED_TURNS).map((history, index) => {
     const details = [
@@ -67,13 +80,114 @@ function buildHistoryContext(session: BridgeSession): string | undefined {
     if (history.finalAnswer)
       details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
     if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
+    if (history.evidence?.repositoryBefore) {
+      details.push(
+        `Repository before: ${formatRepositoryState(history.evidence.repositoryBefore)}`,
+      );
+    }
+    if (history.evidence?.repositoryAfter) {
+      details.push(`Repository after: ${formatRepositoryState(history.evidence.repositoryAfter)}`);
+    }
+    if (history.evidence) {
+      details.push(
+        `Execution evidence: transport=${history.evidence.transportUsed || "unknown"}; exitCode=${history.evidence.exitCode ?? "unknown"}; durationMs=${history.evidence.durationMs ?? "unknown"}`,
+      );
+    }
+    if (history.reviewerSafety) {
+      details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
+    }
     return details.join("\n");
   });
+  const previousRepositoryState = session.history.at(-1)?.evidence?.repositoryAfter;
+  const freshness =
+    previousRepositoryState && currentRepositoryState
+      ? previousRepositoryState.repositoryRoot === currentRepositoryState.repositoryRoot &&
+        previousRepositoryState.fingerprint === currentRepositoryState.fingerprint
+        ? "MATCHED: the current working tree matches the last recorded handoff state."
+        : "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence."
+      : "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.";
   return [
     "## Shared Context",
-    "Reuse successful prior results and explicit findings when relevant. Do not repeat checks unless the current files or repository state make them stale. Treat summaries as context, not as authority over contradictory current evidence.",
+    `Context freshness: ${freshness}`,
+    currentRepositoryState
+      ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
+      : "Current repository: unavailable",
+    "Reuse successful prior results and explicit findings only when freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence.",
     ...turns,
   ].join("\n\n");
+}
+
+function readReviewerSafetyPolicy(session: BridgeSession): ReviewerSafetyPolicy | undefined {
+  const value = session.metadata?.reviewerSafetyPolicy;
+  return value === "best-effort" || value === "enforced" ? value : undefined;
+}
+
+function buildReviewerSafetyReport(options: {
+  policy: ReviewerSafetyPolicy;
+  mechanism: ReviewerSafetyReport["mechanism"];
+  repositoryBefore?: RepositoryStateEvidence;
+  repositoryAfter?: RepositoryStateEvidence;
+  checkWorkspace?: boolean;
+}): ReviewerSafetyReport {
+  const repositoryCheckAvailable = Boolean(options.repositoryBefore && options.repositoryAfter);
+  const workspaceChanged =
+    options.repositoryBefore && options.repositoryAfter
+      ? options.repositoryBefore.fingerprint !== options.repositoryAfter.fingerprint
+      : undefined;
+  const beforePaths = options.repositoryBefore?.pathFingerprints;
+  const afterPaths = options.repositoryAfter?.pathFingerprints;
+  const changedPaths = workspaceChanged
+    ? beforePaths && afterPaths
+      ? [...new Set([...Object.keys(beforePaths), ...Object.keys(afterPaths)])].filter(
+          (filePath) => beforePaths[filePath] !== afterPaths[filePath],
+        )
+      : [
+          ...new Set([
+            ...(options.repositoryBefore?.changedPaths || []),
+            ...(options.repositoryAfter?.changedPaths || []),
+          ]),
+        ]
+    : undefined;
+  const warnings: string[] = [];
+  if (options.mechanism === "prompt-only") {
+    warnings.push("This Reviewer relies on prompt-level constraints, not a runtime sandbox.");
+  }
+  if (options.checkWorkspace !== false && !repositoryCheckAvailable) {
+    warnings.push("The repository fingerprint check was unavailable.");
+  }
+
+  return {
+    requested: options.policy,
+    mechanism: options.mechanism,
+    enforced: options.mechanism !== "prompt-only",
+    workspaceChanged,
+    changedPaths,
+    warning: warnings.length ? warnings.join(" ") : undefined,
+  };
+}
+
+function applyReviewerSafety(result: AgentResult, report: ReviewerSafetyReport): void {
+  result.reviewerSafety = report;
+  if (!report.workspaceChanged) return;
+
+  const changedPaths = report.changedPaths?.length
+    ? report.changedPaths.join(", ")
+    : "unknown paths";
+  const message = `The working tree changed during Reviewer execution: ${changedPaths}. The changes were not reverted.`;
+  result.status = "failed";
+  result.reviewOutcome = "FAIL";
+  result.summary = message;
+  result.error = result.error ? `${result.error}; ${message}` : message;
+  result.output = result.output ? `${result.output}\n\n${message}` : message;
+  result.findings = [
+    ...(result.findings || []),
+    {
+      severity: "high",
+      file: report.changedPaths?.[0] || ".",
+      issue: "The repository state changed while the Reviewer was running.",
+      suggestion: "Inspect the reported paths and rerun the review in a clean working tree.",
+    },
+  ];
 }
 
 export class MultiAgentRunner {
@@ -151,6 +265,31 @@ export class MultiAgentRunner {
       };
     }
 
+    const reviewerSafetyPolicy: ReviewerSafetyPolicy | undefined =
+      effectiveRole === "reviewer"
+        ? existingSession
+          ? readReviewerSafetyPolicy(existingSession) ||
+            roleResolution.assignment?.safety ||
+            "best-effort"
+          : roleResolution.assignment?.safety || "best-effort"
+        : undefined;
+    if (reviewerSafetyPolicy === "enforced" && adapter.sandboxMechanism === "prompt-only") {
+      const message = `${adapter.displayName} cannot run this Reviewer task because safety='enforced' rejects prompt-only protection.`;
+      return {
+        status: "failed",
+        agent: adapter.name,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+        reviewerSafety: buildReviewerSafetyReport({
+          policy: reviewerSafetyPolicy,
+          mechanism: adapter.sandboxMechanism,
+          checkWorkspace: false,
+        }),
+      };
+    }
+
     const contextSession = params.contextSessionId
       ? this.sessionManager.getSession(params.contextSessionId)
       : undefined;
@@ -223,17 +362,22 @@ export class MultiAgentRunner {
       session = existing;
     } else {
       const effectiveCwd = params.cwd || process.cwd();
+      const roleMetadata = roleResolution.loaded
+        ? {
+            roleAssignmentSource: roleResolution.loaded.path,
+            configuredRole: effectiveRole,
+            orchestratorAgent: roleResolution.loaded.config.roles.orchestrator?.agent,
+          }
+        : {};
+      const metadata = {
+        ...roleMetadata,
+        ...(reviewerSafetyPolicy ? { reviewerSafetyPolicy } : {}),
+      };
       session = this.sessionManager.createSession({
         agent: adapter.name,
         cwd: effectiveCwd,
         role: effectiveRole,
-        metadata: roleResolution.loaded
-          ? {
-              roleAssignmentSource: roleResolution.loaded.path,
-              configuredRole: effectiveRole,
-              orchestratorAgent: roleResolution.loaded.config.roles.orchestrator?.agent,
-            }
-          : undefined,
+        metadata: Object.keys(metadata).length ? metadata : undefined,
       });
     }
 
@@ -252,11 +396,12 @@ export class MultiAgentRunner {
       };
     }
 
+    const repositoryBefore = await captureRepositoryState(effectiveCwd);
     const historyContext = contextSession
-      ? buildHistoryContext(contextSession)
+      ? buildHistoryContext(contextSession, repositoryBefore)
       : session.nativeSessionId
         ? undefined
-        : buildHistoryContext(session);
+        : buildHistoryContext(session, repositoryBefore);
 
     const runOptions: RunAgentOptions = {
       task: params.task,
@@ -288,6 +433,18 @@ export class MultiAgentRunner {
 
     // Attach bridge session ID
     result.sessionId = session.id;
+    const repositoryAfter = await captureRepositoryState(effectiveCwd);
+    if (role === "reviewer" && reviewerSafetyPolicy) {
+      applyReviewerSafety(
+        result,
+        buildReviewerSafetyReport({
+          policy: reviewerSafetyPolicy,
+          mechanism: adapter.sandboxMechanism,
+          repositoryBefore,
+          repositoryAfter,
+        }),
+      );
+    }
 
     // Update session record
     if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
@@ -305,6 +462,14 @@ export class MultiAgentRunner {
       finalAnswer: result.finalAnswer,
       findings: result.findings,
       nativeSessionId: result.nativeSessionId,
+      evidence: {
+        repositoryBefore,
+        repositoryAfter,
+        transportUsed: result.transportUsed,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+      },
+      reviewerSafety: result.reviewerSafety,
     });
 
     return result;
@@ -357,10 +522,33 @@ export class MultiAgentRunner {
       };
     }
 
+    const reviewerSafetyPolicy: ReviewerSafetyPolicy | undefined =
+      session.role === "reviewer" ? readReviewerSafetyPolicy(session) || "best-effort" : undefined;
+    if (reviewerSafetyPolicy === "enforced" && adapter.sandboxMechanism === "prompt-only") {
+      const message = `${adapter.displayName} cannot continue this Reviewer task because safety='enforced' rejects prompt-only protection.`;
+      return {
+        status: "failed",
+        agent: adapter.name,
+        sessionId: session.id,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+        reviewerSafety: buildReviewerSafetyReport({
+          policy: reviewerSafetyPolicy,
+          mechanism: adapter.sandboxMechanism,
+          checkWorkspace: false,
+        }),
+      };
+    }
+
     // Generate structured history context from prior session turns
     // Native conversations already contain their own history. Only inject the
     // normalized Bridge context when a CLI cannot provide a native resume ID.
-    const historyContext = session.nativeSessionId ? undefined : buildHistoryContext(session);
+    const repositoryBefore = await captureRepositoryState(session.cwd);
+    const historyContext = session.nativeSessionId
+      ? undefined
+      : buildHistoryContext(session, repositoryBefore);
 
     let result: AgentResult;
     try {
@@ -404,6 +592,18 @@ export class MultiAgentRunner {
     }
 
     result.sessionId = session.id;
+    const repositoryAfter = await captureRepositoryState(session.cwd);
+    if (session.role === "reviewer" && reviewerSafetyPolicy) {
+      applyReviewerSafety(
+        result,
+        buildReviewerSafetyReport({
+          policy: reviewerSafetyPolicy,
+          mechanism: adapter.sandboxMechanism,
+          repositoryBefore,
+          repositoryAfter,
+        }),
+      );
+    }
 
     if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
       this.sessionManager.updateSession(session.id, {
@@ -420,6 +620,14 @@ export class MultiAgentRunner {
       finalAnswer: result.finalAnswer,
       findings: result.findings,
       nativeSessionId: result.nativeSessionId,
+      evidence: {
+        repositoryBefore,
+        repositoryAfter,
+        transportUsed: result.transportUsed,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+      },
+      reviewerSafety: result.reviewerSafety,
     });
 
     return result;

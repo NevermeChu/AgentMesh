@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { describe, it, expect, beforeEach } from "vitest";
 import { MultiAgentRunner } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
@@ -10,6 +11,7 @@ import type {
   AgentName,
   AgentResult,
   RunAgentOptions,
+  SandboxMechanism,
   TransportMode,
 } from "../../src/agents/types.js";
 
@@ -18,7 +20,7 @@ class MockAdapter extends BaseAdapter {
   readonly name: AgentName = "codex";
   readonly displayName = "Mock Codex";
   readonly supportedModes: readonly TransportMode[] = ["cli"];
-  readonly sandboxMechanism = "prompt-only" as const;
+  readonly sandboxMechanism: SandboxMechanism = "prompt-only";
   readonly envBinOverride = "MOCK_CODEX_BIN";
   readonly defaultExecutableName = "node";
 
@@ -234,6 +236,180 @@ describe("core/runner", () => {
     expect(claude.lastRunOptions?.historyContext).toContain("Final: Inspect authentication flow");
   });
 
+  it("reports best-effort Reviewer protection without blocking prompt-only agents", async () => {
+    const result = await runner.delegateTask({
+      agent: "codex",
+      task: "Review current changes",
+      role: "reviewer",
+      cwd: process.cwd(),
+    });
+
+    expect(result.status).toBe("success");
+    expect(result.reviewerSafety).toMatchObject({
+      requested: "best-effort",
+      mechanism: "prompt-only",
+      enforced: false,
+      workspaceChanged: false,
+    });
+    expect(result.reviewerSafety?.warning).toContain("prompt-level constraints");
+    expect(runner.getSession(result.sessionId!)?.history[0]?.reviewerSafety).toEqual(
+      result.reviewerSafety,
+    );
+  });
+
+  it("rejects prompt-only Reviewers when project safety is enforced", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-safety-policy-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".git"));
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { reviewer: { agent: "codex", safety: "enforced" } },
+        }),
+      );
+
+      const result = await runner.reviewChanges({ cwd: projectRoot });
+
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("rejects prompt-only protection");
+      expect(result.reviewerSafety).toMatchObject({
+        requested: "enforced",
+        mechanism: "prompt-only",
+        enforced: false,
+      });
+      expect(runner.listSessions()).toHaveLength(0);
+
+      class NativeReviewerAdapter extends MockAdapter {
+        override readonly sandboxMechanism = "native-sandbox" as const;
+      }
+      registry.register(new NativeReviewerAdapter());
+      const allowed = await runner.reviewChanges({ cwd: projectRoot });
+      expect(allowed.status).toBe("success");
+      expect(allowed.reviewerSafety).toMatchObject({
+        requested: "enforced",
+        mechanism: "native-sandbox",
+        enforced: true,
+      });
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails a Review when the working tree changes during execution", async () => {
+    class MutatingReviewerAdapter extends MockAdapter {
+      override readonly name: AgentName = "claude";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        if (!options.cwd) throw new Error("Test Reviewer requires cwd");
+        fs.appendFileSync(path.join(options.cwd, "feature.ts"), "export const changed = true;\n");
+        return super.runViaCli(options);
+      }
+    }
+    const mutatingReviewer = new MutatingReviewerAdapter();
+    registry.register(mutatingReviewer);
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-review-write-"));
+
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      fs.writeFileSync(path.join(projectRoot, "feature.ts"), "export const value = 1;\n");
+      fs.writeFileSync(path.join(projectRoot, "other.ts"), "export const other = 1;\n");
+      execFileSync("git", ["add", "feature.ts", "other.ts"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+      fs.appendFileSync(path.join(projectRoot, "other.ts"), "// pre-existing user change\n");
+
+      const result = await runner.reviewChanges({
+        agent: "claude",
+        cwd: projectRoot,
+        task: "Review without editing",
+      });
+
+      expect(result.status).toBe("failed");
+      expect(result.reviewOutcome).toBe("FAIL");
+      expect(result.error).toContain("working tree changed");
+      expect(result.reviewerSafety).toMatchObject({
+        workspaceChanged: true,
+        changedPaths: ["feature.ts"],
+      });
+      expect(result.findings?.at(-1)?.file).toBe("feature.ts");
+      expect(fs.readFileSync(path.join(projectRoot, "feature.ts"), "utf8")).toContain("changed");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("marks shared context stale when the repository fingerprint changes", async () => {
+    class MockClaudeAdapter extends MockAdapter {
+      override readonly name: AgentName = "claude";
+    }
+    const claude = new MockClaudeAdapter();
+    registry.register(claude);
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-evidence-"));
+
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      fs.writeFileSync(path.join(projectRoot, "feature.ts"), "export const value = 1;\n");
+      execFileSync("git", ["add", "feature.ts"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+
+      const source = await runner.delegateTask({
+        agent: "codex",
+        task: "Inspect feature",
+        cwd: projectRoot,
+      });
+      await runner.delegateTask({
+        agent: "claude",
+        task: "Review unchanged evidence",
+        cwd: projectRoot,
+        contextSessionId: source.sessionId,
+      });
+      expect(claude.lastRunOptions?.historyContext).toContain("Context freshness: MATCHED");
+      expect(claude.lastRunOptions?.historyContext).toContain("Execution evidence: transport=cli");
+
+      fs.writeFileSync(path.join(projectRoot, "feature.ts"), "export const value = 2;\n");
+      await runner.delegateTask({
+        agent: "claude",
+        task: "Review changed evidence",
+        cwd: projectRoot,
+        contextSessionId: source.sessionId,
+      });
+      expect(claude.lastRunOptions?.historyContext).toContain("Context freshness: STALE");
+      expect(claude.lastRunOptions?.historyContext).toContain("feature.ts");
+
+      const stored = runner.getSession(source.sessionId!);
+      expect(stored?.history[0]?.evidence?.repositoryAfter?.fingerprint).toMatch(/^[a-f0-9]{64}$/);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it("maps multiple roles to one agent with isolated sessions", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-role-map-"));
     try {
@@ -270,6 +446,9 @@ describe("core/runner", () => {
       expect(new Set([worker.sessionId, reviewer.sessionId, tester.sessionId]).size).toBe(3);
       expect(runner.getSession(worker.sessionId!)?.role).toBe("worker");
       expect(runner.getSession(reviewer.sessionId!)?.role).toBe("reviewer");
+      expect(runner.getSession(reviewer.sessionId!)?.metadata?.reviewerSafetyPolicy).toBe(
+        "best-effort",
+      );
       expect(runner.getSession(tester.sessionId!)?.role).toBe("tester");
       expect(runner.getSession(worker.sessionId!)?.metadata?.orchestratorAgent).toBe("codex");
     } finally {

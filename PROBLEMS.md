@@ -301,3 +301,73 @@
 **解决方法**：`contextSessionIds`（最多 4 个，按给定顺序）在 `delegate_task` / `review_changes` / `continue_task` 上多源一手注入：每个来源渲染为带 Session ID/Agent/轮数标签的独立块并各自计算 MATCHED/STALE/UNKNOWN 新鲜度；全局 24k 字符预算按源均分，超限先丢较旧轮次并显式标注 `[truncated]`；实际注入的来源记入历史条目的 `contextSources` 字段。注入规则改为"原生续接只免除自会话历史，显式来源照常注入"。`contextSessionId` 保留为单源兼容形式，超出 4 个或引用不存在的会话整体 fail-fast。
 
 **状态**：已解决。多源注入内容与顺序、独立新鲜度、截断标记、continue 与原生续接并存、超限与缺失引用的 fail-fast、单参数兼容与 MCP 边界透传均有测试覆盖。
+
+## P-031 真实测试暴露的多源 Reviewer 上下文转发遗漏
+
+**问题**：MCP `review_changes` 接收了 `contextSessionIds`，但 Reviewer 实际看不到多个 Worker/Tester Session 的共享上下文，导致重复检索和重复验证。
+
+**根因**：`MultiAgentRunner.reviewChanges` 转发到 `delegateTask` 时只传递旧版单源 `contextSessionId`，遗漏数组 `contextSessionIds`。
+
+**解决方法**：补齐数组转发并增加 runner 回归测试，验证 Shared Context 的来源顺序、freshness 和历史 `contextSources` 记录。
+
+**状态**：已解决。
+
+## P-032 Codex MCP 成功结论未持久化
+
+**问题**：Codex MCP Worker 的最终回答只出现在运行时输出，Bridge Session 中缺少 `finalAnswer`，下游交接无法复用实现结论。
+
+**根因**：Codex MCP 成功路径调用 `formatSuccessResult` 时未传递 `finalAnswer`，与 CLI 路径行为不一致。
+
+**解决方法**：MCP 成功路径将最终 MCP 输出写入 `AgentResult.finalAnswer`，沿用现有 Session history 和 Shared Context 持久化链路。
+
+**状态**：已解决。
+
+## P-033 普通 Agent 摘要被 Markdown 围栏或诊断尾行污染
+
+**问题**：Worker 输出以 ```、git diff 状态或 Exit Code 结尾时，summary 退化为无信息的尾行。
+
+**根因**：`extractSummary` 无条件选择最后一个非空行。
+
+**解决方法**：跳过纯 Markdown 围栏、git 状态检查和执行诊断尾行，选择首个有意义摘要；Reviewer 仍使用结构化 PASS/FAIL 解析。
+
+**状态**：已解决。
+
+## P-034 Vendor 部分成功输出被误判为失败
+
+**问题**：Antigravity 已输出完整 PASS/FAIL 正文，但 JSON 尾部附带 `context canceled` 或工具路径错误时，整个执行被判为失败，正文和 findings 丢失。
+
+**根因**：适配器只要看到结构化 `error` 就返回失败，没有区分 exit code、实质输出和辅助诊断。
+
+**解决方法**：exit code 为 0 且存在实质正文时继续走统一结果归一化，保留正文并将 vendor error 放入 `warning`；无正文或非零退出仍失败，Reviewer UNKNOWN/FAIL 继续 fail-closed。
+
+**状态**：已解决（OpenCode/Codex 的同类语义保留现状，后续按真实协议单独评估）。
+
+## P-035 Session 未持久化超时、取消和进程树清理证据
+
+**问题**：Session 只能看到退出码和耗时，无法区分超时、客户端取消及 Windows 进程树清理结果。
+
+**根因**：executor 返回的 `timedOut`/`aborted` 未贯通 AgentResult、Runner history 和 Session schema。
+
+**解决方法**：扩展执行结果和历史 evidence，记录 `timedOut`、`aborted`、`cancelReason`、`cleanupMethod`、`cleanupSucceeded`，并保持旧 sessions.json 兼容；不对未采集的 CPU/RSS 填充伪造值。
+
+**状态**：已解决。
+
+## P-036 Windows Codex MCP 测试子进程能力差异
+
+**问题**：Windows Codex MCP 沙箱运行 `node --test` 可能出现 `spawn EPERM`，而 CLI 传输可以运行，容易导致重复重试或误以为 AgentMesh 参数错误。
+
+**根因**：vendor sandbox 的子进程策略，不属于 AgentMesh MCP tool schema 可控制的字段。
+
+**解决方法**：不向 vendor MCP 工具注入未知参数；文档明确推荐 `mode: auto`/CLI fallback 或 `node --test --test-isolation=none`，显式 MCP 失败保持可见。
+
+**状态**：已缓解；vendor 限制未宣称已修复。
+
+## P-037 模型与推理强度缺少 vendor-aware 配置
+
+**问题**：项目只能选择 Agent 和传输方式，无法稳定选择模型或推理强度；直接把通用字段发往 Codex MCP 还会违反严格 schema。
+
+**根因**：配置、Runner 和 adapter 没有模型/推理类型，也没有持久化的 vendor 能力声明文件。
+
+**解决方法**：增加 `.agentmesh/capabilities.json` 的显式生成/读取命令；扩展角色和 MCP 请求的 `model`/`reasoningEffort` 字段；各 adapter 只在 CLI 路径按自身白名单解释，Codex MCP 继续严格 allowlist，不发送未知字段。能力文件不含凭据，普通任务不会隐式探测或覆盖。
+
+**状态**：已解决基础能力；vendor 具体可用模型仍须以已安装 CLI 和账号返回的诊断为准。

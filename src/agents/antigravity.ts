@@ -138,6 +138,7 @@ export class AntigravityAdapter extends BaseAdapter {
       historyContext: options.historyContext,
     });
     const args = ["-p", prompt, "--output-format", "json"];
+    if (options.model) args.push("--model", options.model);
 
     if (options.nativeSessionId) {
       args.push("--conversation", options.nativeSessionId);
@@ -180,7 +181,7 @@ export class AntigravityAdapter extends BaseAdapter {
       const nativeSessionId =
         parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
-      if (res.exitCode !== 0 || parsed.error) {
+      if (res.exitCode !== 0 || !parsed.output?.trim()) {
         return {
           status: "failed",
           agent: this.name,
@@ -190,15 +191,22 @@ export class AntigravityAdapter extends BaseAdapter {
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
+          timedOut: res.timedOut,
+          aborted: res.aborted,
+          cleanupMethod: res.cleanupMethod,
+          cleanupSucceeded: res.cleanupSucceeded,
+          resourceEvidence: res.resourceEvidence,
         };
       }
 
-      return this.formatSuccessResult(parsed.output, startTime, {
+      const result = this.formatSuccessResult(parsed.output, startTime, {
         nativeSessionId,
         exitCode: res.exitCode,
         finalAnswer: parsed.output,
         role,
       });
+      if (parsed.error) result.warning = parsed.error;
+      return result;
     } catch (err) {
       if (err instanceof ProcessExecutionError) {
         return {

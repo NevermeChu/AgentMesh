@@ -10,12 +10,7 @@ const MAX_FINAL_ANSWER_CHARS = 12_000;
 const MAX_RAW_OUTPUT_CHARS = 8_000;
 const PROGRESS_INTERVAL_MS = 15_000;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
-const NonBlankString = z
-  .string()
-  .min(1)
-  .refine((value) => value.trim().length > 0, {
-    message: "Value must not be blank",
-  });
+const NonBlankString = z.string().trim().min(1);
 
 function truncateText(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, maxChars - 3)}...`;
@@ -39,6 +34,12 @@ function formatNormalizedResult(result: AgentResult): string[] {
     details.push(`Raw Output:\n${truncateText(rawOutput, MAX_RAW_OUTPUT_CHARS)}`);
   }
   if (result.error) details.push(`Error: ${result.error}`);
+  if (result.warning) details.push(`Warning: ${result.warning}`);
+  if (result.timedOut) details.push("Execution Evidence: timed out");
+  if (result.aborted) details.push("Execution Evidence: aborted");
+  if (result.resourceEvidence) {
+    details.push(`Resource Evidence:\n${JSON.stringify(result.resourceEvidence, null, 2)}`);
+  }
   if (result.exitCode !== undefined) details.push(`Exit Code: ${result.exitCode}`);
   if (result.findings && result.findings.length > 0) {
     details.push(`Findings:\n${JSON.stringify(result.findings, null, 2)}`);
@@ -121,6 +122,11 @@ export const DelegateTaskInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
+  model: NonBlankString.max(200).optional().describe("Vendor-specific model identifier"),
+  reasoningEffort: z
+    .enum(["none", "low", "medium", "high", "xhigh"])
+    .optional()
+    .describe("Requested reasoning effort; supported values depend on the selected vendor"),
   sessionId: NonBlankString.optional().describe(
     "Optional bridge session ID to associate or continue",
   ),
@@ -169,6 +175,11 @@ export const ReviewChangesInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
+  model: NonBlankString.max(200).optional().describe("Vendor-specific model identifier"),
+  reasoningEffort: z
+    .enum(["none", "low", "medium", "high", "xhigh"])
+    .optional()
+    .describe("Requested reasoning effort; supported values depend on the selected vendor"),
   contextSessionId: NonBlankString.optional().describe(
     "Optional worker/tester Bridge session whose normalized evidence should be shared with the reviewer (legacy single-source form)",
   ),
@@ -199,6 +210,11 @@ export const ContinueTaskInputSchema = z.object({
     .max(MAX_TIMEOUT_MS)
     .optional()
     .describe("Execution timeout in milliseconds"),
+  model: NonBlankString.max(200).optional().describe("Vendor-specific model identifier"),
+  reasoningEffort: z
+    .enum(["none", "low", "medium", "high", "xhigh"])
+    .optional()
+    .describe("Requested reasoning effort; supported values depend on the selected vendor"),
   contextSessionIds: z
     .array(NonBlankString)
     .min(1)
@@ -235,6 +251,8 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             role: args.role,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
+            model: args.model,
+            reasoningEffort: args.reasoningEffort,
             sessionId: args.sessionId,
             contextSessionId: args.contextSessionId,
             contextSessionIds: args.contextSessionIds,
@@ -320,6 +338,8 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             baseCommit: args.baseCommit,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
+            model: args.model,
+            reasoningEffort: args.reasoningEffort,
             contextSessionId: args.contextSessionId,
             contextSessionIds: args.contextSessionIds,
             signal: extra.signal,
@@ -376,6 +396,8 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             task: args.task,
             mode: args.mode,
             timeoutMs: args.timeoutMs,
+            model: args.model,
+            reasoningEffort: args.reasoningEffort,
             contextSessionIds: args.contextSessionIds,
             signal: extra.signal,
           }),

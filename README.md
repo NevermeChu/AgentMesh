@@ -133,6 +133,28 @@ agentmesh config
 
 Orchestrator 调用 `delegate_task` / `review_changes` 时省略 `agent`，AgentMesh 就会根据 `cwd` 和角色读取这份配置。显式 MCP `agent` 参数的优先级高于项目配置。
 
+角色配置还可以请求 vendor-aware 的模型和推理强度：
+
+```json
+{
+  "agent": "codex",
+  "mode": "cli",
+  "model": "o3",
+  "reasoningEffort": "high"
+}
+```
+
+`model` 与 `reasoningEffort` 由各 adapter 分别解释，不是所有 Agent 或传输都支持。Codex MCP 继续严格只发送 vendor schema 允许的 `prompt`、`cwd`、`sandbox` 或 `threadId`；模型/推理配置需要使用 CLI，或在能力文件明确声明支持后才可使用。请求的模型和推理强度会记录在 Session history，vendor 不支持时保留结构化诊断，不静默切换模型。
+
+首次显式生成项目能力说明：
+
+```bash
+agentmesh capabilities generate
+agentmesh capabilities show
+```
+
+这会创建 `.agentmesh/capabilities.json`。普通任务不会隐式执行 vendor 文档探测或改写该文件；已有文件不加 `--force` 不会覆盖。能力文件只包含 adapter/CLI 参数能力和来源，不包含 token、完整环境变量、native session 或 Bridge session；它是能力声明，不是当前账号实际可用模型清单。
+
 配置查找会从 `cwd` 向上查找，但不会越过最近的 Git 仓库根目录，防止意外继承其他项目的角色配置。
 
 ---
@@ -194,7 +216,7 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因以及平台相关的进程树清理方式和结果。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
 
 ### 长任务超时
 
@@ -221,7 +243,7 @@ await client.callTool(params, undefined, {
 
 ### 客户端取消与断连
 
-MCP 客户端**请求超时或发送取消通知**时，AgentMesh 会终止底层 Agent 进程树（Windows 上 `taskkill /T /F`），该轮执行在 Bridge Session 历史中记录为失败并保留执行证据（`Run cancelled by the requesting client.`），不会留下"代码已修改但会话无记录"的孤儿状态；取消后 `auto` 模式不会再用 CLI 重跑同一任务。
+取消通知到达后，AgentMesh 会终止底层 Agent 进程树（Windows 使用 `taskkill /T /F`，其他平台使用终止信号），并将该轮记录为失败；取消后的 `auto` 模式不会再用 CLI 重跑同一任务。Codex MCP 在 Windows 受限沙箱中可能无法派生 Node 测试子进程并报 `spawn EPERM`，这是 vendor/platform 能力限制，不应向 Codex MCP 工具注入未知的测试参数。此时优先使用 `mode: "auto"` 让 AgentMesh 在 MCP 失败后回退 CLI，或让 Tester 使用 `node --test --test-isolation=none`；显式 `mode: "mcp"` 则保留失败，不会静默改变传输方式。
 
 边界：如果客户端**直接关闭连接**（而非超时/取消），MCP SDK 的 stdio 客户端会立即终止 AgentMesh 服务进程，服务端可能来不及写入该轮记录。编排方应依赖请求超时 + 取消通知来取消长任务，而不是强行断开。
 

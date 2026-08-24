@@ -3,6 +3,7 @@ import { defaultRunner } from "../core/runner.js";
 import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
 import { VERSION } from "../version.js";
+import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
   parseMode,
@@ -167,6 +168,36 @@ debugProgram
       }
     },
   );
+
+const capabilitiesProgram = program
+  .command("capabilities")
+  .description("Generate or show the project .agentmesh/capabilities.json file");
+capabilitiesProgram
+  .command("generate [cwd]")
+  .option("--force", "Regenerate an existing capabilities file")
+  .action((cwd: string | undefined, options: { force?: boolean }) => {
+    try {
+      const result = generateCapabilities(cwd || process.cwd(), options.force === true);
+      console.log(
+        JSON.stringify(
+          { path: result.path, created: result.created, capabilities: result.capabilities },
+          null,
+          2,
+        ),
+      );
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  });
+capabilitiesProgram.command("show [cwd]").action((cwd: string | undefined) => {
+  try {
+    console.log(JSON.stringify(readCapabilities(cwd || process.cwd()), null, 2));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
+});
 
 program
   .command("config [cwd]")

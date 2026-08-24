@@ -73,6 +73,14 @@ describe("core/prompts", () => {
     expect(extractSummary(ansiFail)).toContain("Review FAILED");
   });
 
+  it("does not use markdown fences or diagnostic status lines as worker summaries", () => {
+    expect(extractSummary("Implemented the feature\n```", "fallback", "worker")).toBe(
+      "Implemented the feature",
+    );
+    expect(
+      extractSummary("Implemented the feature\ngit diff --check passed", "fallback", "worker"),
+    ).toBe("Implemented the feature");
+  });
   it("parses structured review findings", () => {
     const reviewText = `FAIL
 Here are the review findings:

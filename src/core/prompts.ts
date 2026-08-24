@@ -260,6 +260,35 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   };
 }
 
+function isSummaryNoise(line: string): boolean {
+  if (
+    /^(?:the )?(?:background|background task)\b.*(?:launched|started|waiting|results)/i.test(
+      line.trim(),
+    )
+  ) {
+    return true;
+  }
+  const normalized = line.trim().toLowerCase();
+  return (
+    normalized === "```" ||
+    normalized === "~~~" ||
+    normalized === "```text" ||
+    normalized === "```markdown" ||
+    normalized === "```powershell" ||
+    normalized === "```json" ||
+    /^(?:git )?(?:diff --check|status(?: --short)?)(?: passed|produced no errors|shows)?/.test(
+      normalized,
+    ) ||
+    /^(?:exit code|duration|reading additional input from stdin)\s*:/i.test(line)
+  );
+}
+
+function summarizeFirstMeaningfulLine(lines: string[], fallback: string): string {
+  const candidate = lines.find((line) => !isSummaryNoise(line));
+  const value = candidate || lines[0] || fallback;
+  return value.length > 200 ? `${value.slice(0, 197)}...` : value;
+}
+
 /**
  * Summarizes the output of an agent run into a concise description.
  */
@@ -286,10 +315,5 @@ export function extractSummary(
     }
   }
 
-  const lastLine = lines[lines.length - 1];
-  if (lastLine && lastLine.length < 200) {
-    return lastLine;
-  }
-  const snippet = lines[0] ?? fallback;
-  return snippet.length > 200 ? `${snippet.slice(0, 197)}...` : snippet;
+  return summarizeFirstMeaningfulLine(lines, fallback);
 }

@@ -3,6 +3,7 @@ import type {
   AgentName,
   AgentResult,
   AgentRole,
+  ReasoningEffort,
   ReviewerSafetyPolicy,
   ReviewerSafetyReport,
   RunAgentOptions,
@@ -30,6 +31,8 @@ export interface DelegateTaskParams {
   role?: AgentRole;
   mode?: TransportMode;
   timeoutMs?: number;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   env?: Record<string, string>;
   extraArgs?: string[];
   sessionId?: string;
@@ -49,6 +52,8 @@ export interface ReviewChangesParams {
   baseCommit?: string;
   mode?: TransportMode;
   timeoutMs?: number;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   env?: Record<string, string>;
   /** Single source session whose normalized history should be injected (legacy form). */
   contextSessionId?: string;
@@ -63,6 +68,8 @@ export interface ContinueTaskParams {
   task: string;
   mode?: TransportMode;
   timeoutMs?: number;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   env?: Record<string, string>;
   extraArgs?: string[];
   /** Source sessions (max 4) injected alongside the session's own native resume. */
@@ -512,6 +519,8 @@ export class MultiAgentRunner {
       cwd: effectiveCwd,
       role,
       mode: params.mode ?? roleResolution.assignment?.mode,
+      model: params.model ?? roleResolution.assignment?.model,
+      reasoningEffort: params.reasoningEffort ?? roleResolution.assignment?.reasoningEffort,
       timeoutMs: params.timeoutMs ?? roleResolution.assignment?.timeoutMs ?? this.defaultTimeoutMs,
       env: params.env,
       extraArgs: params.extraArgs,
@@ -573,8 +582,16 @@ export class MultiAgentRunner {
         transportUsed: result.transportUsed,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
+        timedOut: result.timedOut,
+        aborted: result.aborted,
+        cancelReason: result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined,
+        cleanupMethod: result.cleanupMethod,
+        cleanupSucceeded: result.cleanupSucceeded,
+        resourceEvidence: result.resourceEvidence,
       },
       reviewerSafety: result.reviewerSafety,
+      requestedModel: params.model,
+      requestedReasoningEffort: params.reasoningEffort,
       ...(injectionSources.some((source) => source.history.length > 0)
         ? {
             contextSources: injectionSources
@@ -599,8 +616,11 @@ export class MultiAgentRunner {
       baseCommit: params.baseCommit,
       mode: params.mode,
       timeoutMs: params.timeoutMs,
+      model: params.model,
+      reasoningEffort: params.reasoningEffort,
       env: params.env,
       contextSessionId: params.contextSessionId,
+      contextSessionIds: params.contextSessionIds,
       signal: params.signal,
     });
   }
@@ -715,6 +735,8 @@ export class MultiAgentRunner {
           cwd: session.cwd,
           role: session.role,
           mode: params.mode,
+          model: params.model,
+          reasoningEffort: params.reasoningEffort,
           timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
           env: params.env,
           extraArgs: params.extraArgs,
@@ -783,8 +805,16 @@ export class MultiAgentRunner {
         transportUsed: result.transportUsed,
         exitCode: result.exitCode,
         durationMs: result.durationMs,
+        timedOut: result.timedOut,
+        aborted: result.aborted,
+        cancelReason: result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined,
+        cleanupMethod: result.cleanupMethod,
+        cleanupSucceeded: result.cleanupSucceeded,
+        resourceEvidence: result.resourceEvidence,
       },
       reviewerSafety: result.reviewerSafety,
+      requestedModel: params.model,
+      requestedReasoningEffort: params.reasoningEffort,
       ...(injectionSources.some((source) => source.history.length > 0)
         ? {
             contextSources: injectionSources

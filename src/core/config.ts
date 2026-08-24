@@ -1,7 +1,12 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
-import type { AgentRole, ReviewerSafetyPolicy, TransportMode } from "../agents/types.js";
+import type {
+  AgentRole,
+  ReasoningEffort,
+  ReviewerSafetyPolicy,
+  TransportMode,
+} from "../agents/types.js";
 
 export type ConfigurableRole = AgentRole | "orchestrator";
 
@@ -9,6 +14,8 @@ export interface RoleAssignment {
   agent: string;
   mode?: TransportMode;
   timeoutMs?: number;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   safety?: ReviewerSafetyPolicy;
 }
 
@@ -29,6 +36,8 @@ const AssignmentObjectSchema = z
     agent: NonBlankString,
     mode: z.enum(["auto", "mcp", "cli"]).optional(),
     timeoutMs: z.number().int().positive().max(3_600_000).optional(),
+    model: NonBlankString.max(200).optional(),
+    reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
   })
   .strict();
 const RoleAssignmentSchema = z.union([NonBlankString, AssignmentObjectSchema]);

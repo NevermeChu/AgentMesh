@@ -144,6 +144,7 @@ export class CodexAdapter extends BaseAdapter {
 
     return this.formatSuccessResult(mcpRes.output, startTime, {
       nativeSessionId,
+      finalAnswer: mcpRes.output,
       role: options.role,
     });
   }
@@ -184,6 +185,9 @@ export class CodexAdapter extends BaseAdapter {
       }
       args.push("-c", 'sandbox_mode="workspace-write"');
       args.push("--json");
+      if (options.model) args.push("--model", options.model);
+      if (options.reasoningEffort)
+        args.push("-c", `model_reasoning_effort=${options.reasoningEffort}`);
       if (options.extraArgs && options.extraArgs.length > 0) {
         args.push(...options.extraArgs);
       }
@@ -236,6 +240,11 @@ export class CodexAdapter extends BaseAdapter {
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
+          timedOut: res.timedOut,
+          aborted: res.aborted,
+          cleanupMethod: res.cleanupMethod,
+          cleanupSucceeded: res.cleanupSucceeded,
+          resourceEvidence: res.resourceEvidence,
         };
       }
 
@@ -254,6 +263,7 @@ export class CodexAdapter extends BaseAdapter {
           summary: `Codex execution error: ${err.message}`,
           exitCode: err.exitCode,
           durationMs: Date.now() - startTime,
+          timedOut: err.timedOut,
         };
       }
       return this.formatErrorResult(err, startTime);

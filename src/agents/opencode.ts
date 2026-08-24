@@ -90,6 +90,7 @@ export class OpenCodeAdapter extends BaseAdapter {
       historyContext: options.historyContext,
     });
     const args = ["run", prompt, "--format", "json"];
+    if (options.model) args.push("--model", options.model);
     if (options.nativeSessionId) args.push("--session", options.nativeSessionId);
     if (role === "reviewer") args.push("--agent", "plan");
     else args.push("--auto");
@@ -132,6 +133,11 @@ export class OpenCodeAdapter extends BaseAdapter {
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
+          timedOut: res.timedOut,
+          aborted: res.aborted,
+          cleanupMethod: res.cleanupMethod,
+          cleanupSucceeded: res.cleanupSucceeded,
+          resourceEvidence: res.resourceEvidence,
         };
       }
 

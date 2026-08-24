@@ -1,4 +1,10 @@
-import type { AgentName, AgentRole, ReviewerSafetyReport, ReviewFinding } from "../agents/types.js";
+import type {
+  AgentName,
+  AgentRole,
+  ReasoningEffort,
+  ReviewerSafetyReport,
+  ReviewFinding,
+} from "../agents/types.js";
 
 export interface RepositoryStateEvidence {
   capturedAt: string;
@@ -10,12 +16,29 @@ export interface RepositoryStateEvidence {
   pathFingerprints?: Record<string, string>;
 }
 
+export interface ResourceEvidence {
+  collection: "none" | "process" | "process-tree" | "external";
+  cpuUserMs?: number;
+  cpuSystemMs?: number;
+  peakRssBytes?: number;
+  processTreePeakRssBytes?: number;
+  orphanProcessesDetected?: boolean;
+  note?: string;
+  limitations?: string;
+}
+
 export interface SessionExecutionEvidence {
   repositoryBefore?: RepositoryStateEvidence;
   repositoryAfter?: RepositoryStateEvidence;
   transportUsed?: "mcp" | "cli";
   exitCode?: number;
   durationMs?: number;
+  timedOut?: boolean;
+  aborted?: boolean;
+  cancelReason?: "timeout" | "client_cancel" | "unknown";
+  cleanupMethod?: "taskkill-tree" | "signal" | "unknown";
+  cleanupSucceeded?: boolean;
+  resourceEvidence?: ResourceEvidence;
 }
 
 export interface SessionHistoryEntry {
@@ -31,6 +54,8 @@ export interface SessionHistoryEntry {
   reviewerSafety?: ReviewerSafetyReport;
   /** Bridge sessions whose normalized history was injected into this turn's prompt. */
   contextSources?: string[];
+  requestedModel?: string;
+  requestedReasoningEffort?: ReasoningEffort;
 }
 
 export interface BridgeSession {

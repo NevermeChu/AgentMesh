@@ -48,6 +48,9 @@ describe("core/executor", () => {
     expect(res.exitCode).toBe(0);
     expect(res.stdout.trim()).toBe("hello from test");
     expect(res.timedOut).toBe(false);
+    expect(res.resourceEvidence?.collection).toBe("process");
+    expect(res.resourceEvidence?.peakRssBytes).toBeGreaterThan(0);
+    expect(res.resourceEvidence?.limitations).toContain("vendor child-process");
   });
 
   it("preserves UTF-8 characters split across process chunks", async () => {
@@ -76,6 +79,9 @@ describe("core/executor", () => {
     expect(res.timedOut).toBe(true);
     expect(res.exitCode).toBe(124);
     expect(res.durationMs).toBeLessThan(4_000);
+    expect(res.cleanupMethod).toBeDefined();
+    expect(res.cleanupSucceeded).toBe(true);
+    expect(res.resourceEvidence?.collection).toBe("process");
   });
 
   it("quotes cmd.exe arguments containing spaces and metacharacters", () => {

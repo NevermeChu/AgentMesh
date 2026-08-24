@@ -32,12 +32,28 @@ const RepositoryStateEvidenceSchema = z.object({
   changedPaths: z.array(z.string()),
   pathFingerprints: z.record(z.string().regex(/^[a-f0-9]{64}$/)).optional(),
 });
+const ResourceEvidenceSchema = z.object({
+  collection: z.enum(["none", "process", "process-tree", "external"]),
+  cpuUserMs: z.number().nonnegative().optional(),
+  cpuSystemMs: z.number().nonnegative().optional(),
+  peakRssBytes: z.number().nonnegative().optional(),
+  processTreePeakRssBytes: z.number().nonnegative().optional(),
+  orphanProcessesDetected: z.boolean().optional(),
+  note: z.string().optional(),
+  limitations: z.string().optional(),
+});
 const SessionExecutionEvidenceSchema = z.object({
   repositoryBefore: RepositoryStateEvidenceSchema.optional(),
   repositoryAfter: RepositoryStateEvidenceSchema.optional(),
   transportUsed: z.enum(["mcp", "cli"]).optional(),
   exitCode: z.number().int().optional(),
   durationMs: z.number().nonnegative().optional(),
+  timedOut: z.boolean().optional(),
+  aborted: z.boolean().optional(),
+  cancelReason: z.enum(["timeout", "client_cancel", "unknown"]).optional(),
+  cleanupMethod: z.enum(["taskkill-tree", "signal", "unknown"]).optional(),
+  cleanupSucceeded: z.boolean().optional(),
+  resourceEvidence: ResourceEvidenceSchema.optional(),
 });
 const ReviewerSafetyReportSchema = z.object({
   requested: z.enum(["best-effort", "enforced"]),
@@ -59,6 +75,8 @@ const SessionHistoryEntrySchema = z.object({
   evidence: SessionExecutionEvidenceSchema.optional(),
   reviewerSafety: ReviewerSafetyReportSchema.optional(),
   contextSources: z.array(z.string()).optional(),
+  requestedModel: z.string().optional(),
+  requestedReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
 });
 const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),

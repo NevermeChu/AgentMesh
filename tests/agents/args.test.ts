@@ -20,6 +20,33 @@ import {
 import { OpenCodeAdapter, parseOpenCodeJsonLines } from "../../src/agents/opencode.js";
 
 describe("agents/args construction", () => {
+  it("maps model and reasoning settings to Codex CLI without leaking them into MCP", () => {
+    const adapter = new CodexAdapter();
+    const args = adapter.buildCliArgs({
+      task: "work",
+      role: "worker",
+      model: "o3",
+      reasoningEffort: "high",
+    });
+    expect(args).toContain("--model");
+    expect(args).toContain("o3");
+    expect(args).toContain("model_reasoning_effort=high");
+    const mcp = buildCodexMcpToolCall(
+      { task: "work", role: "worker", model: "o3", reasoningEffort: "high" },
+      "work",
+    );
+    expect(mcp.toolArguments).toEqual({ prompt: "work", sandbox: "workspace-write" });
+  });
+
+  it("maps model settings to Antigravity and OpenCode CLI", () => {
+    expect(new AntigravityAdapter().buildCliArgs({ task: "work", model: "gemini-pro" })).toContain(
+      "gemini-pro",
+    );
+    expect(new OpenCodeAdapter().buildCliArgs({ task: "work", model: "provider/model" })).toContain(
+      "provider/model",
+    );
+  });
+
   it("resolves Antigravity binary overrides in precedence order", async () => {
     process.env.GEMINI_BIN = "gemini-pro-cli";
     const adapter = new AntigravityAdapter();

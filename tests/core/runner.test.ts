@@ -569,6 +569,26 @@ describe("core/runner", () => {
     expect(target.history[0]?.contextSources).toEqual([workerSource.id, testerSource.id]);
   });
 
+  it("injects multiple sources through reviewChanges", async () => {
+    const workerSource = seededSession("codex", "worker", "Worker result");
+    const testerSource = seededSession("claude", "tester", "Tester result");
+
+    const result = await runner.reviewChanges({
+      agent: "codex",
+      cwd: process.cwd(),
+      task: "Review both handoffs",
+      contextSessionIds: [workerSource.id, testerSource.id],
+    });
+
+    expect(result.status).toBe("success");
+    expect(mock.lastRunOptions?.historyContext).toContain("## Shared Context (2 sources)");
+    expect(mock.lastRunOptions?.historyContext).toContain(workerSource.id);
+    expect(mock.lastRunOptions?.historyContext).toContain(testerSource.id);
+    expect(runner.getSession(result.sessionId!)?.history.at(-1)?.contextSources).toEqual([
+      workerSource.id,
+      testerSource.id,
+    ]);
+  });
   it("fails fast when one of several context sessions is missing", async () => {
     const source = seededSession("codex", "worker", "Valid source");
     const res = await runner.delegateTask({

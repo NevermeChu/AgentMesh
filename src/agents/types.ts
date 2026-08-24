@@ -11,8 +11,14 @@ export type AgentRole = "worker" | "reviewer" | "tester";
 
 export type TransportMode = "auto" | "mcp" | "cli";
 export type ReviewerSafetyPolicy = "best-effort" | "enforced";
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
 
-export interface RunAgentOptions {
+export interface AgentModelOptions {
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+}
+
+export interface RunAgentOptions extends AgentModelOptions {
   task: string;
   cwd?: string;
   role?: AgentRole;
@@ -27,7 +33,7 @@ export interface RunAgentOptions {
   signal?: AbortSignal;
 }
 
-export interface ContinueAgentOptions {
+export interface ContinueAgentOptions extends AgentModelOptions {
   sessionId: string;
   nativeSessionId?: string;
   task: string;
@@ -61,7 +67,23 @@ export interface AgentResult {
   nativeSessionId?: string;
   exitCode?: number;
   error?: string;
+  /** Non-fatal vendor diagnostics preserved alongside substantive output. */
+  warning?: string;
   durationMs?: number;
+  timedOut?: boolean;
+  aborted?: boolean;
+  cleanupMethod?: "taskkill-tree" | "signal" | "unknown";
+  cleanupSucceeded?: boolean;
+  resourceEvidence?: {
+    collection: "none" | "process" | "process-tree" | "external";
+    cpuUserMs?: number;
+    cpuSystemMs?: number;
+    peakRssBytes?: number;
+    processTreePeakRssBytes?: number;
+    orphanProcessesDetected?: boolean;
+    note?: string;
+    limitations?: string;
+  };
   transportUsed?: "mcp" | "cli";
   reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
   findings?: ReviewFinding[];

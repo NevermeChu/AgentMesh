@@ -19,6 +19,15 @@ export interface ExecutionResult {
   durationMs: number;
   timedOut: boolean;
   aborted?: boolean;
+  cleanupMethod?: "taskkill-tree" | "signal" | "unknown";
+  cleanupSucceeded?: boolean;
+  resourceEvidence?: {
+    collection: "process";
+    cpuUserMs: number;
+    cpuSystemMs: number;
+    peakRssBytes: number;
+    limitations: string;
+  };
 }
 
 export interface CommandInvocation {
@@ -32,6 +41,9 @@ export class ProcessExecutionError extends Error {
   readonly stdout: string;
   readonly stderr: string;
   readonly timedOut: boolean;
+  readonly cleanupMethod?: "taskkill-tree" | "signal" | "unknown";
+  readonly cleanupSucceeded?: boolean;
+  readonly resourceEvidence?: ExecutionResult["resourceEvidence"];
 
   constructor(
     message: string,
@@ -301,6 +313,24 @@ export async function executeCommand(
     let timer: NodeJS.Timeout | null = null;
     let forceKillTimer: NodeJS.Timeout | null = null;
     let hardSettleTimer: NodeJS.Timeout | null = null;
+    let cleanupMethod: ExecutionResult["cleanupMethod"];
+    let cleanupSucceeded: boolean | undefined;
+    const initialCpu = process.cpuUsage();
+    const initialRss = process.memoryUsage().rss;
+    let peakRssBytes = initialRss;
+
+    const resourceEvidence = (): ExecutionResult["resourceEvidence"] => {
+      const cpu = process.cpuUsage(initialCpu);
+      peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+      return {
+        collection: "process",
+        cpuUserMs: Math.round(cpu.user / 1_000),
+        cpuSystemMs: Math.round(cpu.system / 1_000),
+        peakRssBytes,
+        limitations:
+          "Measures the AgentMesh process only; vendor child-process and process-tree resources require external monitoring.",
+      };
+    };
 
     const clearTimers = () => {
       if (timer) clearTimeout(timer);
@@ -311,15 +341,19 @@ export async function executeCommand(
       try {
         if (isWindows && childProcess.pid) {
           // Windows kill task tree cleanly
+          cleanupMethod = "taskkill-tree";
           spawn("taskkill", ["/pid", childProcess.pid.toString(), "/T", "/F"], {
             shell: false,
             stdio: "ignore",
           });
+          cleanupSucceeded = true;
         } else {
-          childProcess.kill("SIGTERM");
+          cleanupMethod = "signal";
+          cleanupSucceeded = childProcess.kill("SIGTERM");
         }
       } catch {
-        // ignore kill errors
+        cleanupMethod = cleanupMethod || "unknown";
+        cleanupSucceeded = false;
       }
       forceKillTimer = setTimeout(() => {
         if (isSettled) return;
@@ -340,6 +374,9 @@ export async function executeCommand(
           durationMs: Date.now() - startTime,
           timedOut,
           aborted,
+          cleanupMethod,
+          cleanupSucceeded,
+          resourceEvidence: resourceEvidence(),
         });
       }, 3_000);
     };
@@ -433,6 +470,9 @@ export async function executeCommand(
         durationMs,
         timedOut,
         aborted,
+        cleanupMethod,
+        cleanupSucceeded,
+        resourceEvidence: resourceEvidence(),
       });
     });
   });

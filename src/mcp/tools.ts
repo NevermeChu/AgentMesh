@@ -4,6 +4,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
+import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
@@ -11,10 +12,6 @@ const MAX_RAW_OUTPUT_CHARS = 8_000;
 const PROGRESS_INTERVAL_MS = 15_000;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z.string().trim().min(1);
-
-function truncateText(value: string, maxChars: number): string {
-  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 3)}...`;
-}
 
 function formatNormalizedResult(result: AgentResult): string[] {
   const details = [`Summary: ${result.summary}`];
@@ -201,7 +198,6 @@ export const ContinueTaskInputSchema = z.object({
   mode: z
     .enum(["auto", "mcp", "cli"])
     .optional()
-    .default("auto")
     .describe("Preferred transport mode ('auto', 'mcp', or 'cli')"),
   timeoutMs: z
     .number()

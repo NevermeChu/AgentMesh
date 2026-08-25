@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type {
   AgentName,
@@ -11,14 +12,18 @@ import type {
 } from "../agents/types.js";
 import { defaultRegistry } from "../agents/registry.js";
 import type { AgentRegistry } from "../agents/registry.js";
+import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
+import { truncateText } from "./text.js";
 import type {
   BridgeSession,
   RepositoryStateEvidence,
   RunnerOptions,
+  SessionExecutionEvidence,
   SessionHistoryEntry,
+  SharedContextAudit,
 } from "./types.js";
 
 /** Upper bound for one delegated agent process when no timeout is configured anywhere. */
@@ -41,6 +46,12 @@ export interface DelegateTaskParams {
   /** Source sessions (max 4) whose normalized history is injected first-hand, in the given order. */
   contextSessionIds?: string[];
   baseCommit?: string;
+  /**
+   * Internal: declares the strict review contract so an unparseable reviewer
+   * verdict fails closed. Only the review_changes pipeline sets this; it is
+   * deliberately absent from the MCP input schemas.
+   */
+  reviewVerdictRequired?: boolean;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
 }
@@ -84,7 +95,7 @@ const MAX_SHARED_CONTEXT_CHARS = 24_000;
 const MAX_CONTEXT_SOURCES = 4;
 
 function truncateSharedText(value: string, maxChars: number = MAX_SHARED_ANSWER_CHARS): string {
-  return value.length <= maxChars ? value : `${value.slice(0, maxChars - 3)}... [truncated]`;
+  return truncateText(value, maxChars, "... [truncated]");
 }
 
 function formatRepositoryState(evidence: RepositoryStateEvidence): string {
@@ -112,13 +123,17 @@ function renderSharedTurn(
   history: SessionHistoryEntry,
   session: BridgeSession,
   turnNumber: number,
-): string {
+): { text: string; answerTruncated: boolean } {
   const details = [
     `[Shared Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
     `Task: ${history.task}`,
   ];
+  let answerTruncated = false;
   if (history.summary) details.push(`Summary: ${history.summary}`);
-  if (history.finalAnswer) details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+  if (history.finalAnswer) {
+    answerTruncated = history.finalAnswer.length > MAX_SHARED_ANSWER_CHARS;
+    details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+  }
   if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
   if (history.evidence?.repositoryBefore) {
     details.push(`Repository before: ${formatRepositoryState(history.evidence.repositoryBefore)}`);
@@ -134,7 +149,18 @@ function renderSharedTurn(
   if (history.reviewerSafety) {
     details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
   }
-  return details.join("\n");
+  return { text: details.join("\n"), answerTruncated };
+}
+
+interface SourceRenderStats {
+  sessionId: string;
+  chars: number;
+  truncated: boolean;
+}
+
+interface SharedContextRender {
+  text: string;
+  sources: SourceRenderStats[];
 }
 
 function renderSourceBlock(
@@ -143,7 +169,7 @@ function renderSourceBlock(
   total: number,
   budget: number,
   current: RepositoryStateEvidence | undefined,
-): string {
+): { text: string; truncated: boolean } {
   const header = [
     `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`,
     `Context freshness: ${formatFreshness(session, current)}`,
@@ -152,56 +178,218 @@ function renderSourceBlock(
   let turns = session.history.slice(-MAX_SHARED_TURNS);
   let omittedTurns = session.history.length - turns.length;
   const render = () =>
-    turns
-      .map((history, offset) =>
-        renderSharedTurn(history, session, session.history.length - turns.length + offset + 1),
-      )
-      .join("\n\n");
+    turns.map((history, offset) =>
+      renderSharedTurn(history, session, session.history.length - turns.length + offset + 1),
+    );
 
-  let body = render();
+  let rendered = render();
   // Oldest turns are dropped first so the most recent handoff state survives.
-  while (body.length > budget && turns.length > 1) {
+  while (rendered.map((turn) => turn.text).join("\n\n").length > budget && turns.length > 1) {
     turns = turns.slice(1);
     omittedTurns += 1;
-    body = render();
+    rendered = render();
   }
+  let body = rendered.map((turn) => turn.text).join("\n\n");
+  let clamped = false;
   if (body.length > budget) {
     body = truncateSharedText(body, budget);
+    clamped = true;
   }
   const omissionNote =
     omittedTurns > 0 ? `[${omittedTurns} older turn(s) omitted within the context budget]` : "";
-  return [header, body, omissionNote].filter(Boolean).join("\n\n");
+  const text = [header, body, omissionNote].filter(Boolean).join("\n\n");
+  return {
+    text,
+    truncated: clamped || omittedTurns > 0 || rendered.some((turn) => turn.answerTruncated),
+  };
 }
 
 /**
  * Renders the normalized history of one or more source sessions as first-hand
  * shared context, replacing orchestrator-side relay through task text. Each
  * source keeps its own freshness verdict and a bounded character budget.
+ *
+ * Returns per-source injection statistics so callers can audit verbatim what
+ * downstream agents actually received (see SharedContextAudit).
  */
-export function buildSharedContext(
+export function buildSharedContextDetailed(
   sources: BridgeSession[],
   currentRepositoryState?: RepositoryStateEvidence,
-): string | undefined {
+): SharedContextRender | undefined {
   const usable = sources.filter((session) => session.history.length > 0);
   if (usable.length === 0) return undefined;
   const perSourceBudget = Math.max(2_000, Math.floor(MAX_SHARED_CONTEXT_CHARS / usable.length));
   const header =
     usable.length === 1 ? "## Shared Context" : `## Shared Context (${usable.length} sources)`;
-  return [
-    header,
-    "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence.",
-    currentRepositoryState
-      ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
-      : "Current repository: unavailable",
-    ...usable.map((session, index) =>
-      renderSourceBlock(session, index, usable.length, perSourceBudget, currentRepositoryState),
-    ),
-  ].join("\n\n");
+  const blocks = usable.map((session, index) =>
+    renderSourceBlock(session, index, usable.length, perSourceBudget, currentRepositoryState),
+  );
+  return {
+    text: [
+      header,
+      "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context.",
+      currentRepositoryState
+        ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
+        : "Current repository: unavailable",
+      ...blocks.map((block) => block.text),
+    ].join("\n\n"),
+    sources: usable.map((session, index) => ({
+      sessionId: session.id,
+      chars: blocks[index]!.text.length,
+      truncated: blocks[index]!.truncated,
+    })),
+  };
+}
+
+/**
+ * Backward-compatible wrapper returning only the rendered shared-context text.
+ */
+export function buildSharedContext(
+  sources: BridgeSession[],
+  currentRepositoryState?: RepositoryStateEvidence,
+): string | undefined {
+  return buildSharedContextDetailed(sources, currentRepositoryState)?.text;
 }
 
 function readReviewerSafetyPolicy(session: BridgeSession): ReviewerSafetyPolicy | undefined {
   const value = session.metadata?.reviewerSafetyPolicy;
   return value === "best-effort" || value === "enforced" ? value : undefined;
+}
+
+/**
+ * Loads the project safety policy for a reviewer continuation. The session
+ * binding stays authoritative; the project config only fills what the session
+ * does not already pin down. A broken config must not block a continuation,
+ * so load failures degrade to `undefined` instead of throwing.
+ */
+function loadReviewerSafetyFallback(cwd: string): ReviewerSafetyPolicy | undefined {
+  try {
+    return resolveRoleAssignment(cwd, "reviewer").assignment?.safety;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Validates and deduplicates requested context source sessions against the
+ * working directory of the target execution.
+ */
+type CollectedContextSources =
+  | { sources: BridgeSession[] }
+  | { failure: "not-found"; contextId: string }
+  | { failure: "cwd-mismatch"; contextId: string; sourceCwd: string };
+
+function collectContextSources(
+  sessionManager: SessionManager,
+  requestedIds: string[],
+  targetCwd: string,
+): CollectedContextSources {
+  const sources: BridgeSession[] = [];
+  for (const contextId of requestedIds) {
+    const found = sessionManager.getSession(contextId);
+    if (!found) {
+      return { failure: "not-found", contextId };
+    }
+    if (path.resolve(found.cwd) !== path.resolve(targetCwd)) {
+      return { failure: "cwd-mismatch", contextId, sourceCwd: found.cwd };
+    }
+    if (!sources.some((existing) => existing.id === found.id)) {
+      sources.push(found);
+    }
+  }
+  return { sources };
+}
+
+function buildContextLimitError(maxSources: number, requested: number): string {
+  return `At most ${maxSources} context sessions are supported, but ${requested} were requested.`;
+}
+
+function describeContextFailure(
+  failure: Exclude<CollectedContextSources, { sources: BridgeSession[] }>,
+  targetCwd: string,
+): { summary: string; output: string } {
+  const isMismatch = failure.failure === "cwd-mismatch";
+  const summary = isMismatch
+    ? `Context session cwd mismatch: Context '${failure.contextId}' belongs to '${failure.sourceCwd}', but the target session uses '${targetCwd}'.`
+    : `Context session '${failure.contextId}' not found.`;
+  const output = isMismatch
+    ? "Cannot share context across different working directories."
+    : `Cannot share context: No Bridge session with ID '${failure.contextId}'.`;
+  return { summary, output };
+}
+
+/**
+ * Surfaces every independent validation problem in one message. When both a
+ * context-source problem and a role-resolution problem exist, neither masks
+ * the other — the caller fixes both in one round trip.
+ */
+function mergeValidationMessages(contextSummary: string | undefined, roleMessage: string): string {
+  return contextSummary ? `${contextSummary}; additionally: ${roleMessage}` : roleMessage;
+}
+
+function safeResolveRoleAssignment(
+  configCwd: string,
+  role: AgentRole,
+): { resolution?: ReturnType<typeof resolveRoleAssignment>; error?: string } {
+  try {
+    return { resolution: resolveRoleAssignment(configCwd, role) };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * Predicts which transport an auto/explicit mode will execute on so model
+ * option support can be checked BEFORE dispatching the vendor process.
+ */
+function predictTransport(
+  supportedModes: readonly TransportMode[],
+  mode?: TransportMode,
+): "mcp" | "cli" | undefined {
+  if (mode && mode !== "auto" && supportedModes.includes(mode)) return mode;
+  const preferred = supportedModes[0];
+  return preferred === "mcp" || preferred === "cli" ? preferred : undefined;
+}
+
+/**
+ * Detects vendor-level refusals of a requested model id (HTTP 4xx family,
+ * "unsupported/invalid model" wording). Conservative on purpose: both the
+ * model id and a refusal signal must appear before a diagnostic is emitted.
+ */
+export function modelRejectionDiagnostic(params: { model?: string; text?: string }): string[] {
+  const { model, text } = params;
+  if (!model || !text) return [];
+  const escaped = model.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!new RegExp(escaped).test(text)) return [];
+  const refusalSignal =
+    /\b(?:400|401|403|404)\b|invalid[_-]?model|unsupported[_-]?model|model.{0,40}(?:not\s+(?:supported|available|found|valid)|is\s+unavailable)|does\s+not\s+have\s+access|no\s+access\s+to\s+model/i;
+  if (!refusalSignal.test(text)) return [];
+  return [
+    `Capability diagnostic: model '${model}' was rejected by the vendor (account/model-id level refusal detected in the error text); ` +
+      "the request was NOT applied. Verify the model id and account entitlement.",
+  ];
+}
+
+/**
+ * Surfaces the documented codex MCP sandbox mitigation when a child-process
+ * spawn is rejected, instead of leaving agents to rediscover it every round.
+ */
+export function sandboxSpawnHint(
+  agent: AgentName,
+  transportUsed: "mcp" | "cli" | undefined,
+  result: Pick<AgentResult, "error" | "output">,
+): string | undefined {
+  if (transportUsed !== "mcp") return undefined;
+  const haystack = `${result.error ?? ""}\n${result.output ?? ""}`;
+  if (!/spawn\s+EPERM/i.test(haystack)) return undefined;
+  return agent === "codex"
+    ? "codex MCP sandbox blocked a child process (spawn EPERM). Known mitigation: run tests with NODE_OPTIONS=--test-isolation=none, or rerun with mode=cli."
+    : "An MCP sandbox blocked a child process (spawn EPERM); consider rerunning with the CLI transport.";
+}
+
+function contextSourceIds(sources: BridgeSession[]): string[] | undefined {
+  const usable = sources.filter((source) => source.history.length > 0).map((s) => s.id);
+  return usable.length ? usable : undefined;
 }
 
 function buildReviewerSafetyReport(options: {
@@ -291,6 +479,60 @@ export class MultiAgentRunner {
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
   }
 
+  private readonly inFlight = new Map<
+    number,
+    { controller: AbortController; done: Promise<void> }
+  >();
+  private nextInFlightId = 1;
+
+  /** Number of executions currently running; observable for shutdown diagnostics. */
+  public get activeExecutionCount(): number {
+    return this.inFlight.size;
+  }
+
+  /**
+   * Aborts every active execution and waits for their turns to be recorded.
+   * Called on server shutdown (stdio close / SIGINT / SIGTERM) so a client
+   * disconnect leaves a terminal failed turn with full evidence behind
+   * instead of a silent zero-trace disappearance (P-REAL-009).
+   */
+  public async abortAllInFlight(
+    reason = "Client disconnected from the AgentMesh server.",
+  ): Promise<void> {
+    const entries = [...this.inFlight.values()];
+    for (const entry of entries) entry.controller.abort(new Error(reason));
+    await Promise.allSettled(entries.map((entry) => entry.done));
+    this.inFlight.clear();
+  }
+
+  private beginInFlight(externalSignal: AbortSignal | undefined): {
+    signal: AbortSignal;
+    isDisconnectAborted: () => boolean;
+    finish: () => void;
+  } {
+    const controller = new AbortController();
+    const anyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal })
+      .any;
+    const signal =
+      externalSignal && anyImpl
+        ? anyImpl([externalSignal, controller.signal])
+        : (externalSignal ?? controller.signal);
+    const id = this.nextInFlightId++;
+    let settle = () => {};
+    const done = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    this.inFlight.set(id, { controller, done });
+    return {
+      signal,
+      isDisconnectAborted: () => controller.signal.aborted,
+      finish: () => {
+        this.inFlight.delete(id);
+        settle();
+      },
+    };
+  }
+
   /**
    * Delegates a task to a designated agent harness.
    */
@@ -310,13 +552,16 @@ export class MultiAgentRunner {
       };
     }
 
-    const configCwd = params.cwd ?? existingSession?.cwd ?? process.cwd();
-    const effectiveRole: AgentRole = params.role ?? existingSession?.role ?? "worker";
-    let roleResolution: ReturnType<typeof resolveRoleAssignment>;
-    try {
-      roleResolution = resolveRoleAssignment(configCwd, effectiveRole);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+    // Context-source validation runs before role resolution so a bad handoff
+    // is reported precisely instead of being masked by an unrelated role error.
+    // A role-resolution problem is still detected in the same pass so that the
+    // combined message surfaces both problems at once (S4 aggregation).
+    const requestedContextIds = [
+      ...(params.contextSessionIds ?? []),
+      ...(params.contextSessionId ? [params.contextSessionId] : []),
+    ];
+    if (requestedContextIds.length > MAX_CONTEXT_SOURCES) {
+      const message = buildContextLimitError(MAX_CONTEXT_SOURCES, requestedContextIds.length);
       return {
         status: "failed",
         agent: (params.agent || existingSession?.agent || "unknown") as AgentName,
@@ -326,17 +571,59 @@ export class MultiAgentRunner {
         durationMs: Date.now() - startTime,
       };
     }
+    // Existing sessions own their execution context even before the binding is
+    // re-validated below; new sessions use the explicitly requested cwd.
+    const targetCwd = params.sessionId ? existingSession!.cwd : params.cwd || process.cwd();
+    const collected = collectContextSources(this.sessionManager, requestedContextIds, targetCwd);
+    const contextFailure = "failure" in collected ? collected : undefined;
+    const contextSessions: BridgeSession[] =
+      contextFailure === undefined && "sources" in collected ? collected.sources : [];
+
+    const configCwd = params.cwd ?? existingSession?.cwd ?? process.cwd();
+    const effectiveRole: AgentRole = params.role ?? existingSession?.role ?? "worker";
+    const roleOutcome = safeResolveRoleAssignment(configCwd, effectiveRole);
 
     const selectedAgent =
-      params.agent ?? existingSession?.agent ?? roleResolution.assignment?.agent;
+      params.agent ?? existingSession?.agent ?? roleOutcome.resolution?.assignment?.agent;
     if (!selectedAgent) {
-      const message = `No agent was provided and role '${effectiveRole}' is not configured in '${configCwd}/.agentmesh/config.json'.`;
+      const message = mergeValidationMessages(
+        contextFailure ? describeContextFailure(contextFailure, targetCwd).summary : undefined,
+        `No agent was provided and role '${effectiveRole}' is not configured in '${configCwd}/.agentmesh/config.json'.`,
+      );
       return {
         status: "failed",
         agent: "unknown" as AgentName,
         summary: message,
         output: message,
         error: message,
+        durationMs: Date.now() - startTime,
+      };
+    }
+    if (roleOutcome.error !== undefined || !roleOutcome.resolution) {
+      // Role binding is broken but an explicit agent was provided; keep the
+      // precise role diagnostics and merge any independent context failure.
+      const message = mergeValidationMessages(
+        contextFailure ? describeContextFailure(contextFailure, targetCwd).summary : undefined,
+        roleOutcome.error ?? "Role assignment could not be resolved.",
+      );
+      return {
+        status: "failed",
+        agent: selectedAgent as AgentName,
+        summary: message,
+        output: message,
+        error: message,
+        durationMs: Date.now() - startTime,
+      };
+    }
+    const roleResolution = roleOutcome.resolution;
+    if (contextFailure) {
+      const described = describeContextFailure(contextFailure, targetCwd);
+      return {
+        status: "failed",
+        agent: selectedAgent as AgentName,
+        summary: described.summary,
+        output: described.output,
+        error: described.summary,
         durationMs: Date.now() - startTime,
       };
     }
@@ -377,54 +664,6 @@ export class MultiAgentRunner {
           checkWorkspace: false,
         }),
       };
-    }
-
-    const requestedContextIds = [
-      ...(params.contextSessionIds ?? []),
-      ...(params.contextSessionId ? [params.contextSessionId] : []),
-    ];
-    if (requestedContextIds.length > MAX_CONTEXT_SOURCES) {
-      const message = `At most ${MAX_CONTEXT_SOURCES} context sessions are supported, but ${requestedContextIds.length} were requested.`;
-      return {
-        status: "failed",
-        agent: adapter.name,
-        summary: message,
-        output: message,
-        error: message,
-        durationMs: Date.now() - startTime,
-      };
-    }
-    const contextSessions: BridgeSession[] = [];
-    for (const contextId of requestedContextIds) {
-      const found = this.sessionManager.getSession(contextId);
-      if (!found) {
-        return {
-          status: "failed",
-          agent: adapter.name,
-          summary: `Context session '${contextId}' not found.`,
-          output: `Cannot share context: No Bridge session with ID '${contextId}'.`,
-          error: `Context session '${contextId}' not found`,
-          durationMs: Date.now() - startTime,
-        };
-      }
-      // New sessions must be validated before creation so an invalid reference
-      // cannot leave an orphaned session behind.
-      if (
-        !params.sessionId &&
-        path.resolve(found.cwd) !== path.resolve(params.cwd || process.cwd())
-      ) {
-        return {
-          status: "failed",
-          agent: adapter.name,
-          summary: `Context session cwd mismatch: Context '${found.id}' belongs to '${found.cwd}', but the target session uses '${params.cwd || process.cwd()}'.`,
-          output: "Cannot share context across different working directories.",
-          error: "Context session cwd mismatch",
-          durationMs: Date.now() - startTime,
-        };
-      }
-      if (!contextSessions.some((existing) => existing.id === found.id)) {
-        contextSessions.push(found);
-      }
     }
 
     // Manage or create bridge session with consistency validation
@@ -494,114 +733,122 @@ export class MultiAgentRunner {
     // binding; explicitly supplied values were validated above.
     const effectiveCwd = params.cwd ?? session.cwd;
     const role: AgentRole = params.role ?? session.role;
-    for (const source of contextSessions) {
-      if (path.resolve(source.cwd) !== path.resolve(effectiveCwd)) {
-        return {
-          status: "failed",
-          agent: adapter.name,
-          summary: `Context session cwd mismatch: Context '${source.id}' belongs to '${source.cwd}', but the target session uses '${effectiveCwd}'.`,
-          output: "Cannot share context across different working directories.",
-          error: "Context session cwd mismatch",
-          durationMs: Date.now() - startTime,
-        };
-      }
-    }
 
     const repositoryBefore = await captureRepositoryState(effectiveCwd);
     // Native resume covers the target session's OWN history only; explicit
     // context sources always inject so cross-session facts arrive first-hand.
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
     const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
-    const historyContext = buildSharedContext(injectionSources, repositoryBefore);
+    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore);
+
+    const effectiveRequestedModel = params.model ?? roleResolution.assignment?.model;
+    const effectiveRequestedEffort =
+      params.reasoningEffort ?? roleResolution.assignment?.reasoningEffort;
+
+    const inFlight = this.beginInFlight(params.signal);
+
+    // Pre-flight capability check against the transport that will actually be
+    // used. Never blocks execution; merged with post-execution diagnostics
+    // (deduplicated) below so the caller sees one authoritative list.
+    const requestedMode = params.mode ?? roleResolution.assignment?.mode;
+    const preflightDiagnostics = evaluateModelOptionSupport({
+      agent: adapter.name,
+      transportUsed: predictTransport(adapter.supportedModes, requestedMode),
+      model: effectiveRequestedModel,
+      reasoningEffort: effectiveRequestedEffort,
+      startDirectory: configCwd,
+    });
 
     const runOptions: RunAgentOptions = {
       task: params.task,
       cwd: effectiveCwd,
       role,
       mode: params.mode ?? roleResolution.assignment?.mode,
-      model: params.model ?? roleResolution.assignment?.model,
-      reasoningEffort: params.reasoningEffort ?? roleResolution.assignment?.reasoningEffort,
+      model: effectiveRequestedModel,
+      reasoningEffort: effectiveRequestedEffort,
       timeoutMs: params.timeoutMs ?? roleResolution.assignment?.timeoutMs ?? this.defaultTimeoutMs,
       env: params.env,
       extraArgs: params.extraArgs,
       nativeSessionId: session.nativeSessionId,
       baseCommit: params.baseCommit,
-      historyContext,
-      signal: params.signal,
+      historyContext: sharedContext?.text,
+      reviewVerdictRequired: params.reviewVerdictRequired,
+      signal: inFlight.signal,
     };
 
-    let result: AgentResult;
     try {
-      result = await adapter.run(runOptions);
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      result = {
-        status: "failed",
+      let result: AgentResult;
+      try {
+        result = await adapter.run(runOptions);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        result = {
+          status: "failed",
+          agent: adapter.name,
+          summary: `Execution failed: ${errorMsg}`,
+          output: errorMsg,
+          error: errorMsg,
+          durationMs: Date.now() - startTime,
+        };
+      }
+
+      // Attach bridge session ID
+      result.sessionId = session.id;
+      const repositoryAfter = await captureRepositoryState(effectiveCwd);
+      if (role === "reviewer" && reviewerSafetyPolicy) {
+        applyReviewerSafety(
+          result,
+          buildReviewerSafetyReport({
+            policy: reviewerSafetyPolicy,
+            mechanism: adapter.sandboxMechanism,
+            repositoryBefore,
+            repositoryAfter,
+          }),
+        );
+      }
+
+      // Structured capability diagnostics: never let a requested vendor model or
+      // reasoning option disappear silently on a transport that ignores it.
+      const executedDiagnostics = evaluateModelOptionSupport({
         agent: adapter.name,
-        summary: `Execution failed: ${errorMsg}`,
-        output: errorMsg,
-        error: errorMsg,
-        durationMs: Date.now() - startTime,
-      };
-    }
-
-    // Attach bridge session ID
-    result.sessionId = session.id;
-    const repositoryAfter = await captureRepositoryState(effectiveCwd);
-    if (role === "reviewer" && reviewerSafetyPolicy) {
-      applyReviewerSafety(
-        result,
-        buildReviewerSafetyReport({
-          policy: reviewerSafetyPolicy,
-          mechanism: adapter.sandboxMechanism,
-          repositoryBefore,
-          repositoryAfter,
-        }),
-      );
-    }
-
-    // Update session record
-    if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
-      this.sessionManager.updateSession(session.id, {
-        nativeSessionId: result.nativeSessionId,
+        transportUsed: result.transportUsed,
+        model: effectiveRequestedModel,
+        reasoningEffort: effectiveRequestedEffort,
+        startDirectory: configCwd,
       });
-    }
+      const rejectionDiagnostics = modelRejectionDiagnostic({
+        model: effectiveRequestedModel,
+        text: [result.error, result.output].filter(Boolean).join("\n"),
+      });
+      const spawnHint = sandboxSpawnHint(adapter.name, result.transportUsed, result);
+      const diagnostics = [
+        ...new Set([...preflightDiagnostics, ...executedDiagnostics, ...rejectionDiagnostics]),
+      ];
+      const extraWarnings = [...diagnostics, ...(spawnHint ? [spawnHint] : [])];
+      if (extraWarnings.length > 0) {
+        result.warning = [result.warning, ...extraWarnings].filter(Boolean).join(" ");
+      }
 
-    this.sessionManager.addHistory(session.id, {
-      role,
-      task: params.task,
-      timestamp: new Date().toISOString(),
-      status: result.status,
-      summary: result.summary,
-      finalAnswer: result.finalAnswer,
-      findings: result.findings,
-      nativeSessionId: result.nativeSessionId,
-      evidence: {
+      this.recordTurn({
+        session,
+        role,
+        task: params.task,
+        result,
         repositoryBefore,
         repositoryAfter,
-        transportUsed: result.transportUsed,
-        exitCode: result.exitCode,
-        durationMs: result.durationMs,
-        timedOut: result.timedOut,
-        aborted: result.aborted,
-        cancelReason: result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined,
-        cleanupMethod: result.cleanupMethod,
-        cleanupSucceeded: result.cleanupSucceeded,
-        resourceEvidence: result.resourceEvidence,
-      },
-      reviewerSafety: result.reviewerSafety,
-      requestedModel: params.model,
-      requestedReasoningEffort: params.reasoningEffort,
-      ...(injectionSources.some((source) => source.history.length > 0)
-        ? {
-            contextSources: injectionSources
-              .filter((source) => source.history.length > 0)
-              .map((source) => source.id),
-          }
-        : {}),
-    });
+        injectionSources,
+        requestedModel: params.model,
+        requestedReasoningEffort: params.reasoningEffort,
+        capabilityDiagnostics: diagnostics,
+        sharedContextText: sharedContext?.text,
+        sharedContextSources: sharedContext?.sources,
+        cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
+      });
 
-    return result;
+      return result;
+    } finally {
+      inFlight.finish();
+    }
   }
 
   /**
@@ -621,6 +868,7 @@ export class MultiAgentRunner {
       env: params.env,
       contextSessionId: params.contextSessionId,
       contextSessionIds: params.contextSessionIds,
+      reviewVerdictRequired: true,
       signal: params.signal,
     });
   }
@@ -657,7 +905,7 @@ export class MultiAgentRunner {
 
     const requestedContextIds = params.contextSessionIds ?? [];
     if (requestedContextIds.length > MAX_CONTEXT_SOURCES) {
-      const message = `At most ${MAX_CONTEXT_SOURCES} context sessions are supported, but ${requestedContextIds.length} were requested.`;
+      const message = buildContextLimitError(MAX_CONTEXT_SOURCES, requestedContextIds.length);
       return {
         status: "failed",
         agent: session.agent,
@@ -668,38 +916,27 @@ export class MultiAgentRunner {
         durationMs: Date.now() - startTime,
       };
     }
-    const contextSessions: BridgeSession[] = [];
-    for (const contextId of requestedContextIds) {
-      const found = this.sessionManager.getSession(contextId);
-      if (!found) {
-        return {
-          status: "failed",
-          agent: session.agent,
-          sessionId: session.id,
-          summary: `Context session '${contextId}' not found.`,
-          output: `Cannot share context: No Bridge session with ID '${contextId}'.`,
-          error: `Context session '${contextId}' not found`,
-          durationMs: Date.now() - startTime,
-        };
-      }
-      if (path.resolve(found.cwd) !== path.resolve(session.cwd)) {
-        return {
-          status: "failed",
-          agent: session.agent,
-          sessionId: session.id,
-          summary: `Context session cwd mismatch: Context '${found.id}' belongs to '${found.cwd}', but the target session uses '${session.cwd}'.`,
-          output: "Cannot share context across different working directories.",
-          error: "Context session cwd mismatch",
-          durationMs: Date.now() - startTime,
-        };
-      }
-      if (!contextSessions.some((existing) => existing.id === found.id)) {
-        contextSessions.push(found);
-      }
+    const collected = collectContextSources(this.sessionManager, requestedContextIds, session.cwd);
+    if ("failure" in collected) {
+      const described = describeContextFailure(collected, session.cwd);
+      return {
+        status: "failed",
+        agent: session.agent,
+        sessionId: session.id,
+        summary: described.summary,
+        output: described.output,
+        error: described.summary,
+        durationMs: Date.now() - startTime,
+      };
     }
+    const contextSessions = collected.sources;
 
     const reviewerSafetyPolicy: ReviewerSafetyPolicy | undefined =
-      session.role === "reviewer" ? readReviewerSafetyPolicy(session) || "best-effort" : undefined;
+      session.role === "reviewer"
+        ? readReviewerSafetyPolicy(session) ||
+          loadReviewerSafetyFallback(session.cwd) ||
+          "best-effort"
+        : undefined;
     if (reviewerSafetyPolicy === "enforced" && adapter.sandboxMechanism === "prompt-only") {
       const message = `${adapter.displayName} cannot continue this Reviewer task because safety='enforced' rejects prompt-only protection.`;
       return {
@@ -723,76 +960,170 @@ export class MultiAgentRunner {
     const repositoryBefore = await captureRepositoryState(session.cwd);
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
     const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
-    const historyContext = buildSharedContext(injectionSources, repositoryBefore);
+    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore);
 
-    let result: AgentResult;
+    const inFlight = this.beginInFlight(params.signal);
+    const preflightDiagnostics = evaluateModelOptionSupport({
+      agent: adapter.name,
+      transportUsed: predictTransport(adapter.supportedModes, params.mode),
+      model: params.model,
+      reasoningEffort: params.reasoningEffort,
+      startDirectory: session.cwd,
+    });
+
     try {
-      if (adapter.continue) {
-        result = await adapter.continue({
-          sessionId: session.id,
-          nativeSessionId: session.nativeSessionId,
-          task: params.task,
-          cwd: session.cwd,
-          role: session.role,
-          mode: params.mode,
-          model: params.model,
-          reasoningEffort: params.reasoningEffort,
-          timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
-          env: params.env,
-          extraArgs: params.extraArgs,
-          historyContext,
-          signal: params.signal,
-        });
-      } else {
-        // Fallback to run with context
-        result = await adapter.run({
-          task: params.task,
-          cwd: session.cwd,
-          role: session.role,
-          mode: params.mode,
-          timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
-          env: params.env,
-          extraArgs: params.extraArgs,
-          nativeSessionId: session.nativeSessionId,
-          historyContext,
-          signal: params.signal,
-        });
+      let result: AgentResult;
+      try {
+        if (adapter.continue) {
+          result = await adapter.continue({
+            sessionId: session.id,
+            nativeSessionId: session.nativeSessionId,
+            task: params.task,
+            cwd: session.cwd,
+            role: session.role,
+            mode: params.mode,
+            model: params.model,
+            reasoningEffort: params.reasoningEffort,
+            timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
+            env: params.env,
+            extraArgs: params.extraArgs,
+            historyContext: sharedContext?.text,
+            signal: inFlight.signal,
+          });
+        } else {
+          // Fallback to run with context
+          result = await adapter.run({
+            task: params.task,
+            cwd: session.cwd,
+            role: session.role,
+            mode: params.mode,
+            timeoutMs: params.timeoutMs ?? this.defaultTimeoutMs,
+            env: params.env,
+            extraArgs: params.extraArgs,
+            nativeSessionId: session.nativeSessionId,
+            historyContext: sharedContext?.text,
+            signal: inFlight.signal,
+          });
+        }
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        result = {
+          status: "failed",
+          agent: session.agent,
+          summary: `Continuation failed: ${errorMsg}`,
+          output: errorMsg,
+          error: errorMsg,
+          durationMs: Date.now() - startTime,
+        };
       }
-    } catch (err) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      result = {
-        status: "failed",
+
+      result.sessionId = session.id;
+      const repositoryAfter = await captureRepositoryState(session.cwd);
+      if (session.role === "reviewer" && reviewerSafetyPolicy) {
+        applyReviewerSafety(
+          result,
+          buildReviewerSafetyReport({
+            policy: reviewerSafetyPolicy,
+            mechanism: adapter.sandboxMechanism,
+            repositoryBefore,
+            repositoryAfter,
+          }),
+        );
+      }
+
+      // Structured capability diagnostics for continued runs as well.
+      const executedDiagnostics = evaluateModelOptionSupport({
         agent: session.agent,
-        summary: `Continuation failed: ${errorMsg}`,
-        output: errorMsg,
-        error: errorMsg,
-        durationMs: Date.now() - startTime,
-      };
-    }
+        transportUsed: result.transportUsed,
+        model: params.model,
+        reasoningEffort: params.reasoningEffort,
+        startDirectory: session.cwd,
+      });
+      const rejectionDiagnostics = modelRejectionDiagnostic({
+        model: params.model,
+        text: [result.error, result.output].filter(Boolean).join("\n"),
+      });
+      const spawnHint = sandboxSpawnHint(session.agent, result.transportUsed, result);
+      const diagnostics = [
+        ...new Set([...preflightDiagnostics, ...executedDiagnostics, ...rejectionDiagnostics]),
+      ];
+      const extraWarnings = [...diagnostics, ...(spawnHint ? [spawnHint] : [])];
+      if (extraWarnings.length > 0) {
+        result.warning = [result.warning, ...extraWarnings].filter(Boolean).join(" ");
+      }
 
-    result.sessionId = session.id;
-    const repositoryAfter = await captureRepositoryState(session.cwd);
-    if (session.role === "reviewer" && reviewerSafetyPolicy) {
-      applyReviewerSafety(
+      this.recordTurn({
+        session,
+        role: session.role,
+        task: params.task,
         result,
-        buildReviewerSafetyReport({
-          policy: reviewerSafetyPolicy,
-          mechanism: adapter.sandboxMechanism,
-          repositoryBefore,
-          repositoryAfter,
-        }),
-      );
-    }
+        repositoryBefore,
+        repositoryAfter,
+        injectionSources,
+        requestedModel: params.model,
+        requestedReasoningEffort: params.reasoningEffort,
+        capabilityDiagnostics: diagnostics,
+        sharedContextText: sharedContext?.text,
+        sharedContextSources: sharedContext?.sources,
+        cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
+      });
 
+      return result;
+    } finally {
+      inFlight.finish();
+    }
+  }
+
+  /**
+   * Persists native session binding changes and one normalized turn of
+   * execution evidence. Shared by delegateTask and continueTask.
+   */
+  private recordTurn(options: {
+    session: BridgeSession;
+    role: AgentRole;
+    task: string;
+    result: AgentResult;
+    repositoryBefore: RepositoryStateEvidence | undefined;
+    repositoryAfter: RepositoryStateEvidence | undefined;
+    injectionSources: BridgeSession[];
+    requestedModel?: string;
+    requestedReasoningEffort?: ReasoningEffort;
+    capabilityDiagnostics?: string[];
+    sharedContextText?: string;
+    sharedContextSources?: SourceRenderStats[];
+    /** Overrides the derived cancel reason (e.g. server-shutdown disconnects). */
+    cancelReason?: SessionExecutionEvidence["cancelReason"];
+  }): void {
+    const { session, result, repositoryBefore, repositoryAfter } = options;
     if (result.nativeSessionId && result.nativeSessionId !== session.nativeSessionId) {
       this.sessionManager.updateSession(session.id, {
         nativeSessionId: result.nativeSessionId,
       });
     }
 
+    // Verbatim handoff audit: persist the exact injected block as a sidecar and
+    // attach digest/size/truncation metadata to the turn so orchestrators can
+    // verify what downstream agents actually saw.
+    let sharedContextAudit: SharedContextAudit | undefined;
+    if (options.sharedContextText && options.sharedContextSources?.length) {
+      const text = options.sharedContextText;
+      const artifact = this.sessionManager.persistContextArtifact(
+        session.id,
+        session.history.length + 1,
+        text,
+      );
+      sharedContextAudit = {
+        ...(artifact ? { file: artifact.file } : {}),
+        bytes: artifact?.bytes ?? Buffer.byteLength(text, "utf-8"),
+        sha256: createHash("sha256").update(text, "utf-8").digest("hex"),
+        totalChars: text.length,
+        sources: options.sharedContextSources.map((source) => ({ ...source })),
+      };
+    }
+
     this.sessionManager.addHistory(session.id, {
-      role: session.role,
-      task: params.task,
+      role: options.role,
+      task: options.task,
       timestamp: new Date().toISOString(),
       status: result.status,
       summary: result.summary,
@@ -807,24 +1138,25 @@ export class MultiAgentRunner {
         durationMs: result.durationMs,
         timedOut: result.timedOut,
         aborted: result.aborted,
-        cancelReason: result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined,
+        cancelReason:
+          options.cancelReason ??
+          (result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined),
         cleanupMethod: result.cleanupMethod,
         cleanupSucceeded: result.cleanupSucceeded,
         resourceEvidence: result.resourceEvidence,
+        transportFallback: result.transportFallback,
       },
       reviewerSafety: result.reviewerSafety,
-      requestedModel: params.model,
-      requestedReasoningEffort: params.reasoningEffort,
-      ...(injectionSources.some((source) => source.history.length > 0)
-        ? {
-            contextSources: injectionSources
-              .filter((source) => source.history.length > 0)
-              .map((source) => source.id),
-          }
+      requestedModel: options.requestedModel,
+      requestedReasoningEffort: options.requestedReasoningEffort,
+      ...(options.capabilityDiagnostics?.length
+        ? { capabilityDiagnostics: options.capabilityDiagnostics }
+        : {}),
+      ...(sharedContextAudit ? { sharedContextAudit } : {}),
+      ...(contextSourceIds(options.injectionSources)
+        ? { contextSources: contextSourceIds(options.injectionSources) }
         : {}),
     });
-
-    return result;
   }
 
   /**

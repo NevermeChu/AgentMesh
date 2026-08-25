@@ -38,7 +38,15 @@ export {
   executeCommand,
   findExecutableOnPath,
   isCommandAvailable,
+  /**
+   * @deprecated cmd.exe does not honor backslash escaping; these helpers are
+   * retained only for backwards compatibility and are not used internally.
+   */
   escapeCmdArg,
+  /**
+   * @deprecated cmd.exe does not honor backslash escaping; these helpers are
+   * retained only for backwards compatibility and are not used internally.
+   */
   buildCmdCommandLine,
   resolveCommandInvocation,
   buildChildEnvironment,
@@ -63,6 +71,7 @@ export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
 export { captureRepositoryState } from "./core/repository.js";
+export { truncateText } from "./core/text.js";
 export { findProjectConfigPath, loadProjectConfig, resolveRoleAssignment } from "./core/config.js";
 export type {
   AgentMeshProjectConfig,

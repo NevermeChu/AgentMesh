@@ -15,6 +15,14 @@ export interface McpServerOptions {
 }
 
 /**
+ * Upper bound for waiting on in-flight executions during shutdown. The wait is
+ * event-driven (resolves as soon as every aborted run has recorded its turn);
+ * this cap only bounds the pathological case. A hard SIGKILL before flushing
+ * remains an honest residual boundary.
+ */
+const SHUTDOWN_FLUSH_BUDGET_MS = 10_000;
+
+/**
  * Creates and initializes the Multi-Agent Bridge MCP Server instance.
  */
 export function createMcpServer(options: McpServerOptions = {}): McpServer {
@@ -35,6 +43,7 @@ export function createMcpServer(options: McpServerOptions = {}): McpServer {
 export async function startMcpServer(options: McpServerOptions = {}): Promise<McpServer> {
   const server = createMcpServer(options);
   const transport = options.transport || new StdioServerTransport();
+  const runner = options.runner || defaultRunner;
 
   await server.connect(transport);
 
@@ -44,6 +53,7 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<Mc
   // repeated programmatic starts do not accumulate process listeners.
   const originalClose = server.close.bind(server);
   let closePromise: Promise<void> | undefined;
+  let shutdownStarted = false;
   const removeSignalHandlers = () => {
     process.off("SIGINT", handleExit);
     process.off("SIGTERM", handleExit);
@@ -56,6 +66,26 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<Mc
     await closePromise;
   };
 
+  /**
+   * Disconnect path (stdio close, SIGINT, SIGTERM): abort in-flight executions
+   * through their registered controllers and wait — bounded by the flush budget
+   * — for each aborted run to record its terminal failed turn with full cancel
+   * evidence before the process goes away.
+   */
+  const gracefulShutdown = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    try {
+      await Promise.race([
+        runner.abortAllInFlight(),
+        new Promise((resolve) => setTimeout(resolve, SHUTDOWN_FLUSH_BUDGET_MS)),
+      ]);
+    } catch {
+      // Shutdown must proceed even if aborting or flushing fails.
+    }
+    await closeAndExit();
+  };
+
   const closeAndExit = async () => {
     try {
       await closeServer();
@@ -66,11 +96,16 @@ export async function startMcpServer(options: McpServerOptions = {}): Promise<Mc
   };
 
   const handleExit = () => {
-    void closeAndExit();
+    void gracefulShutdown();
   };
 
   process.on("SIGINT", handleExit);
   process.on("SIGTERM", handleExit);
+  const previousOnClose = transport.onclose?.bind(transport);
+  transport.onclose = () => {
+    previousOnClose?.();
+    void gracefulShutdown();
+  };
   server.close = closeServer;
 
   return server;

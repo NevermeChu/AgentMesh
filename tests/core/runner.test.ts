@@ -3,7 +3,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { describe, it, expect, beforeEach } from "vitest";
-import { MultiAgentRunner, DEFAULT_RUN_TIMEOUT_MS } from "../../src/core/runner.js";
+import {
+  MultiAgentRunner,
+  DEFAULT_RUN_TIMEOUT_MS,
+  modelRejectionDiagnostic,
+  sandboxSpawnHint,
+} from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
 import { BaseAdapter } from "../../src/agents/base.js";
@@ -518,16 +523,25 @@ describe("core/runner", () => {
       signal: controller.signal,
     });
 
-    expect(mock.lastRunOptions?.signal).toBe(controller.signal);
+    // The runner composes external + server-shutdown signals into one parent
+    // signal; the adapter must observe aborts of the caller's controller.
+    const observed = mock.lastRunOptions?.signal;
+    expect(observed).toBeDefined();
+    expect(observed?.aborted).toBe(false);
+    controller.abort();
+    expect(observed?.aborted).toBe(true);
 
     const sessionId = runner.listSessions()[0]!.id;
+    const freshController = new AbortController();
     const contRes = await runner.continueTask({
       sessionId,
       task: "Signal passthrough continue",
-      signal: controller.signal,
+      signal: freshController.signal,
     });
     expect(contRes.status).toBe("success");
-    expect(mock.lastRunOptions?.signal).toBe(controller.signal);
+    expect(mock.lastRunOptions?.signal?.aborted).toBe(false);
+    freshController.abort();
+    expect(mock.lastRunOptions?.signal?.aborted).toBe(true);
   });
 
   function seededSession(agent: AgentName, role: "worker" | "reviewer" | "tester", task: string) {
@@ -679,5 +693,286 @@ describe("core/runner", () => {
         }
       }
     }
+  });
+
+  it("attaches structured capability diagnostics when the executed transport ignores model options (P-REAL-007)", async () => {
+    class McpOnlyAdapter extends BaseAdapter {
+      readonly name: AgentName = "codex";
+      readonly displayName = "Mock MCP Codex";
+      readonly supportedModes: readonly TransportMode[] = ["mcp"];
+      readonly sandboxMechanism: SandboxMechanism = "prompt-only";
+      readonly envBinOverride = "MOCK_MCP_CODEX_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        void options;
+        throw new Error("CLI transport is not exercised by this mock");
+      }
+
+      protected override async runViaMcp(options: RunAgentOptions): Promise<AgentResult> {
+        void options;
+        return {
+          status: "success",
+          agent: this.name,
+          summary: "MCP task done",
+          output: "done",
+          finalAnswer: "done",
+          exitCode: 0,
+          durationMs: 5,
+        };
+      }
+    }
+    const mcpMock = new McpOnlyAdapter();
+    registry.register(mcpMock);
+
+    const res = await runner.delegateTask({
+      agent: "codex",
+      task: "Use the requested vendor model",
+      model: "gpt-5-codex",
+      reasoningEffort: "high",
+    });
+
+    expect(res.status).toBe("success");
+    expect(res.transportUsed).toBe("mcp");
+    expect(res.warning).toContain("Capability diagnostic");
+    expect(res.warning).toContain("model 'gpt-5-codex'");
+    expect(res.warning).toContain("reasoningEffort='high'");
+
+    const entry = runner.getSession(res.sessionId!)?.history.at(-1);
+    expect(entry?.capabilityDiagnostics).toHaveLength(2);
+    expect(entry?.requestedModel).toBe("gpt-5-codex");
+  });
+
+  it("reports context handoff problems before unrelated role-resolution errors (error precedence)", async () => {
+    const invalidConfigRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh_badconfig_"));
+    fs.mkdirSync(path.join(invalidConfigRoot, ".agentmesh"));
+    fs.writeFileSync(
+      path.join(invalidConfigRoot, ".agentmesh", "config.json"),
+      "{not valid json",
+      "utf-8",
+    );
+    try {
+      const sourceSession = sessionManager.createSession({
+        agent: "codex",
+        cwd: process.cwd(),
+        role: "worker",
+      });
+      sessionManager.addHistory(sourceSession.id, {
+        role: "worker",
+        task: "seed turn",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "seeded",
+      });
+
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "Cross-repo handoff probe",
+        cwd: invalidConfigRoot,
+        contextSessionIds: [sourceSession.id],
+      });
+
+      expect(res.status).toBe("failed");
+      // Without precedence ordering, the invalid-config error would mask the
+      // actual cross-repo context problem being debugged.
+      expect(res.summary).toContain("Context session cwd mismatch");
+    } finally {
+      fs.rmSync(invalidConfigRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("persists a verbatim shared-context audit with truncation metadata (injected-context observability)", async () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh_audit_"));
+    const sessionStoragePath = path.join(tempDir, "sessions.json");
+    const persistedManager = new SessionManager({ storagePath: sessionStoragePath });
+    const auditRunner = new MultiAgentRunner(registry, persistedManager);
+    try {
+      const longAnswer = "x".repeat(4_600);
+      const firstRes = await auditRunner.delegateTask({
+        agent: "codex",
+        task: "Source of truth",
+      });
+      // Give the source session an oversized final answer (>4000 chars).
+      persistedManager.addHistory(firstRes.sessionId!, {
+        role: "worker",
+        task: "oversized report",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "big report",
+        finalAnswer: longAnswer,
+      });
+
+      const secondRes = await auditRunner.delegateTask({
+        agent: "codex",
+        task: "Consumer turn",
+        contextSessionIds: [firstRes.sessionId!],
+      });
+
+      const entry = auditRunner.getSession(secondRes.sessionId!)?.history.at(-1);
+      const audit = entry?.sharedContextAudit;
+      expect(audit).toBeDefined();
+      expect(audit?.sources).toHaveLength(1);
+      expect(audit?.sources[0]?.sessionId).toBe(firstRes.sessionId);
+      expect(audit?.sources[0]?.truncated).toBe(true);
+      expect(entry?.contextSources).toEqual([firstRes.sessionId]);
+
+      const artifactPath = path.join(tempDir, audit!.file!);
+      expect(fs.existsSync(artifactPath)).toBe(true);
+      const { createHash } = await import("node:crypto");
+      const stored = fs.readFileSync(artifactPath, "utf-8");
+      expect(audit!.sha256).toBe(createHash("sha256").update(stored, "utf-8").digest("hex"));
+      expect(stored).toContain("[truncated]");
+      expect(audit!.bytes).toBe(Buffer.byteLength(stored, "utf-8"));
+
+      // The consumer actually received the truncated rendering.
+      expect(mock.lastRunOptions?.historyContext).toContain("[truncated]");
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("records structured fallback evidence when auto mode falls back from MCP to CLI (N-R10-C)", async () => {
+    class FallbackAdapter extends BaseAdapter {
+      readonly name: AgentName = "codex";
+      readonly displayName = "Fallback Codex";
+      readonly supportedModes: readonly TransportMode[] = ["mcp", "cli"];
+      readonly sandboxMechanism: SandboxMechanism = "prompt-only";
+      readonly envBinOverride = "MOCK_FALLBACK_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli(): Promise<AgentResult> {
+        return {
+          status: "success",
+          agent: this.name,
+          summary: "CLI execution succeeded",
+          output: "cli output",
+          finalAnswer: "cli answer",
+          exitCode: 0,
+          durationMs: 5,
+        };
+      }
+
+      protected override async runViaMcp(): Promise<AgentResult> {
+        throw new Error("MCP handshake failed: vendor socket closed");
+      }
+    }
+    const previous = registry.getAdapter("codex");
+    registry.register(new FallbackAdapter());
+    try {
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "fallback probe",
+        mode: "auto",
+      });
+
+      expect(res.status).toBe("success");
+      expect(res.transportUsed).toBe("cli");
+      expect(res.transportFallback).toEqual({
+        from: "mcp",
+        to: "cli",
+        reason: "MCP handshake failed: vendor socket closed",
+      });
+      expect(res.warning).toContain("Transport fallback");
+
+      const entry = runner.getSession(res.sessionId!)?.history.at(-1);
+      expect(entry?.evidence?.transportUsed).toBe("cli");
+      expect(entry?.evidence?.transportFallback?.reason).toContain("vendor socket closed");
+    } finally {
+      if (previous) registry.register(previous);
+    }
+  });
+
+  it("merges context-source failures with independent role-resolution problems (S4 aggregation)", async () => {
+    const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh_noconfig_"));
+    try {
+      const sourceSession = sessionManager.createSession({
+        agent: "codex",
+        cwd: process.cwd(),
+        role: "worker",
+      });
+      sessionManager.addHistory(sourceSession.id, {
+        role: "worker",
+        task: "seed turn",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "seeded",
+      });
+
+      const res = await runner.delegateTask({
+        task: "Aggregated validation probe",
+        cwd: plainRoot,
+        contextSessionIds: [sourceSession.id],
+      });
+
+      expect(res.status).toBe("failed");
+      expect(res.summary).toContain("Context session cwd mismatch");
+      expect(res.summary).toContain("; additionally:");
+      expect(res.summary).toContain("role 'worker' is not configured");
+    } finally {
+      fs.rmSync(plainRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("records a terminal failed turn with disconnect evidence on server shutdown (P-REAL-009)", async () => {
+    class SlowAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        await new Promise<void>((resolve) => {
+          if (options.signal?.aborted) return resolve();
+          options.signal?.addEventListener("abort", () => resolve(), { once: true });
+          setTimeout(resolve, 15_000);
+        });
+        return {
+          status: "failed",
+          agent: this.name,
+          summary: "Run cancelled by the requesting client.",
+          output: "cancelled",
+          error: "Client disconnected from the AgentMesh server.",
+          aborted: true,
+          cleanupMethod: "signal" as const,
+          exitCode: 1,
+          durationMs: 5,
+        };
+      }
+    }
+    const slow = new SlowAdapter();
+    registry.register(slow);
+
+    const pending = runner.delegateTask({ agent: "codex", task: "Long running analysis" });
+    for (let waited = 0; runner.activeExecutionCount === 0 && waited < 5_000; waited += 10) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(runner.activeExecutionCount).toBe(1);
+    await runner.abortAllInFlight();
+    const res = await pending;
+
+    expect(res.status).toBe("failed");
+    expect(res.aborted).toBe(true);
+    const entry = runner.getSession(res.sessionId!)?.history.at(-1);
+    expect(entry?.status).toBe("failed");
+    expect(entry?.evidence?.cancelReason).toBe("client_disconnect");
+    expect(entry?.evidence?.aborted).toBe(true);
+  }, 20_000);
+
+  it("classifies vendor model rejections conservatively (P-REAL-007c)", () => {
+    expect(
+      modelRejectionDiagnostic({
+        model: "gpt-5-codex",
+        text: 'Error from vendor: model "gpt-5-codex" was rejected with status 403',
+      }),
+    ).toHaveLength(1);
+    expect(
+      modelRejectionDiagnostic({ model: "gpt-5-codex", text: "unrelated timeout" }),
+    ).toHaveLength(0);
+    expect(modelRejectionDiagnostic({ model: undefined, text: "400 bad request" })).toHaveLength(0);
+  });
+
+  it("hints the codex sandbox mitigation when MCP spawns are rejected (P6/P-036)", () => {
+    const hint = sandboxSpawnHint("codex", "mcp", {
+      output: "node --test failed with spawn EPERM",
+    });
+    expect(hint).toContain("--test-isolation=none");
+    expect(sandboxSpawnHint("codex", "cli", { output: "spawn EPERM" })).toBeUndefined();
+    expect(sandboxSpawnHint("codex", "mcp", { output: "all good" })).toBeUndefined();
   });
 });

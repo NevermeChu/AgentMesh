@@ -26,6 +26,7 @@ class TestAdapter extends BaseAdapter {
 
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
     this.lastRunOptions = options;
+    const verdictRequired = options.reviewVerdictRequired;
     if (options.task.includes("CANCEL_WAIT")) {
       await new Promise<void>((resolve) => {
         if (options.signal?.aborted) return resolve();
@@ -37,6 +38,7 @@ class TestAdapter extends BaseAdapter {
         exitCode: 0,
         summary: "Completed",
         role: options.role,
+        reviewVerdictRequired: verdictRequired,
       });
     }
     if (options.task.includes("RAW_OUTPUT_TRIGGER")) {
@@ -46,6 +48,7 @@ class TestAdapter extends BaseAdapter {
         summary: "Task completed: RAW_OUTPUT_TRIGGER",
         finalAnswer: "Clean final answer",
         role: options.role,
+        reviewVerdictRequired: verdictRequired,
       });
     }
     if (options.role === "reviewer") {
@@ -53,7 +56,9 @@ class TestAdapter extends BaseAdapter {
         return this.formatSuccessResult("Review finished without a verdict.", Date.now(), {
           nativeSessionId: "native_rev_unknown",
           exitCode: 0,
+          finalAnswer: "Review finished without a verdict.",
           role: "reviewer",
+          reviewVerdictRequired: verdictRequired,
         });
       }
       if (options.task.includes("FAIL_TRIGGER")) {
@@ -62,12 +67,14 @@ class TestAdapter extends BaseAdapter {
           nativeSessionId: "native_rev_fail",
           exitCode: 0,
           role: "reviewer",
+          reviewVerdictRequired: verdictRequired,
         });
       }
       return this.formatSuccessResult("PASS\nAll checks passed cleanly.", Date.now(), {
         nativeSessionId: "native_rev_123",
         exitCode: 0,
         role: "reviewer",
+        reviewVerdictRequired: verdictRequired,
       });
     }
 
@@ -77,6 +84,7 @@ class TestAdapter extends BaseAdapter {
       summary: `Task completed: ${options.task}`,
       finalAnswer: `Executed successfully: ${options.task}`,
       role: options.role,
+      reviewVerdictRequired: verdictRequired,
     });
   }
 }
@@ -210,6 +218,23 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("Review Outcome: UNKNOWN");
     expect(content[0]?.text).not.toContain("Review Outcome: PASS");
     expect(content[0]?.text).not.toContain("--- REVIEW FINDINGS ---");
+  });
+
+  it("keeps a verdict-less reviewer reply non-fatal outside the review contract (N-R11-A)", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        role: "reviewer",
+        task: "UNKNOWN_TRIGGER",
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("Review Outcome: UNKNOWN");
+    expect(content[0]?.text).toContain("Status: SUCCESS");
+    expect(content[0]?.text).toContain("No explicit PASS/FAIL verdict");
   });
 
   it("continues a Bridge session through MCP", async () => {

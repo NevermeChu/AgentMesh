@@ -15,7 +15,8 @@ export interface ExecutionOptions {
 export interface ExecutionResult {
   stdout: string;
   stderr: string;
-  exitCode: number;
+  /** `undefined` when the exit code could not be observed (e.g. hard settle). */
+  exitCode?: number;
   durationMs: number;
   timedOut: boolean;
   aborted?: boolean;
@@ -37,10 +38,11 @@ export interface CommandInvocation {
 }
 
 export class ProcessExecutionError extends Error {
-  readonly exitCode: number;
+  readonly exitCode?: number;
   readonly stdout: string;
   readonly stderr: string;
   readonly timedOut: boolean;
+  readonly aborted?: boolean;
   readonly cleanupMethod?: "taskkill-tree" | "signal" | "unknown";
   readonly cleanupSucceeded?: boolean;
   readonly resourceEvidence?: ExecutionResult["resourceEvidence"];
@@ -52,6 +54,10 @@ export class ProcessExecutionError extends Error {
       stdout: string;
       stderr: string;
       timedOut?: boolean;
+      aborted?: boolean;
+      cleanupMethod?: ExecutionResult["cleanupMethod"];
+      cleanupSucceeded?: boolean;
+      resourceEvidence?: ExecutionResult["resourceEvidence"];
     },
   ) {
     super(message);
@@ -60,6 +66,10 @@ export class ProcessExecutionError extends Error {
     this.stdout = options.stdout;
     this.stderr = options.stderr;
     this.timedOut = options.timedOut ?? false;
+    this.aborted = options.aborted;
+    this.cleanupMethod = options.cleanupMethod;
+    this.cleanupSucceeded = options.cleanupSucceeded;
+    this.resourceEvidence = options.resourceEvidence;
   }
 }
 
@@ -300,6 +310,9 @@ export async function executeCommand(
     shell: useShell,
     windowsVerbatimArguments: windowsVerbatim,
     stdio: ["pipe", "pipe", "pipe"],
+    // On POSIX a detached child gets its own process group so the whole vendor
+    // tree can be signalled via `-pid`; Windows uses taskkill /T instead.
+    detached: !isWindows && !useShell,
   };
 
   return new Promise<ExecutionResult>((resolve, reject) => {
@@ -337,48 +350,81 @@ export async function executeCommand(
       if (forceKillTimer) clearTimeout(forceKillTimer);
       if (hardSettleTimer) clearTimeout(hardSettleTimer);
     };
-    const terminateProcessTree = () => {
-      try {
-        if (isWindows && childProcess.pid) {
-          // Windows kill task tree cleanly
-          cleanupMethod = "taskkill-tree";
-          spawn("taskkill", ["/pid", childProcess.pid.toString(), "/T", "/F"], {
-            shell: false,
-            stdio: "ignore",
-          });
-          cleanupSucceeded = true;
-        } else {
-          cleanupMethod = "signal";
-          cleanupSucceeded = childProcess.kill("SIGTERM");
-        }
-      } catch {
-        cleanupMethod = cleanupMethod || "unknown";
-        cleanupSucceeded = false;
+    let pendingTermination: Promise<void> | null = null;
+    const terminateProcessTree = (): Promise<void> => {
+      if (!pendingTermination) {
+        pendingTermination = (async () => {
+          if (cleanupSucceeded !== undefined) return;
+          cleanupMethod = isWindows && childProcess.pid ? "taskkill-tree" : "signal";
+          if (isWindows && childProcess.pid) {
+            cleanupSucceeded = await new Promise<boolean>((resolveKill) => {
+              let settled = false;
+              const kill = spawn("taskkill", ["/pid", childProcess.pid!.toString(), "/T", "/F"], {
+                shell: false,
+                stdio: "ignore",
+              });
+              const finish = (success: boolean) => {
+                if (settled) return;
+                settled = true;
+                resolveKill(success);
+              };
+              kill.once("error", () => finish(false));
+              kill.once("close", (code) => finish(code === 0));
+            });
+          } else {
+            // The detached child leads its own process group; signalling `-pid`
+            // reaches vendor-forked children that a plain root kill would orphan.
+            const groupId = childProcess.pid ? -childProcess.pid : undefined;
+            try {
+              cleanupSucceeded =
+                groupId !== undefined && process.kill(groupId, "SIGTERM")
+                  ? true
+                  : childProcess.kill("SIGTERM");
+            } catch {
+              try {
+                cleanupSucceeded = childProcess.kill("SIGTERM");
+              } catch {
+                cleanupSucceeded = false;
+              }
+            }
+          }
+          forceKillTimer = setTimeout(() => {
+            if (isSettled) return;
+            try {
+              if (!isWindows && childProcess.pid) {
+                try {
+                  process.kill(-childProcess.pid, "SIGKILL");
+                } catch {
+                  childProcess.kill("SIGKILL");
+                }
+              } else {
+                childProcess.kill("SIGKILL");
+              }
+            } catch {
+              // The hard-settle timer below still bounds the caller's wait.
+            }
+          }, 1_000);
+          hardSettleTimer = setTimeout(() => {
+            if (isSettled) return;
+            isSettled = true;
+            clearTimers();
+            // The process never reported a close event, so no honest exit code
+            // exists; report undefined rather than fabricating one.
+            resolve({
+              stdout: readStdout(),
+              stderr: readStderr(),
+              exitCode: timedOut ? 124 : undefined,
+              durationMs: Date.now() - startTime,
+              timedOut,
+              aborted,
+              cleanupMethod,
+              cleanupSucceeded,
+              resourceEvidence: resourceEvidence(),
+            });
+          }, 3_000);
+        })();
       }
-      forceKillTimer = setTimeout(() => {
-        if (isSettled) return;
-        try {
-          childProcess.kill("SIGKILL");
-        } catch {
-          // The hard-settle timer below still bounds the caller's wait.
-        }
-      }, 1_000);
-      hardSettleTimer = setTimeout(() => {
-        if (isSettled) return;
-        isSettled = true;
-        clearTimers();
-        resolve({
-          stdout: readStdout(),
-          stderr: readStderr(),
-          exitCode: 124,
-          durationMs: Date.now() - startTime,
-          timedOut,
-          aborted,
-          cleanupMethod,
-          cleanupSucceeded,
-          resourceEvidence: resourceEvidence(),
-        });
-      }, 3_000);
+      return pendingTermination;
     };
 
     let childProcess: ChildProcess;
@@ -396,26 +442,32 @@ export async function executeCommand(
     }
 
     if (childProcess.stdin) {
+      // A child that exits before draining stdin raises an async EPIPE error;
+      // without a listener it would crash the AgentMesh process.
+      childProcess.stdin.on("error", () => {
+        // Stdin failures cannot change the outcome; stdout/stderr already
+        // capture whatever the process managed to produce.
+      });
       try {
         if (options.input) {
           childProcess.stdin.write(options.input);
         }
         childProcess.stdin.end();
       } catch {
-        // Ignore stdin write error if process died quickly
+        // Ignore synchronous stdin write error if process died quickly
       }
     }
 
     if (options.signal?.aborted) {
       aborted = true;
-      terminateProcessTree();
+      void terminateProcessTree();
     } else {
       options.signal?.addEventListener(
         "abort",
         () => {
           if (isSettled) return;
           aborted = true;
-          terminateProcessTree();
+          void terminateProcessTree();
         },
         { once: true },
       );
@@ -424,7 +476,7 @@ export async function executeCommand(
     if (timeoutMs > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        terminateProcessTree();
+        void terminateProcessTree();
       }, timeoutMs);
     }
 
@@ -438,42 +490,57 @@ export async function executeCommand(
 
     childProcess.on("error", (err: Error) => {
       if (isSettled) return;
-      isSettled = true;
-      clearTimers();
-      reject(
-        new ProcessExecutionError(`Process '${command}' encountered error: ${err.message}`, {
-          exitCode: 1,
-          stdout: readStdout(),
-          stderr: readStderr() || err.message,
-          timedOut,
-        }),
-      );
+      void (async () => {
+        await terminateProcessTree();
+        if (isSettled) return;
+        isSettled = true;
+        clearTimers();
+        reject(
+          new ProcessExecutionError(`Process '${command}' encountered error: ${err.message}`, {
+            exitCode: 1,
+            stdout: readStdout(),
+            stderr: readStderr() || err.message,
+            timedOut,
+            aborted,
+            cleanupMethod,
+            cleanupSucceeded,
+            resourceEvidence: resourceEvidence(),
+          }),
+        );
+      })();
     });
 
     childProcess.on("close", (code: number | null, signal: string | null) => {
       if (isSettled) return;
-      isSettled = true;
-      clearTimers();
-      const durationMs = Date.now() - startTime;
-      const exitCode = timedOut
-        ? 124
-        : code !== null
-          ? code
-          : signal
-            ? 128 + (SIGNAL_EXIT_CODES[signal] ?? 0)
-            : 0;
+      void (async () => {
+        // A termination initiated by timeout/cancel may still be recording its
+        // cleanup outcome; settle only after it has finished so the reported
+        // evidence is complete.
+        await pendingTermination?.catch(() => undefined);
+        if (isSettled) return;
+        isSettled = true;
+        clearTimers();
+        const durationMs = Date.now() - startTime;
+        const exitCode = timedOut
+          ? 124
+          : code !== null
+            ? code
+            : signal
+              ? 128 + (SIGNAL_EXIT_CODES[signal] ?? 0)
+              : 0;
 
-      resolve({
-        stdout: readStdout(),
-        stderr: readStderr(),
-        exitCode,
-        durationMs,
-        timedOut,
-        aborted,
-        cleanupMethod,
-        cleanupSucceeded,
-        resourceEvidence: resourceEvidence(),
-      });
+        resolve({
+          stdout: readStdout(),
+          stderr: readStderr(),
+          exitCode,
+          durationMs,
+          timedOut,
+          aborted,
+          cleanupMethod,
+          cleanupSucceeded,
+          resourceEvidence: resourceEvidence(),
+        });
+      })();
     });
   });
 }

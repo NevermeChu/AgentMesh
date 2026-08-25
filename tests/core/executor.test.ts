@@ -191,4 +191,14 @@ describe("core/executor", () => {
     expect(result.exitCode).not.toBe(0);
     expect(Date.now() - startedAt).toBeLessThan(10_000);
   });
+
+  it("survives a child that exits before draining stdin (EPIPE regression)", async () => {
+    // Without an error listener on the child's stdin stream, the async EPIPE
+    // event would crash the AgentMesh process with an unhandled error.
+    const result = await executeCommand(process.execPath, ["-e", "process.exit(0)"], {
+      input: "payload that will never be read\n".repeat(2_000),
+    });
+
+    expect(result.exitCode).toBe(0);
+  });
 });

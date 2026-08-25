@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { resolveCommandInvocation, buildChildEnvironment } from "./executor.js";
@@ -141,6 +142,20 @@ export async function executeViaMcpClient(
   } finally {
     if (timer) clearTimeout(timer);
     options.signal?.removeEventListener("abort", onAbort);
+    // Reap the vendor process tree while the parent is still alive. The SDK's
+    // StdioClientTransport.close() only SIGTERMs/SIGKILLs its direct child;
+    // vendor MCP servers (e.g. `codex mcp-server`, antigravity) routinely fork
+    // subprocesses (`codex exec`, `agy`) that would survive that teardown as
+    // orphans once the direct child is reaped. taskkill /T /F the whole tree
+    // first so descendants do not leak after the caller's connection closes.
+    const vendorPid = transport.pid;
+    if (process.platform === "win32" && vendorPid) {
+      try {
+        spawn("taskkill", ["/pid", vendorPid.toString(), "/T", "/F"], { stdio: "ignore" });
+      } catch {
+        // Best-effort cleanup; the server may already be gone.
+      }
+    }
     try {
       await client.close();
     } catch {

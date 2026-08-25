@@ -2,7 +2,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { z } from "zod";
 import { VERSION } from "../version.js";
-import type { AgentName, AgentRole, ReviewerSafetyPolicy, TransportMode } from "../agents/types.js";
+import type {
+  AgentName,
+  AgentRole,
+  ReasoningEffort,
+  ReviewerSafetyPolicy,
+  TransportMode,
+} from "../agents/types.js";
 import { findProjectConfigPath } from "./config.js";
 
 const CapabilityValueSchema = z
@@ -25,6 +31,8 @@ const TransportCapabilitySchema = z
   .object({
     model: CapabilityValueSchema.optional(),
     reasoningEffort: CapabilityValueSchema.optional(),
+    /** Free-form operational guidance surfaced alongside capability diagnostics. */
+    notes: z.string().trim().min(1).optional(),
   })
   .strict();
 
@@ -74,7 +82,13 @@ function staticCapabilities(): CapabilitiesFile["capabilities"] {
   return {
     codex: {
       transports: {
-        mcp: { model: unsupportedMcp, reasoningEffort: unsupportedMcp },
+        mcp: {
+          model: unsupportedMcp,
+          reasoningEffort: unsupportedMcp,
+          notes:
+            "The codex MCP sandbox may reject child processes (spawn EPERM). " +
+            "Known mitigation: run tests with NODE_OPTIONS=--test-isolation=none, or rerun with mode=cli.",
+        },
         cli: {
           model: cliModel,
           reasoningEffort: {
@@ -158,4 +172,89 @@ export function capabilityConfigSummary(
   safety?: ReviewerSafetyPolicy,
 ) {
   return { role, agent, mode, safety };
+}
+
+/**
+ * Evaluates requested vendor model/reasoning options against the capability
+ * matrix for the transport that actually executed. Unsupported combinations
+ * yield structured diagnostics so the request is never silently dropped:
+ * execution itself is not blocked (matching the documented contract), the
+ * caller just learns exactly what was ignored and why.
+ *
+ * When no project capabilities.json exists, the adapter static matrix is used
+ * as the fallback — identical to what `agentmesh capabilities generate` writes.
+ */
+export function evaluateModelOptionSupport(params: {
+  agent: AgentName;
+  transportUsed?: TransportMode;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
+  startDirectory?: string;
+}): string[] {
+  const { agent, transportUsed, model, reasoningEffort } = params;
+  if (!transportUsed || (!model && !reasoningEffort)) return [];
+
+  let capabilities = staticCapabilities();
+  try {
+    capabilities = readCapabilities(params.startDirectory ?? process.cwd()).capabilities;
+  } catch {
+    // No readable capabilities file: fall back to the built-in static matrix.
+  }
+
+  const transportCaps = capabilities[agent]?.transports[transportUsed];
+  const diagnostics: string[] = [];
+  if (model) {
+    diagnostics.push(
+      ...modelOptionDiagnostic({
+        option: "model",
+        value: model,
+        cap: transportCaps?.model,
+        agent,
+        transportUsed,
+      }),
+    );
+  }
+  if (reasoningEffort) {
+    diagnostics.push(
+      ...modelOptionDiagnostic({
+        option: "reasoningEffort",
+        value: reasoningEffort,
+        cap: transportCaps?.reasoningEffort,
+        agent,
+        transportUsed,
+      }),
+    );
+  }
+  return diagnostics;
+}
+
+function modelOptionDiagnostic(options: {
+  option: "model" | "reasoningEffort";
+  value: string;
+  cap?: {
+    supported: boolean | "vendor-dependent" | "provider-dependent";
+    values?: string[];
+    reason?: string;
+  };
+  agent: AgentName;
+  transportUsed: TransportMode;
+}): string[] {
+  const { option, value, cap, agent, transportUsed } = options;
+  const label = option === "model" ? `model '${value}'` : `${option}='${value}'`;
+  const prefix = `Capability diagnostic: ${label} was requested for ${agent} via ${transportUsed}`;
+  const suffix =
+    "The request is recorded in this session but was NOT applied to the executed transport.";
+  if (!cap) {
+    return [`${prefix}, which declares no ${option} support; the request was ignored. ${suffix}`];
+  }
+  if (cap.supported === false) {
+    const reason = cap.reason ? ` (${cap.reason})` : "";
+    return [`${prefix}, which does not support it${reason}. ${suffix}`];
+  }
+  if (cap.values && !cap.values.includes(value)) {
+    return [
+      `${prefix}, whose supported values are [${cap.values.join(", ")}]; '${value}' was ignored. ${suffix}`,
+    ];
+  }
+  return [];
 }

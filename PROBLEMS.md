@@ -324,13 +324,13 @@
 
 ## P-033 普通 Agent 摘要被 Markdown 围栏或诊断尾行污染
 
-**问题**：Worker 输出以 ```、git diff 状态或 Exit Code 结尾时，summary 退化为无信息的尾行。
+**问题**：Worker 输出以 ```、git diff 状态或 Exit Code 结尾时，summary 退化为无信息的尾行。Tester 输出以引导性进度消息（如 "We have started searching for..."）开头时，取首个非噪声行亦非摘要。
 
-**根因**：`extractSummary` 无条件选择最后一个非空行。
+**根因**：`extractSummary` 无条件选择最后一个非空行（首次修复改为首个非噪声行），但首个非噪声行可能是进度消息而非结论句。
 
-**解决方法**：跳过纯 Markdown 围栏、git 状态检查和执行诊断尾行，选择首个有意义摘要；Reviewer 仍使用结构化 PASS/FAIL 解析。
+**解决方法**：首次修复跳过纯 Markdown 围栏、git 状态检查和执行诊断尾行。**第二次改进**：改用 `pickSummaryLine`——优先匹配带标签的结论行（`Overall Status: PASS`、`Summary: 已实现`），其次匹配 Markdown 结论章节标题，最后回退到最后一个非噪声行（结论通常出现在输出末尾）。同时新增 `normalizeSummaryLine` 剥离无序列表标记（`- `、`* `）和加粗/斜体装饰，使 `- **Overall Status:** **PASS**` 也能正确匹配。覆盖标签行、标题行、进度噪音和带装饰的实例如测试。
 
-**状态**：已解决。
+**状态**：已解决（第二次改进，2026-08-24）。
 
 ## P-034 Vendor 部分成功输出被误判为失败
 
@@ -371,3 +371,219 @@
 **解决方法**：增加 `.agentmesh/capabilities.json` 的显式生成/读取命令；扩展角色和 MCP 请求的 `model`/`reasoningEffort` 字段；各 adapter 只在 CLI 路径按自身白名单解释，Codex MCP 继续严格 allowlist，不发送未知字段。能力文件不含凭据，普通任务不会隐式探测或覆盖。
 
 **状态**：已解决基础能力；vendor 具体可用模型仍须以已安装 CLI 和账号返回的诊断为准。
+
+## P-038 正常完成后 vendor MCP 服务器子进程未清理
+
+**问题**：真实测试五中，Worker（codex）+ Tester（antigravity）全部 SUCCESS/PASS 并正常退出后，残留两个孤立进程——`agy.exe`（RSS≈260MB，CPU≈624.8s）和 `codex.js`（RSS≈37MB），父进程已消失。这些进程持续消耗 CPU 和内存，属于资源泄漏。
+
+**根因**：MCP 传输路径中，SDK 的 `StdioClientTransport.close()` 只 SIGTERM+SIGKILL 其直接子进程（vendor MCP server），不会终止该 server 已经 fork 的孙子进程（如 `codex exec` 和 `agy` 守护进程）。CLI 传输路径中，`executeCommand` 在子进程正常退出后不再检查并清理其后台派生进程。两种路径都允许 vendor 守护进程在任务完成后继续存活。
+
+**解决方法**：MCP 传输路径——在 `executeViaMcpClient` 的 `finally` 块中、`transport.close()` 之前，读取 `transport.pid`（SDK 暴露的 getter），用 `spawn("taskkill", ["/pid", pid, "/T", "/F"])` 在 Windows 上先杀死整个进程树，确保孙子进程被一并回收。CLI 传输路径现在等待 `taskkill /T /F` 的真实退出结果，并在 timeout、abort 和进程错误路径统一回收仍挂在根 PID 下的 descendants；清理失败会保留为 `cleanupSucceeded: false`，不再把“已启动 taskkill”误报为成功。vendor 主动脱离父树的守护进程仍无法由 AgentMesh 安全定位，继续作为外部监控边界记录在 README 的已知限制中。
+
+**状态**：MCP 传输路径已解决（2026-08-24）；CLI 传输路径中仍挂在根 PID 树内的 descendants 已修复并通过回归测试（2026-08-24）；vendor 主动脱离 PID 树的守护进程仍未解决。
+
+## P-039 真实测试驱动的证据目录生命周期不安全
+
+**问题**：复杂真实测试中，Tester 运行后隔离仓库内的 `evidence/` 目录被删除或重置，主驱动随后写入 `worker-final.json` 时收到 `ENOENT`，预定的 `continue_task` 没有执行，编排证据不完整。
+
+**根因**：驱动把编排证据放在 Agent 可操作的工作区内，且写文件前没有重新创建目录；测试产物和驱动证据没有隔离。
+
+**解决方法**：本轮通过独立 continuation 补做修复闭环，但生产代码未改。后续真实测试驱动应将证据输出放在工作区外，或每次写入前原子创建目录并验证路径。
+
+**状态**：已解决（2026-08-24 第七轮真实测试验证：证据目录置于工作区外后全程编排零中断；属编排脚本实践，不涉及 AgentMesh 运行时）。
+
+## P-040 复杂任务的空记录语义未在规范中明确
+
+**问题**：CSV 任务的最终空行和中间空记录边界未预先写入 SPEC，Reviewer 首轮发现 `parseCsv("\\n")` 可被解析为一列表头，并要求明确空记录语义。
+
+**根因**：任务设计只规定“忽略最终空行”，没有区分最终物理空记录与非最终空记录，也没有定义一列 CSV 的空字段行为。
+
+**解决方法**：Continue 阶段明确并实现：最终空 LF/CRLF 记录忽略；非最终空记录作为一列空字段，宽表中因列数不匹配而跳过；增加 9 项 parser 回归测试和 20 项流水线测试。
+
+**状态**：已解决（本轮真实 FAIL→continue 已验证）。
+
+## P-041 本轮资源采样器未建立有效证据
+
+**问题**：为复杂真实测试启动的 PowerShell 进程采样器因内联变量展开/脚本解析失败，没有生成 CPU、RSS、进程树或孤儿进程证据。
+
+**根因**：采样命令通过 Git Bash 内联传递 PowerShell 变量，shell 先行展开 `$root`、`$end` 等变量，导致 PowerShell 收到缺失表达式。
+
+**解决方法**：改为独立 `.ps1` 文件后重新启动，但采样任务仍未产生可用 `process-samples.jsonl`；最终报告明确资源指标未知，不填零、不宣称正常。
+
+**状态**：已解决（2026-08-24 第七轮真实测试：先以 4 秒 smoke run 验证采样器产物，再全程启用，产出 24211 行 JSONL 样本覆盖完整流水线）。
+
+## P-042 子进程 stdin 缺少错误监听可导致服务进程崩溃
+
+**问题**：executeCommand 向子进程写入 input 后，如果子进程提前退出（未排空 stdin），异步 EPIPE 错误事件在 stdin 流上没有监听器，会以 unhandled error 事件使常驻的 AgentMesh MCP Server 进程整体崩溃。
+
+**根因**：src/core/executor.ts 中只对 stdin.write 做了同步 try/catch，而 EPIPE 是异步 error 事件，必须注册监听器才能吞掉。
+
+**解决方法**：在 spawn 后为 childProcess.stdin 注册 no-op error 监听器；stdin 写入失败不改变任务结果（stdout/stderr 已保留进程实际产出）。新增回归测试：子进程立即退出且传入大量 input 时命令正常收敛。
+
+**状态**：已解决（单元回归覆盖；真实链路未验证）。
+
+## P-043 POSIX 侧没有真正的进程树终止
+
+**问题**：非 Windows 平台超时/取消时只对根进程发 SIGTERM/SIGKILL，vendor CLI fork 出的后台子进程会成为孤儿；README 只承认了 Windows taskkill 的局限，未如实说明 POSIX 侧同样存在。
+
+**根因**：spawn 未使用 detached 进程组，终止逻辑缺少 kill(-pid) 的组信号路径。
+
+**解决方法**：POSIX 上以 detached 方式 spawn 使子进程成为独立进程组组长，终止时先向整个进程组发送 SIGTERM，1 秒后升级 SIGKILL，组信号失败时回退为仅杀根进程。新增 executor.integ.ts 集成测试：shell fork 出的心跳子进程必须在超时后停止心跳。Windows 路径保持 taskkill /T /F 不变。
+
+**状态**：已解决（代码与集成测试完成；集成测试仅在非 Windows 执行，Windows 真实链路行为未变化）。
+
+## P-044 硬结算兜底伪造 exit code 124
+
+**问题**：子进程在强杀后仍不退出时，executor 的 hard-settle 兜底路径无条件返回 exitCode=124，即使并未发生超时，违反项目“证据如实”的原则。
+
+**根因**：兜底 resolve 直接硬编码 124，没有区分“观测到的退出码”和“未知的退出码”。
+
+**解决方法**：ExecutionResult.exitCode 与 ProcessExecutionError.exitCode 放宽为可选；hard settle 仅在确实发生超时时报告 124，否则报告 undefined（未知）。所有消费方均按 optional 处理，无破坏性影响。
+
+**状态**：已解决。
+
+## P-045 Reviewer PASS 判定可被输出中引用内容误触发
+
+**问题**：parseReviewOutput 对全部行做前缀式 PASS/FAIL 匹配，若 Reviewer 引用的 diff/测试内容恰有行首 PASS 且全文无 FAIL，评审结论会被误判为 PASS（findings 只能部分兜底）。
+
+**根因**：裸词判定没有位置约束，也没有区分“行首词 + 任意后文”与“整行只有该词”。
+
+**解决方法**：前 10 行内保留原有的行首前缀匹配（规范要求 verdict 位于输出开头）；超过该区域后仅接受“整行独立成词”（允许 Markdown 加粗/斜体装饰）或带标签形式（Verdict:/Status: 等）。标签判定不受位置限制，兼容真实测试中出现过的“先过程消息后结论”输出。
+
+**状态**：已解决（含正反用例回归）。
+
+## P-046 Codex CLI 仍存在“结构化错误清空部分成功输出”的残留模式
+
+**问题**：antigravity 已修复为“exitCode=0 且有实质正文时保留 finalAnswer、error 降级为 warning”，但 codex.ts CLI 路径仍是 parsed.error 存在即整体判败，finalAnswer 不持久化——与 real_test.md P3/P8 同类模式在不同适配器上残留。
+
+**根因**：两个适配器的失败判定各自实现，修复只落在了 antigravity 一侧。
+
+**解决方法**：codex runViaCli 对齐同一语义：exitCode!==0 或（有 error 且无实质 agent_message 输出）才判失败；error 与实质正文并存时返回成功并携带 warning 字段。新增两条集成测试覆盖正反场景。
+
+**状态**：已解决（fake CLI 集成测试验证；真实 Codex 链路待下次真实测试确认）。
+
+## P-047 会话存储无界增长导致写放大
+
+**问题**：sessions.json 每次追加历史都全量重写，会话数与每会话轮数均无上限，长期使用下每次 addHistory 都是 O(N) 重写且体积无限增长。
+
+**根因**：SessionManager 只有单文件 JSON 持久化，没有任何容量治理。
+
+**解决方法**：新增 SessionManagerOptions.maxHistoryTurnsPerSession（默认 50，超出丢弃最旧轮次）与 maxSessions（默认 200，按 updatedAt LRU 逐出，平局按插入顺序），设为 0 可关闭上限。逐出/裁剪均在文件锁内执行以保证跨进程一致性。
+
+**状态**：已解决（默认上限生效；如需长期归档请自行调大或定期导出 sessions.json）。
+
+## P-048 delegateTask 与 continueTask 大面积重复且行为漂移
+
+**问题**：两个入口各自维护 context 校验、reviewer safety、历史落盘约 200 行近乎相同的代码；且 continueTask 的 reviewer safety 只读 session metadata、不回退项目配置的 roles.reviewer.safety，与 delegateTask 行为不一致。另有一处隐患：delegateTask 对 context 会话的第一遍 cwd 校验使用 process.cwd() 兜底，而 existing session 实际绑定的是 session.cwd，绑定会话继续时可能误判。
+
+**根因**：continueTask 从 delegateTask 复制而来，后续单侧演进。
+
+**解决方法**：提取 collectContextSources / recordTurn / loadReviewerSafetyFallback 共享辅助；context 校验统一针对“目标执行 cwd”（existing session 用其绑定的 cwd）一次性完成并删除冗余的第二遍循环；continueTask 的 safety 按 session metadata → 项目配置 → best-effort 顺序解析（配置加载失败降级为不阻塞续接）；共享上下文指令中新增“引用来源需给出 session ID、不得声称复用未注入的信息”的归因约束（缓解 real_test.md P5）。全部既有协议测试通过。
+
+**状态**：已解决。
+
+## P-049 评审输出契约不支持"PASS + 非阻塞备注"，fail-closed 解析把干净评审判为失败
+
+**问题**：2026-08-24 第七轮真实测试中，opencode Reviewer 两次完成实质 PASS 评审（一次含约 30 个独立行为探针，一次含 20 万次×2 差分模糊逐位匹配），但都按现代 vendor 惯例附上 `severity: low` 的非阻塞 observations；`parseReviewOutput` 的 fail-closed 规则（findings 非空即覆盖 PASS→FAIL）使两次评审整体判 FAIL、MCP 返回 `isError=true`，触发不必要的修复闭环与 orchestrator 重试。
+
+**根因**：评审提示词模板是二元输出契约（"clean → PASS / any issues or concerns → FAIL + findings"），没有为"PASS + 非阻塞备注"提供表达通道；解析器无严重度分级概念，任何 findings 都视为否决。vendor 倾向于输出分级备注，契约与模型行为不匹配。
+
+**解决方法**：提示词与解析器同步引入严重度感知判定：①`buildReviewerPrompt` 为 PASS 增加显式非阻塞通道（允许在 PASS 后以结构化格式附带 severity medium/low 的 observations，并说明其不影响结论）；②`parseReviewOutput` 仅在显式 PASS 且 findings 含 critical/high（或 severity 无法解析）时按矛盾输出 fail-closed 判 FAIL；medium/low findings 保持 PASS、原样返回给 orchestrator 自行取舍。显式 FAIL 判定始终优先，无任何可解析 verdict 时维持原有 fail-closed 行为。
+
+**状态**：已解决（2026-08-24，含正反用例回归：PASS+low/medium → PASSED with non-blocking findings；PASS+critical/high/garbled-severity → FAIL；显式 FAIL 与无 verdict 场景行为不变）。同日第八轮真实测试验证：opencode PASS 附带 3 个 low findings → `Review PASSED with 3 non-blocking finding(s).`、status=SUCCESS、isError=false。
+
+## P-050 能力协商零接线：vendor 模型/推理请求被静默丢弃
+
+**问题**：第九轮真实测试（2026-08-25）向 codex(auto→mcp) 请求 `model:"gpt-5-codex"` + `reasoningEffort:"high"`，Session history 记录了 requestedModel/requestedReasoningEffort，执行照常走 mcp，但该传输按 vendor schema 不支持模型参数——MCP 返回与会话条目均无任何"不支持/已忽略"诊断，请求被静默丢弃。`getCapability()` 在仓库中没有任何调用方，能力门控只有声明层。
+
+**根因**：capabilities.ts 的能力矩阵（schema/generator/静态矩阵）从未在执行路径被咨询；README"vendor 不支持时保留结构化诊断、不静默切换模型"的承诺没有代码兑现。
+
+**解决方法**：新增 `evaluateModelOptionSupport()`（capabilities.ts），在 delegateTask/continueTask 执行结束后按实际 transportUsed 对照能力矩阵（优先 .agentmesh/capabilities.json，缺失时回退内建静态矩阵）；不支持组合产生结构化诊断，附加到结果 warning 与会话 history 新增的 `capabilityDiagnostics` 字段。任务不因此失败。
+
+**状态**：已解决（2026-08-25；含单元回归：不支持/缺声明/values 不匹配/支持静默四类路径）
+
+## P-051 客户端取消留下 0-turn 僵尸会话
+
+**问题**：第九轮真实测试中 20s 客户端取消后，全局存储残留 bridge-sess 壳：history=0、无 status/aborted/cancelReason/cleanup 任何证据；MCP 层只向调用方回传 -32001，服务端已有的进程清理事实不可达。僵尸会话可被后续 continue_task/contextSessionIds 引用且语义不明。
+
+**根因**：createSession 在执行前即时持久化；客户端断开使 stdio server 在 recordTurn 之前退出，空壳永久留在共享存储。
+
+**解决方法**：SessionManager 引入延迟首持久化（unsavedSessions 集合）：createSession 只写内存，首个 turn 落盘时会话才变为持久；withFileLock/getSession/listSessions 的磁盘重载保留未落盘会话。硬死亡不再可能留下零轮空壳；优雅取消路径仍会记录完整 failed/aborted 终态轮。
+
+**状态**：已解决（2026-08-25；并发实例回归测试覆盖"零轮不可见/首轮后可见"）
+
+## P-052 注入的共享上下文不可逐字审计（截断盲区）
+
+**问题**：buildSharedContext 渲染的多源注入块（含 4000 字符/答案、24000/源预算、旧轮省略等截断）只存在于当次 prompt 中，不持久化；下游 history 仅记录 contextSources ID。orchestrator 无法事后验证下游实际看到什么，截断只能推断，交接争议（如 r3-P5 归因错误）无法裁决。
+
+**根因**：渲染文本未进入任何持久化通道，也无摘要/摘要指纹。
+
+**解决方法**：新增 buildSharedContextDetailed 返回逐源注入统计（chars/truncated，含内层 finalAnswer>4000 截断判定）；recordTurn 将完整渲染块以 sidecar 工件持久化到 `<sessions 目录>/contexts/<sessionId>/<turn>.txt`，并在 history 条目的 `sharedContextAudit` 记录相对路径、字节数、SHA-256、totalChars 与逐源截断标志。主 JSON 存储不膨胀。
+
+**状态**：已解决（2026-08-25；回归验证 sidecar 存在、哈希与内容一致、超限答案标记 truncated=true）
+
+## P-053 校验错误优先级：context 问题被角色解析错误掩盖
+
+**问题**：delegateTask 先做角色解析再做 context 校验。目标 cwd 缺 .agentmesh/config.json 且同时存在跨仓 context 引用时，返回"role not configured"而掩盖真正的交接 cwd-mismatch，误导编排方调试。
+
+**根因**：两段校验顺序与信息价值倒置；context 收集本不依赖角色解析结果。
+
+**解决方法**：将 contextSources 上限检查与 collectContextSources 移至角色解析之前（两者均只需 existingSession/params）；错误结果的 agent 标签回退为 params.agent ?? existingSession?.agent ?? "unknown"。
+
+**状态**：已解决（2026-08-25；回归测试验证无效 config + 跨仓 context 场景优先报告 mismatch）。同日二次增强（S4 聚合）：优先级修复后存在反向掩盖——context 错误先返回时角色问题不可见。delegateTask 现在同趟完成两类校验，同时失败时返回合并消息（含 "; additionally:"），仅一类失败时保持精确单因报告；continueTask 复用共享 describeContextFailure helper。回归双覆盖。
+
+## P-054 delegate_task 对 reviewer 角色无条件跑评审 verdict 解析，讨论类回复被误判失败（N-R11-A）
+
+**问题**：2026-08-25 第十一轮真实测试冒烟实证：formatSuccessResult 对任何 role=reviewer 的输出执行 parseReviewOutput，无显式 verdict 即 UNKNOWN → status=failed/isError=true——即使 exit 0 且答案完整。reviewer 角色无法承载讨论、答疑类回复；两次复现。
+
+**根因**：「reviewer 角色」与「评审契约」被混为一谈：fail-closed 只应由声明评审契约的调用（review_changes）触发，却无差别作用于全部 reviewer 角色调用。
+
+**解决方法**：RunAgentOptions/DelegateTaskParams 新增内部标记 reviewVerdictRequired，仅 reviewChanges() 置 true 并透传至 formatSuccessResult（MCP schema 不暴露）。置位时维持 fail-closed；未置位时 UNKNOWN+实质回答判 SUCCESS 并附警告（reviewOutcome=UNKNOWN 保留供裁决），无实质输出仍判失败；显式 FAIL 在所有入口恒为失败。六个适配器同步透传。
+
+**状态**：已解决（2026-08-25）；回归覆盖宽严两路径 + MCP 协议层 delegate_task/review_changes 对照用例。
+
+## P-055 auto 模式静默传输回退销毁根因证据（N-R10-C）
+
+**问题**：第十轮真实测试中并发双 worker 两次 runViaMcp 快速失败后静默回退 CLI（transportUsed=cli 为唯一线索），原始错误被丢弃，事后无法复现根因（疑似 vendor 并发握手竞态）。
+
+**根因**：base.ts 回退点只执行 fallback，不捕获原始 MCP 错误；AgentResult 与 Session 证据均无回退字段。
+
+**解决方法**：回退时捕获原始错误文本；结果携带结构化 transportFallback {from,to,reason} 并追加 warning；SessionExecutionEvidence 新增同名持久化字段，get_session 可见。回退行为本身保留。
+
+**状态**：已解决（2026-08-25）；回归断言 result/evidence 双通道 + warning 文本。
+
+## P-056 断开式客户端取消零审计痕迹（P-REAL-009）
+
+**问题**：传输层 close()/SIGINT/SIGTERM 触发的服务端关闭不留任何会话或轮次证据；r10 P2 断开式取消实验中会话与审计痕迹完全丢失。
+
+**根因**：server 随 stdin 关闭直接退出，in-flight 执行既未被中止也未走 recordTurn。
+
+**解决方法**：MultiAgentRunner 维护 in-flight AbortController 注册表并新增 abortAllInFlight()；runner 用 AbortSignal.any 组合外部信号与服务端信号。startMcpServer 将 stdio onclose/SIGINT/SIGTERM 统一接入优雅关闭：先中止全部 in-flight，再事件驱动等待各轮经既有 recordTurn 链落盘（整体上限 10s 兜底），最后关闭 server。cancelReason 枚举新增 client_disconnect（types 与 session zod 两处同步）。SIGKILL 强杀仍无法落盘，作为残留边界写入 README。
+
+**状态**：已解决（2026-08-25）；回归：在途任务经 abortAllInFlight 后 history 记录 failed + cancelReason=client_disconnect + aborted=true。
+
+## P-057 vendor 账户级模型拒绝无预检诊断（P-REAL-007 矩阵粒度缺口）
+
+**问题**：r10 A0 以 CLI 请求 gpt-5-codex 被 vendor 账户拒绝（400）；矩阵 flag 层面声明支持导致无任何 capability diagnostic，编排方无法快速归因。
+
+**根因**：能力矩阵只有 flag/transport 维度，「声明支持不等于实际可用」缺少诊断通道；诊断仅在执行后评估一次。
+
+**解决方法**：delegateTask/continueTask 派发前按预测 transport 做预检诊断并与执行后评估去重合并（永不阻断执行）；新增保守分类器 modelRejectionDiagnostic——错误文本同时含所请求 model id 与 4xx/unsupported-model 特征时输出结构化拒绝诊断（含 requestedModel）。模型枚举 values 字段维持仅 provenance=manual 人工维护写入，静态生成器不猜测值，防止枚举腐烂产生假阴性警告。
+
+**状态**：已解决（2026-08-25）；回归覆盖分类器正反用例与预检合并路径。「MCP 忽略 model」真链路用例按仓库规则保持 opt-in 不入 CI。
+
+## P-058 codex MCP spawn EPERM 缓解指引未进入结构化信息通道（P6/P-036 增强）
+
+**问题**：codex MCP 沙箱阻止子进程派生的 spawn EPERM 连续多轮复现，缓解知识只存在于真实测试记录中；agent 每轮需自行重新发现绕过方式。
+
+**解决方法**：内置能力矩阵 codex.mcp 增加 notes 缓解指引（TransportCapabilitySchema 扩展可选 notes 字段）；runner 检测到 MCP 传输结果中的 spawn EPERM 特征时自动在 warning 附带「NODE_OPTIONS=--test-isolation=none 或改用 cli」提示（sandboxSpawnHint）。
+
+**状态**：已解决（2026-08-25）；回归覆盖命中/传输/特征三重排除条件。
+
+## P-059 antigravity artifact-path 白名单失败无产物可复核性警示（P9 产品侧检测）
+
+**问题**：antigravity 的 write_to_file 以 artifact 白名单为由拒绝写入工作区且间歇性致命（r9 吞掉整轮产出）；vendor 行为无法根治，但 AgentMesh 未对「自述产出可能不可复核」给出任何结构化警示。
+
+**解决方法**：antigravity 适配器以常量特征匹配 "not a valid artifact path"，命中时经 warning 通道附加「产物可能未落盘工作区、需独立复核」警示；成功与致命失败两个分支均覆盖。不注入 findings，避免干扰 parseReviewOutput 的 fail-closed 语义。README 已知限制同步更新编排方降级指引建议。
+
+**状态**：已解决（2026-08-25，检测与警示层面；vendor 白名单本身属平台限制，如实记录）。

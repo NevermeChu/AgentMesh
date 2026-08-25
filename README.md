@@ -10,8 +10,8 @@
 
 - 🔌 **官方连接优先 (Official MCP Preferred)**：支持直接连接底层 Agent 的原生 MCP Server（如 `codex mcp-server`、`claude mcp serve`），并在不可用时自动无缝降级为 Headless CLI。
 - 🛡️ **结构化错误传播**：底层 Agent 未安装、未登录、额度不足或执行失败时，适配器和 MCP Tools 会尽量捕获错误并返回结构化诊断；启动配置、Session 存储或进程级故障仍会显式失败，而不是被静默忽略。
-- 🔍 **独立 Reviewer 规范**：内置代码评审提示词模板与只读权限约束（如 Codex `--sandbox read-only`）；无法解析为 `PASS` / `FAIL` 的结果按失败处理，避免误报通过。
-- 🧵 **轻量 Session 跟踪**：支持 `continue_task` 继续原 Agent 会话，也支持通过 `contextSessionId` 向新角色传递规范化历史。Reviewer/Tester 结果不会自动写回 Worker 原会话，Orchestrator 负责在修复任务中明确携带反馈。
+- 🔍 **独立 Reviewer 规范**：内置代码评审提示词模板与只读权限约束（如 Codex `--sandbox read-only`）；`review_changes` 声明严格评审契约，无法解析为 `PASS` / `FAIL` 的结果按失败处理，避免误报通过。Reviewer 结论为显式 `FAIL` 时始终失败；`PASS` 附带 critical/high（或严重度不可解析）findings 时按矛盾输出 fail-closed 判失败，仅附带 medium/low findings 时保持 PASS 并作为非阻塞 observations 随结果返回。经 `delegate_task` 以 reviewer 角色发起的**一般性对话**（讨论、答疑）不适用该严格契约：无 verdict 但有实质回答的结果保持 SUCCESS，`reviewOutcome=UNKNOWN` 与警告一并返回供调用方自行裁决；空/垃圾输出仍判失败。
+- 🧵 **轻量 Session 跟踪**：支持 `continue_task` 继续原 Agent 会话，也支持通过 `contextSessionId` 向新角色传递规范化历史。Reviewer/Tester 结果不会自动写回 Worker 原会话，Orchestrator 负责在修复任务中明确携带反馈。多源注入的共享上下文会以 sidecar 工件逐字持久化（`contexts/<sessionId>/<turn>.txt`），并在会话 history 的 `sharedContextAudit` 中记录 SHA-256、字节数与逐源截断标志，交接内容可事后审计；零轮次的会话不落盘，客户端中途取消不会留下空壳会话。
 - 💻 **Orchestrator-first**：正常工作流由主控 Agent 通过 MCP Tools 编排；CLI 负责启动服务、配置、状态和会话管理，直接执行仅保留在 `debug` 命名空间用于诊断。
 
 真实链路中已经确认的问题、修复状态和平台限制见 [PROBLEMS.md](./PROBLEMS.md)。
@@ -146,6 +146,8 @@ Orchestrator 调用 `delegate_task` / `review_changes` 时省略 `agent`，Agent
 
 `model` 与 `reasoningEffort` 由各 adapter 分别解释，不是所有 Agent 或传输都支持。Codex MCP 继续严格只发送 vendor schema 允许的 `prompt`、`cwd`、`sandbox` 或 `threadId`；模型/推理配置需要使用 CLI，或在能力文件明确声明支持后才可使用。请求的模型和推理强度会记录在 Session history，vendor 不支持时保留结构化诊断，不静默切换模型。
 
+执行结束后，AgentMesh 会按**实际使用的 transport** 对照能力矩阵（优先读取 `.agentmesh/capabilities.json`，不存在时回退到内建静态矩阵）校验请求的 `model`/`reasoningEffort`：不支持或值不在声明列表中时，会在 MCP 返回的 `Warning:` 段和会话 history 的 `capabilityDiagnostics` 字段中附上结构化诊断（说明请求未生效及原因），任务本身不会因此失败。
+
 首次显式生成项目能力说明：
 
 ```bash
@@ -169,7 +171,7 @@ agentmesh capabilities show
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
    - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选)。
 2. **`review_changes`**
-   - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果。
+   - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
    - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式)。
 3. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
@@ -216,7 +218,9 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因以及平台相关的进程树清理方式和结果。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
+
+Session 持久化有容量上限以防止 `sessions.json` 无界增长：每个会话默认保留最近 50 轮历史（更早轮次按时间丢弃），存储整体默认保留最近更新的 200 个会话（超出按 LRU 逐出）。两个上限均可通过程序化 `SessionManagerOptions` 调整，设为 `0` 表示不限制。
 
 ### 长任务超时
 
@@ -228,28 +232,46 @@ Orchestrator MCP request timeout > AgentMesh timeoutMs > 预期 Agent 执行时�
 
 未显式传入 `timeoutMs` 且项目角色配置也未设置时，AgentMesh 会对底层执行应用 10 分钟（600000ms）的默认超时（`DEFAULT_RUN_TIMEOUT_MS`），避免挂死的 Agent 进程无限占用请求；程序化使用时可通过 `MultiAgentRunner` 的 `RunnerOptions.defaultTimeoutMs` 覆盖。
 
-AgentMesh 在客户端请求 Progress 时会在任务开始、每 15 秒和完成时发送标准 MCP Progress 通知。使用 MCP SDK 直接调用时，应同时注册进度回调、允许进度重置空闲超时，并设置总超时上限：
+AgentMesh 在客户端请求 Progress 时会在任务开始、每 15 秒和完成时发送标准 MCP Progress 通知。使用 MCP SDK 直接调用时，应同时注册进度回调、允许进度重置空闲超时，并设置总超时上限，**且基础 `timeout` 必须大于 AgentMesh 任务的 `timeoutMs`**：
 
 ```ts
 await client.callTool(params, undefined, {
-  timeout: 30_000,
+  // 单次任务可达 600s+，这里给足余量；进度通知会自动重置空闲计时，
+  // 因此大不设小。
+  timeout: 1_800_000,
   resetTimeoutOnProgress: true,
-  maxTotalTimeout: 360_000,
+  maxTotalTimeout: 1_900_000,
   onprogress: ({ message }) => console.log(message),
 });
 ```
 
-> **注意**：请只通过 `onprogress` 回调接收进度。不要再额外调用 `setNotificationHandler(ProgressNotificationSchema, ...)` 注册全局进度处理器——在实测的 TS SDK 行为中，全局处理器会接管进度路由，`onprogress` 不再触发，`resetTimeoutOnProgress` 也随之失效，客户端会在基础超时处误判请求超时。
+> **注意一**：SDK 客户端若不传 `timeout`，默认请求超时仅为 **60 秒**（`DEFAULT_REQUEST_TIMEOUT_MSEC`）。AgentMesh 单次 `delegate_task`/`review_changes` 经常超过此值——实测中默认值会在 60s 处直接掐断请求（`-32001 Request timed out`），即使底层 Agent 仍在正常运行。必须显式把 `timeout` 设到高于 AgentMesh `timeoutMs`，否则长任务会被客户端提前取消。
+>
+> **注意二**：请只通过 `onprogress` 回调接收进度。不要再额外调用 `setNotificationHandler(ProgressNotificationSchema, ...)` 注册全局进度处理器——在实测的 TS SDK 行为中，全局处理器会接管进度路由，`onprogress` 不再触发，`resetTimeoutOnProgress` 也随之失效，客户端会在基础超时处误判请求超时。
+>
+> **注意三**：用 `StdioClientTransport` 构造客户端时必须显式传 `env: process.env`。SDK 默认的环境白名单会丢弃 `PATHEXT` 与自定义 `PATH` 项，实测会把子进程环境裁剪到无法解析 `.cmd`/全局 bin（症状为迷惑性 ENOENT、`PATHEXT=null`）。这是 MCP TS SDK 的集成者陷阱，AgentMesh 自身的产品路径不受影响（内部已传全量环境）。
 
 ### 客户端取消与断连
 
-取消通知到达后，AgentMesh 会终止底层 Agent 进程树（Windows 使用 `taskkill /T /F`，其他平台使用终止信号），并将该轮记录为失败；取消后的 `auto` 模式不会再用 CLI 重跑同一任务。Codex MCP 在 Windows 受限沙箱中可能无法派生 Node 测试子进程并报 `spawn EPERM`，这是 vendor/platform 能力限制，不应向 Codex MCP 工具注入未知的测试参数。此时优先使用 `mode: "auto"` 让 AgentMesh 在 MCP 失败后回退 CLI，或让 Tester 使用 `node --test --test-isolation=none`；显式 `mode: "mcp"` 则保留失败，不会静默改变传输方式。
+取消通知到达后，AgentMesh 会终止底层 Agent 进程树（Windows 使用 `taskkill /T /F`；其他平台以独立进程组 spawn，终止时向整个进程组发送 SIGTERM 并在 1 秒后升级 SIGKILL，从而一并回收 vendor CLI fork 出的后台子进程），并将该轮记录为失败；取消后的 `auto` 模式不会再用 CLI 重跑同一任务。Codex MCP 在 Windows 受限沙箱中可能无法派生 Node 测试子进程并报 `spawn EPERM`，这是 vendor/platform 能力限制，不应向 Codex MCP 工具注入未知的测试参数。此时优先使用 `mode: "auto"` 让 AgentMesh 在 MCP 失败后回退 CLI，或让 Tester 使用 `node --test --test-isolation=none`；显式 `mode: "mcp"` 则保留失败，不会静默改变传输方式。AgentMesh 检测到 MCP 传输下的 `spawn EPERM` 特征时，会自动在结果 `warning` 中附带该缓解指引（同时写入内置能力矩阵的 codex MCP notes）。
 
-边界：如果客户端**直接关闭连接**（而非超时/取消），MCP SDK 的 stdio 客户端会立即终止 AgentMesh 服务进程，服务端可能来不及写入该轮记录。编排方应依赖请求超时 + 取消通知来取消长任务，而不是强行断开。
+`mode: "auto"` 在首选传输失败时回退执行的行为保持不变，但**不再静默**：回退发生时结果会携带结构化 `transportFallback` 证据（from/to/原始错误原因）与 warning 文本，并随该轮 Session 历史持久化，编排方可据此追溯传输切换的根因。
+
+vendor 侧的结构化错误字段与实质结论并存时（如 CLI 收尾竞态产生的尾部 `context canceled`），Codex/Antigravity 适配器在 exit code 为 0 且已有完整最终回答时会保留该轮成功结果，并把错误降级为 `warning` 附带返回，而不是整体判失败并丢弃正文。
+
+边界：如果客户端**直接关闭连接**（而非超时/取消），AgentMesh 服务进程在 stdio 关闭、SIGINT 或 SIGTERM 时会先中止所有 in-flight 执行，并**有界等待**（事件驱动 + 最长 10 秒兜底）每轮以 `cancelReason: "client_disconnect"` 落盘为失败记录后再退出——断连不再留下零痕迹的消失。进程被 SIGKILL 式强杀仍无法落盘，这是如实的残留边界；编排方仍应优先依赖请求超时 + 取消通知来取消长任务。
 
 ### 结果中的原始诊断输出
 
 MCP 工具响应在 `Summary` / `Final Answer` 之外，还会包含截断到 8000 字符的 `Raw Output` 段（vendor CLI 的原始输出与 stderr），用于远程排查底层 Agent 失败；当原始输出与最终回答一致时该段省略。
+
+### 已知的 vendor 运行时限制
+
+真实链路中还观察到几类可影响可复核性的 vendor 限制，AgentMesh 不做静默修补，只如实记录：
+
+- **Antigravity CLI 的临时测试产物无法写入工作区**：实测中 Antigravity Tester 运行对抗/临时测试时，其 `write_to_file` 工具要求产物位于自身 `antigravity-cli/brain/...` 目录，写入工作区路径会返回 `not a valid artifact path`。AgentMesh 不能改变 vendor 的 artifact 白名单；Tester 返回的测试结论只有在 `repository evidence` 中出现对应文件时才可复核。若文件未落入工作区，编排方必须将结果标记为“不可复核产物”，不能把 vendor 自述的通过数当作仓库证据。任务应要求使用可写工作区工具创建测试文件，或明确接受该限制。AgentMesh 检测到该特征时会在结果 `warning` 中标注「产物可能未落盘工作区、需独立复核」，防止下游把不可复核的自述当成功证据（该间歇性 vendor 行为在真实测试中曾以致命形态吞掉整轮产出，编排方宜默认在任务文本内嵌「改用 shell 写入」降级指引）。
+- **OpenCode Reviewer 的 shell 常缺 `node`/`git`**：实测中 Reviewer 静态审阅通过但无法本地执行测试（`node`、`git` 不在其 shell PATH）。此时 PASS 仅代表静态结论，不代表已执行过测试。
+- Windows 上 `taskkill /T /F` 只回收 AgentMesh 能定位到根 PID 的 vendor 进程树；某些 vendor CLI 会 fork 出已脱离父进程的后台守护进程，这些孤儿进程需外部监控或手工清理。POSIX 平台通过进程组信号可回收 fork 子进程，但主动 `setsid` 脱离进程组的守护进程同样无法定位。
 
 具体配置入口取决于 Orchestrator；若客户端不请求 Progress 且固定在较短超时，即使 `.agentmesh/config.json` 已设置更长的 `timeoutMs`，外层请求仍会先取消。同步 MCP 链路通过 Progress 提供实时状态和失败结果；跨请求或离线 webhook 不属于当前本地 stdio Bridge 的职责。
 

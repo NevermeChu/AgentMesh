@@ -10,7 +10,7 @@ import type {
   SandboxMechanism,
   TransportMode,
 } from "./types.js";
-import { findExecutableOnPath } from "../core/executor.js";
+import { findExecutableOnPath, ProcessExecutionError } from "../core/executor.js";
 import { extractSummary, parseReviewOutput } from "../core/prompts.js";
 
 export abstract class BaseAdapter implements AgentAdapter {
@@ -128,12 +128,18 @@ export abstract class BaseAdapter implements AgentAdapter {
         // If mode is 'auto', fall back gracefully to CLI — unless the caller
         // cancelled, in which case re-running the task would ignore the cancel.
         if (mode === "auto" && this.supportedModes.includes("cli") && !options.signal?.aborted) {
+          const mcpError = err instanceof Error ? err.message : String(err);
           try {
             const fallbackRes = await this.runViaCli(options);
+            const note =
+              `Transport fallback: MCP execution failed (${mcpError}); ` +
+              "the task was re-executed via CLI so the result below comes from the CLI transport.";
             return {
               ...fallbackRes,
               transportUsed: "cli",
               durationMs: Date.now() - startTime,
+              transportFallback: { from: "mcp", to: "cli", reason: mcpError },
+              warning: [fallbackRes.warning, note].filter(Boolean).join(" "),
             };
           } catch (cliErr) {
             return this.formatErrorResult(cliErr, startTime);
@@ -189,20 +195,32 @@ export abstract class BaseAdapter implements AgentAdapter {
       summary?: string;
       finalAnswer?: string;
       role?: AgentRole;
+      reviewVerdictRequired?: boolean;
     },
   ): AgentResult {
     const isReviewer = options?.role === "reviewer";
     let status: "success" | "failed" = "success";
     let reviewOutcome: "PASS" | "FAIL" | "UNKNOWN" | undefined;
     let findings: ReviewFinding[] | undefined;
+    let warning: string | undefined;
     let summary = options?.summary;
 
     if (isReviewer) {
       const parsed = parseReviewOutput(output);
       reviewOutcome = parsed.reviewOutcome;
       findings = parsed.findings;
-      if (parsed.reviewOutcome !== "PASS") {
+      if (parsed.reviewOutcome === "FAIL") {
         status = "failed";
+      } else if (parsed.reviewOutcome === "UNKNOWN") {
+        const substantiveAnswer = Boolean((options?.finalAnswer ?? output).trim());
+        if (options?.reviewVerdictRequired || !substantiveAnswer) {
+          // The review contract (or an empty response) fails closed.
+          status = "failed";
+        } else {
+          warning =
+            "No explicit PASS/FAIL verdict was detected in the reviewer response; " +
+            "reviewOutcome=UNKNOWN was kept non-fatal because this call did not declare the strict review contract.";
+        }
       }
       if (!summary) {
         summary = parsed.summary;
@@ -228,11 +246,13 @@ export abstract class BaseAdapter implements AgentAdapter {
       durationMs: Date.now() - startTime,
       reviewOutcome,
       findings,
+      ...(warning ? { warning } : {}),
     };
   }
 
   protected formatErrorResult(err: unknown, startTime: number, output = ""): AgentResult {
     const errorMsg = err instanceof Error ? err.message : String(err);
+    const processError = err instanceof ProcessExecutionError ? err : undefined;
     const combinedOutput = output ? `${output}\n${errorMsg}` : errorMsg;
     return {
       status: "failed",
@@ -240,8 +260,13 @@ export abstract class BaseAdapter implements AgentAdapter {
       output: combinedOutput,
       summary: `Failed to execute ${this.displayName}: ${errorMsg}`,
       error: errorMsg,
-      exitCode: 1,
+      exitCode: processError?.exitCode ?? 1,
       durationMs: Date.now() - startTime,
+      timedOut: processError?.timedOut,
+      aborted: processError?.aborted,
+      cleanupMethod: processError?.cleanupMethod,
+      cleanupSucceeded: processError?.cleanupSucceeded,
+      resourceEvidence: processError?.resourceEvidence,
     };
   }
 }

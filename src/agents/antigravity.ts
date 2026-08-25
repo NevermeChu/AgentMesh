@@ -19,6 +19,22 @@ export interface ParsedAntigravityOutput {
   error?: string;
 }
 
+/**
+ * Antigravity intermittently refuses to write files outside its artifact
+ * sandbox ("not a valid artifact path"), sometimes fatally after producing a
+ * full response. Detection lets callers know that claimed outputs may be
+ * unreproducible in the workspace without misattributing them as PASS/FAIL
+ * findings.
+ */
+const ARTIFACT_PATH_RESTRICTION_PATTERN = /not a valid artifact path/i;
+
+function artifactRestrictionWarning(): string {
+  return (
+    "Antigravity reported an artifact-path restriction (files must live in its artifact sandbox); " +
+    "any files it claims to have written may NOT exist in the workspace. Verify artifacts independently."
+  );
+}
+
 export function parseAntigravityJsonOutput(output: string): ParsedAntigravityOutput {
   try {
     const parsed = JSON.parse(output) as Record<string, unknown>;
@@ -182,12 +198,14 @@ export class AntigravityAdapter extends BaseAdapter {
         parsed.sessionId || this.extractSessionId(res.stdout) || options.nativeSessionId;
 
       if (res.exitCode !== 0 || !parsed.output?.trim()) {
+        const restricted = ARTIFACT_PATH_RESTRICTION_PATTERN.test(diagnosticOutput);
         return {
           status: "failed",
           agent: this.name,
           output: diagnosticOutput,
           summary: parsed.error || `Antigravity/AGY exited with code ${res.exitCode}`,
           error: parsed.error,
+          ...(restricted ? { warning: artifactRestrictionWarning() } : {}),
           exitCode: res.exitCode,
           nativeSessionId,
           durationMs: Date.now() - startTime,
@@ -204,8 +222,15 @@ export class AntigravityAdapter extends BaseAdapter {
         exitCode: res.exitCode,
         finalAnswer: parsed.output,
         role,
+        reviewVerdictRequired: options.reviewVerdictRequired,
       });
-      if (parsed.error) result.warning = parsed.error;
+      const warnings = [
+        parsed.error,
+        ARTIFACT_PATH_RESTRICTION_PATTERN.test(res.stdout)
+          ? artifactRestrictionWarning()
+          : undefined,
+      ].filter(Boolean);
+      if (warnings.length > 0) result.warning = warnings.join(" ");
       return result;
     } catch (err) {
       if (err instanceof ProcessExecutionError) {

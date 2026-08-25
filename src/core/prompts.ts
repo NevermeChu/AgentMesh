@@ -1,5 +1,6 @@
 import type { AgentRole, ReviewFinding } from "../agents/types.js";
 import type { SessionHistoryEntry } from "./types.js";
+import { truncateText } from "./text.js";
 
 /**
  * Builds standard system and task instructions tailored to the assigned role.
@@ -63,7 +64,12 @@ export function buildReviewerPrompt(
     `PASS`,
     `Optional positive summary / remarks.`,
     ``,
-    `If any issues or concerns are identified, respond with:`,
+    `After a PASS you may additionally list minor non-blocking observations`,
+    `(severity medium or low) in the structured finding format below; they are`,
+    `reported to the orchestrator but do not change the PASS verdict. Use this`,
+    `only when you are confident the change should be approved.`,
+    ``,
+    `If blocking issues or concerns are identified, respond with:`,
     `FAIL`,
     ``,
     `Then list each finding in this structured format:`,
@@ -143,18 +149,10 @@ export interface ParsedReviewOutput {
   summary: string;
 }
 
-function matchVerdict(line: string): "PASS" | "FAIL" | undefined {
+function matchVerdict(line: string, allowBarePrefix: boolean): "PASS" | "FAIL" | undefined {
   const trimmed = line.trim();
   // Strip Markdown header hashes: ### **PASS** -> **PASS**
   const clean = trimmed.replace(/^#+\s*/, "").trim();
-
-  // Direct word or bold/italic: PASS, **PASS**, *PASS*, __PASS__
-  if (/^(\*{1,2}|_{1,2})?PASS\b(\*{1,2}|_{1,2})?/i.test(clean)) {
-    return "PASS";
-  }
-  if (/^(\*{1,2}|_{1,2})?FAIL\b(\*{1,2}|_{1,2})?/i.test(clean)) {
-    return "FAIL";
-  }
 
   // Labeled verdicts: Verdict: PASS, Result: **PASS**, Status: FAIL, Outcome: PASS, Review: PASS
   const labeledPass =
@@ -164,6 +162,23 @@ function matchVerdict(line: string): "PASS" | "FAIL" | undefined {
 
   if (labeledPass.test(clean)) return "PASS";
   if (labeledFail.test(clean)) return "FAIL";
+
+  // Direct word or bold/italic: PASS, **PASS**, *PASS*, __PASS__
+  // A bare word that starts a longer line is only trusted near the top of the
+  // output (the required verdict position); deeper in the text it may be a
+  // quoted diff/test artifact and must not decide the review outcome.
+  const barePattern = allowBarePrefix
+    ? /^(\*{1,2}|_{1,2})?PASS\b(\*{1,2}|_{1,2})?/i
+    : /^(\*{1,2}|_{1,2})?PASS(\*{1,2}|_{1,2})?$/i;
+  if (barePattern.test(clean)) {
+    return "PASS";
+  }
+  const bareFailPattern = allowBarePrefix
+    ? /^(\*{1,2}|_{1,2})?FAIL\b(\*{1,2}|_{1,2})?/i
+    : /^(\*{1,2}|_{1,2})?FAIL(\*{1,2}|_{1,2})?$/i;
+  if (bareFailPattern.test(clean)) {
+    return "FAIL";
+  }
 
   return undefined;
 }
@@ -188,8 +203,11 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   let outcome: "PASS" | "FAIL" | "UNKNOWN" = "UNKNOWN";
   const verdicts = new Set<"PASS" | "FAIL">();
 
-  for (const line of lines) {
-    const verdict = matchVerdict(line);
+  // The required output format places the verdict at the start of the review;
+  // beyond that region only exact standalone words or labeled verdicts count.
+  const BARE_VERDICT_PREFIX_LINES = 10;
+  for (const [index, line] of lines.entries()) {
+    const verdict = matchVerdict(line, index < BARE_VERDICT_PREFIX_LINES);
     if (verdict) verdicts.add(verdict);
   }
 
@@ -200,11 +218,15 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   }
 
   const findings: ReviewFinding[] = [];
+  let hasUnparsedSeverity = false;
   const findingBlocks = cleanOutput.split(/(?:^|\n)(?:[-*]\s*)?severity\s*:\s*/i);
 
   for (let i = 1; i < findingBlocks.length; i++) {
     const block = findingBlocks[i]!;
     const severityMatch = block.match(/^(critical|high|medium|low)\b/i);
+    if (!severityMatch) {
+      hasUnparsedSeverity = true;
+    }
     const severity = (
       severityMatch ? severityMatch[1]?.toLowerCase() : "medium"
     ) as ReviewFinding["severity"];
@@ -232,25 +254,30 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
     });
   }
 
-  // Findings always override a PASS declaration. Contradictory or unsafe
-  // reviewer output must fail closed rather than allow a false green result.
-  if (findings.length > 0) {
+  // An explicit FAIL verdict always decides the review. Under an explicit
+  // PASS, only critical/high findings (or a finding whose severity cannot be
+  // parsed) contradict the verdict strongly enough to fail closed; medium/low
+  // observations stay non-blocking so reviewers can report minor notes without
+  // flipping an approval into a failure. Without any verdict, findings still
+  // fail closed rather than allow an unreviewed green result.
+  const hasBlockingFinding =
+    findings.length > 0 &&
+    (hasUnparsedSeverity ||
+      findings.some((f) => f.severity === "critical" || f.severity === "high"));
+  if (findings.length > 0 && (outcome !== "PASS" || hasBlockingFinding)) {
     outcome = "FAIL";
   }
 
   let summary: string;
   if (outcome === "PASS") {
-    summary = "Review PASSED: Changes are clean and verified.";
+    summary =
+      findings.length > 0
+        ? `Review PASSED with ${findings.length} non-blocking finding(s).`
+        : "Review PASSED: Changes are clean and verified.";
   } else if (outcome === "FAIL") {
     summary = `Review FAILED: ${findings.length > 0 ? `${findings.length} issue(s) detected.` : "Issues were detected during review."}`;
   } else {
-    const lastLine = lines[lines.length - 1];
-    if (lastLine && lastLine.length < 200) {
-      summary = lastLine;
-    } else {
-      const snippet = lines[0] ?? "Execution completed";
-      summary = snippet.length > 200 ? `${snippet.slice(0, 197)}...` : snippet;
-    }
+    summary = pickSummaryLine(lines, "Execution completed");
   }
 
   return {
@@ -283,10 +310,57 @@ function isSummaryNoise(line: string): boolean {
   );
 }
 
-function summarizeFirstMeaningfulLine(lines: string[], fallback: string): string {
-  const candidate = lines.find((line) => !isSummaryNoise(line));
-  const value = candidate || lines[0] || fallback;
-  return value.length > 200 ? `${value.slice(0, 197)}...` : value;
+/**
+ * Labels that carry a conclusion value when followed by a colon.
+ *   "Overall Status: PASS", "Summary: Implemented the feature",
+ *   "- **Overall Status:** **PASS**".
+ */
+const SUMMARY_LABEL_RE =
+  /^(?:summary|(?:overall\s+)?(?:status|result|verdict|outcome|conclusion)|final\s+verdict|decision)\s*:\s*(.+)$/i;
+
+const SUMMARY_HEADING_RE = /^#+\s*(?:summary|conclusion|verdict|result|outcome|overall)\b\W*/i;
+
+/** Strips markdown list markers and bold/italic decorations for summary matching. */
+function normalizeSummaryLine(line: string): string {
+  let value = line.trim();
+  // Remove a leading unordered-list / emphasis marker: "- ", "* ", "** ".
+  value = value.replace(/^\s*(?:[-*]\s+)+/, "");
+  // Remove surrounding bold/italic markers from the label AND the value.
+  value = value.replace(/^\*{1,2}|_{1,2}/, "").replace(/\*{1,2}|_{1,2}$/, "");
+  return value;
+}
+
+function truncate(text: string, max = 200): string {
+  return truncateText(text, max);
+}
+
+function pickSummaryLine(lines: string[], fallback: string): string {
+  // 1. A labeled conclusion line carries the most intent:
+  //    "Overall Status: PASS", "Summary: Implemented the feature",
+  //    "- **Overall Status:** **PASS**".
+  for (const line of lines) {
+    const match = normalizeSummaryLine(line).match(SUMMARY_LABEL_RE);
+    if (!match) continue;
+    const value = normalizeSummaryLine(match[1]!);
+    if (value && !isSummaryNoise(value)) {
+      return truncate(value);
+    }
+  }
+  // 2. A Markdown heading that names a conclusion section, e.g.
+  //    "## Combined Verification Outcome", "### Summary".
+  for (const line of lines) {
+    if (SUMMARY_HEADING_RE.test(line.trim())) {
+      const value = line.trim().replace(SUMMARY_HEADING_RE, "").trim();
+      if (value && !isSummaryNoise(value)) {
+        return truncate(value);
+      }
+    }
+  }
+  // 3. Fall back to the last non-noise line — conclusions tend to be near the
+  //    end of an agent's run, while the leading lines are often progress chatter.
+  const meaningful = lines.filter((line) => !isSummaryNoise(line));
+  const candidate = meaningful[meaningful.length - 1] ?? lines[0] ?? fallback;
+  return truncate(candidate);
 }
 
 /**
@@ -315,5 +389,5 @@ export function extractSummary(
     }
   }
 
-  return summarizeFirstMeaningfulLine(lines, fallback);
+  return pickSummaryLine(lines, fallback);
 }

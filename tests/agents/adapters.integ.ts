@@ -129,6 +129,54 @@ describe("CLI adapter process integration", () => {
       transportUsed: "cli",
     });
   });
+  it("keeps a successful Codex run despite a trailing structured error event", async () => {
+    const executable = await createFakeExecutable(temporaryDirectory);
+    const capturePath = path.join(temporaryDirectory, "codex-args.json");
+    process.env.CODEX_BIN = executable;
+
+    const result = await new CodexAdapter().run({
+      task: "Finish the feature",
+      cwd: temporaryDirectory,
+      role: "worker",
+      mode: "cli",
+      env: {
+        FAKE_CAPTURE_PATH: capturePath,
+        FAKE_STDOUT: [
+          JSON.stringify({ type: "error", error: "context canceled" }),
+          JSON.stringify({
+            type: "item.completed",
+            item: { type: "agent_message", text: "PASS\nFeature complete." },
+          }),
+        ].join("\n"),
+      },
+    });
+
+    // Partial success must not be discarded (regression for P3/P8 residue):
+    // a clean exit plus a substantive final message wins over teardown noise.
+    expect(result.status).toBe("success");
+    expect(result.finalAnswer).toContain("Feature complete.");
+    expect(result.warning).toContain("context canceled");
+  });
+
+  it("still fails a Codex run whose structured error has no substantive output", async () => {
+    const executable = await createFakeExecutable(temporaryDirectory);
+    const capturePath = path.join(temporaryDirectory, "codex-args.json");
+    process.env.CODEX_BIN = executable;
+
+    const result = await new CodexAdapter().run({
+      task: "Fail clearly",
+      cwd: temporaryDirectory,
+      role: "worker",
+      mode: "cli",
+      env: {
+        FAKE_CAPTURE_PATH: capturePath,
+        FAKE_STDOUT: JSON.stringify({ type: "error", error: "quota exceeded" }),
+      },
+    });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("quota exceeded");
+  });
 });
 
 function restoreEnvironment(name: string, value: string | undefined): void {

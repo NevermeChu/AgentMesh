@@ -29,6 +29,12 @@ export interface RunAgentOptions extends AgentModelOptions {
   nativeSessionId?: string;
   baseCommit?: string;
   historyContext?: string;
+  /**
+   * Declares the strict review contract: an unparseable review verdict fails
+   * closed. Set only by callers whose product IS the review verdict (the
+   * review_changes pipeline); general reviewer-role conversations stay lenient.
+   */
+  reviewVerdictRequired?: boolean;
   /** Aborts the underlying agent process; the run resolves as a cancelled failure. */
   signal?: AbortSignal;
 }
@@ -54,6 +60,14 @@ export interface ReviewFinding {
   line?: number | string;
   issue: string;
   suggestion?: string;
+}
+
+/** Evidence that an auto-mode execution silently switched transports. */
+export interface TransportFallbackEvidence {
+  from: "mcp" | "cli";
+  to: "mcp" | "cli";
+  /** Original transport error that triggered the fallback. */
+  reason: string;
 }
 
 export interface AgentResult {
@@ -85,6 +99,8 @@ export interface AgentResult {
     limitations?: string;
   };
   transportUsed?: "mcp" | "cli";
+  /** Present when auto mode fell back from the preferred transport to another one. */
+  transportFallback?: TransportFallbackEvidence;
   reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
   findings?: ReviewFinding[];
   reviewerSafety?: ReviewerSafetyReport;

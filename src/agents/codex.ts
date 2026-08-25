@@ -146,6 +146,7 @@ export class CodexAdapter extends BaseAdapter {
       nativeSessionId,
       finalAnswer: mcpRes.output,
       role: options.role,
+      reviewVerdictRequired: options.reviewVerdictRequired,
     });
   }
 
@@ -229,8 +230,13 @@ export class CodexAdapter extends BaseAdapter {
           ? res.stderr.trim()
           : undefined;
       const semanticError = parsed.error || stderrSemanticError;
+      // A structured error next to a substantive final message with a clean
+      // exit code is vendor teardown noise, not a business failure; keep the
+      // conclusion and surface the error as a warning instead of discarding it.
+      const hasSubstantiveOutput = Boolean(parsed.output?.trim());
+      const shouldFail = res.exitCode !== 0 || (semanticError && !hasSubstantiveOutput);
 
-      if (res.exitCode !== 0 || semanticError) {
+      if (shouldFail) {
         return {
           status: "failed",
           agent: this.name,
@@ -248,12 +254,14 @@ export class CodexAdapter extends BaseAdapter {
         };
       }
 
-      return this.formatSuccessResult(fullOutput, startTime, {
+      const result = this.formatSuccessResult(fullOutput, startTime, {
         nativeSessionId,
         exitCode: res.exitCode,
         finalAnswer: parsed.output || undefined,
         role,
       });
+      if (semanticError && hasSubstantiveOutput) result.warning = semanticError;
+      return result;
     } catch (err) {
       if (err instanceof ProcessExecutionError) {
         return {

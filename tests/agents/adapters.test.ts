@@ -139,7 +139,7 @@ describe("agents/adapters", () => {
     expect(invoked).toBe(false);
   });
 
-  it("fails closed when reviewer output has no verdict", async () => {
+  it("keeps an unparseable reviewer verdict non-fatal when no strict contract is declared (N-R11-A)", async () => {
     class UnknownReviewerAdapter extends BaseAdapter {
       readonly name = "codex" as const;
       readonly displayName = "Mock Codex";
@@ -148,15 +148,71 @@ describe("agents/adapters", () => {
       readonly envBinOverride = "TEST_CODEX_BIN";
       readonly defaultExecutableName = "node";
 
-      protected override async runViaCli() {
+      protected override async runViaCli(options: RunAgentOptions) {
         return this.formatSuccessResult("Review completed without a verdict.", Date.now(), {
+          role: "reviewer",
+          exitCode: 0,
+          finalAnswer: "Review completed without a verdict.",
+          reviewVerdictRequired: options.reviewVerdictRequired,
+        });
+      }
+    }
+
+    const result = await new UnknownReviewerAdapter().run({
+      task: "Explain your review approach",
+      role: "reviewer",
+    });
+    expect(result.status).toBe("success");
+    expect(result.reviewOutcome).toBe("UNKNOWN");
+    expect(result.warning).toContain("No explicit PASS/FAIL verdict");
+  });
+
+  it("fails closed on an unknown verdict when the strict review contract is declared", async () => {
+    class ContractReviewerAdapter extends BaseAdapter {
+      readonly name = "codex" as const;
+      readonly displayName = "Mock Codex";
+      readonly supportedModes = ["cli"] as const;
+      readonly sandboxMechanism = "prompt-only" as const;
+      readonly envBinOverride = "TEST_CODEX_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli(options: RunAgentOptions) {
+        return this.formatSuccessResult("Review completed without a verdict.", Date.now(), {
+          role: "reviewer",
+          exitCode: 0,
+          finalAnswer: "Review completed without a verdict.",
+          reviewVerdictRequired: options.reviewVerdictRequired,
+        });
+      }
+    }
+
+    const result = await new ContractReviewerAdapter().run({
+      task: "Review changes",
+      role: "reviewer",
+      reviewVerdictRequired: true,
+    });
+    expect(result.status).toBe("failed");
+    expect(result.reviewOutcome).toBe("UNKNOWN");
+  });
+
+  it("still fails closed for a reviewer UNKNOWN without any substantive answer", async () => {
+    class EmptyUnknownAdapter extends BaseAdapter {
+      readonly name = "codex" as const;
+      readonly displayName = "Mock Codex";
+      readonly supportedModes = ["cli"] as const;
+      readonly sandboxMechanism = "prompt-only" as const;
+      readonly envBinOverride = "TEST_CODEX_BIN";
+      readonly defaultExecutableName = "node";
+
+      protected override async runViaCli() {
+        return this.formatSuccessResult("", Date.now(), {
           role: "reviewer",
           exitCode: 0,
         });
       }
     }
 
-    const result = await new UnknownReviewerAdapter().run({
+    const result = await new EmptyUnknownAdapter().run({
       task: "Review changes",
       role: "reviewer",
     });

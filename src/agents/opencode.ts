@@ -146,6 +146,7 @@ export class OpenCodeAdapter extends BaseAdapter {
         exitCode: res.exitCode,
         finalAnswer: parsed.output || undefined,
         role,
+        reviewVerdictRequired: options.reviewVerdictRequired,
       });
     } catch (err) {
       if (err instanceof ProcessExecutionError) {

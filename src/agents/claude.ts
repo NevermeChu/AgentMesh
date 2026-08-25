@@ -167,6 +167,7 @@ export class ClaudeAdapter extends BaseAdapter {
         exitCode: res.exitCode,
         finalAnswer: parsed.output,
         role,
+        reviewVerdictRequired: options.reviewVerdictRequired,
       });
     } catch (err) {
       if (err instanceof ProcessExecutionError) {

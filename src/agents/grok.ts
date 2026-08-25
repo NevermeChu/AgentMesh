@@ -64,6 +64,7 @@ export class GrokAdapter extends BaseAdapter {
         nativeSessionId,
         exitCode: res.exitCode,
         role,
+        reviewVerdictRequired: options.reviewVerdictRequired,
       });
     } catch (err) {
       if (err instanceof ProcessExecutionError) {

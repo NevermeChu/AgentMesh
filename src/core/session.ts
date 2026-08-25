@@ -42,6 +42,11 @@ const ResourceEvidenceSchema = z.object({
   note: z.string().optional(),
   limitations: z.string().optional(),
 });
+const TransportFallbackEvidenceSchema = z.object({
+  from: z.enum(["mcp", "cli"]),
+  to: z.enum(["mcp", "cli"]),
+  reason: z.string(),
+});
 const SessionExecutionEvidenceSchema = z.object({
   repositoryBefore: RepositoryStateEvidenceSchema.optional(),
   repositoryAfter: RepositoryStateEvidenceSchema.optional(),
@@ -50,10 +55,11 @@ const SessionExecutionEvidenceSchema = z.object({
   durationMs: z.number().nonnegative().optional(),
   timedOut: z.boolean().optional(),
   aborted: z.boolean().optional(),
-  cancelReason: z.enum(["timeout", "client_cancel", "unknown"]).optional(),
+  cancelReason: z.enum(["timeout", "client_cancel", "client_disconnect", "unknown"]).optional(),
   cleanupMethod: z.enum(["taskkill-tree", "signal", "unknown"]).optional(),
   cleanupSucceeded: z.boolean().optional(),
   resourceEvidence: ResourceEvidenceSchema.optional(),
+  transportFallback: TransportFallbackEvidenceSchema.optional(),
 });
 const ReviewerSafetyReportSchema = z.object({
   requested: z.enum(["best-effort", "enforced"]),
@@ -62,6 +68,19 @@ const ReviewerSafetyReportSchema = z.object({
   workspaceChanged: z.boolean().optional(),
   changedPaths: z.array(z.string()).optional(),
   warning: z.string().optional(),
+});
+const SharedContextAuditSchema = z.object({
+  file: z.string().optional(),
+  bytes: z.number().int().nonnegative(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  totalChars: z.number().int().nonnegative(),
+  sources: z.array(
+    z.object({
+      sessionId: z.string(),
+      chars: z.number().int().nonnegative(),
+      truncated: z.boolean(),
+    }),
+  ),
 });
 const SessionHistoryEntrySchema = z.object({
   role: AgentRoleSchema,
@@ -77,6 +96,8 @@ const SessionHistoryEntrySchema = z.object({
   contextSources: z.array(z.string()).optional(),
   requestedModel: z.string().optional(),
   requestedReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+  capabilityDiagnostics: z.array(z.string()).optional(),
+  sharedContextAudit: SharedContextAuditSchema.optional(),
 });
 const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),
@@ -90,6 +111,9 @@ const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
+const DEFAULT_MAX_HISTORY_TURNS_PER_SESSION = 50;
+const DEFAULT_MAX_SESSIONS = 200;
+
 function snapshotSession(session: BridgeSession): BridgeSession {
   return structuredClone(session);
 }
@@ -99,9 +123,24 @@ export class SessionManager {
   private readonly storagePath: string;
   private readonly persist: boolean;
   private readonly lockPath: string;
+  private readonly maxHistoryTurnsPerSession: number;
+  private readonly maxSessions: number;
+  /**
+   * Sessions created in this process whose first turn has not been flushed to
+   * storage yet. Deferring the first write means a client disconnect that kills
+   * the server mid-execution can no longer leave a permanent zero-turn session
+   * husk behind: a session becomes durable together with its first turn.
+   */
+  private unsavedSessions = new Set<string>();
 
   constructor(options: SessionManagerOptions = {}) {
     this.persist = options.persist ?? true;
+    // Storage stays bounded: every mutation rewrites the whole JSON file, so
+    // unbounded history would turn each append into an O(N) rewrite that grows
+    // without limit. Caps are configurable and `0` disables them.
+    this.maxHistoryTurnsPerSession =
+      options.maxHistoryTurnsPerSession ?? DEFAULT_MAX_HISTORY_TURNS_PER_SESSION;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
     this.storagePath =
       options.storagePath ||
       process.env.AGENTMESH_SESSIONS_FILE ||
@@ -111,6 +150,37 @@ export class SessionManager {
     if (this.persist) {
       this.loadFromFile();
     }
+  }
+
+  /**
+   * Refreshes from disk while keeping sessions created in this process whose
+   * first turn has not been flushed yet, so a deferred-create session stays
+   * visible and is not clobbered by the storage reload.
+   */
+  private reloadFromDiskPreservingUnsaved(): void {
+    const preserved = new Map<string, BridgeSession>();
+    for (const id of this.unsavedSessions) {
+      const session = this.sessions.get(id);
+      if (session) preserved.set(id, session);
+    }
+    this.loadFromFile();
+    for (const [id, session] of preserved) {
+      const persisted = this.sessions.get(id);
+      if (
+        !persisted ||
+        new Date(persisted.updatedAt).getTime() <= new Date(session.updatedAt).getTime()
+      ) {
+        this.sessions.set(id, session);
+      } else {
+        // Another process already flushed a newer state for this id.
+        this.unsavedSessions.delete(id);
+      }
+    }
+  }
+
+  /** Marks a session as durably stored after a successful flush. */
+  private markFlushed(...ids: string[]): void {
+    for (const id of ids) this.unsavedSessions.delete(id);
   }
 
   /**
@@ -232,7 +302,7 @@ export class SessionManager {
 
     let outcome: { ok: true; value: T } | { ok: false; error: unknown };
     try {
-      this.loadFromFile();
+      this.reloadFromDiskPreservingUnsaved();
       outcome = { ok: true, value: operation() };
     } catch (error) {
       outcome = { ok: false, error };
@@ -275,6 +345,24 @@ export class SessionManager {
     return `bridge-sess_${randomHex}`;
   }
 
+  /** Evicts least-recently-updated sessions when the storage cap is exceeded. */
+  private enforceSessionCap(): void {
+    while (this.maxSessions > 0 && this.sessions.size >= this.maxSessions) {
+      let oldestId: string | undefined;
+      let oldestTime = Infinity;
+      for (const [id, session] of this.sessions) {
+        const updated = new Date(session.updatedAt).getTime();
+        if (updated < oldestTime) {
+          oldestTime = updated;
+          oldestId = id;
+        }
+      }
+      if (!oldestId) break;
+      this.sessions.delete(oldestId);
+      this.unsavedSessions.delete(oldestId);
+    }
+  }
+
   /**
    * Creates and stores a new BridgeSession.
    */
@@ -286,6 +374,7 @@ export class SessionManager {
     metadata?: Record<string, unknown>;
   }): BridgeSession {
     return this.withFileLock(() => {
+      this.enforceSessionCap();
       const id = this.generateId();
       const now = new Date().toISOString();
       const session: BridgeSession = {
@@ -301,7 +390,10 @@ export class SessionManager {
       };
 
       this.sessions.set(id, session);
-      this.saveToFile();
+      // Deferred first flush: the session becomes durable together with its
+      // first turn (see unsavedSessions). A hard death before that point must
+      // not leave a zero-turn husk in shared storage.
+      this.unsavedSessions.add(id);
       return snapshotSession(session);
     });
   }
@@ -311,7 +403,7 @@ export class SessionManager {
    */
   public getSession(id: string): BridgeSession | undefined {
     if (this.persist) {
-      this.loadFromFile();
+      this.reloadFromDiskPreservingUnsaved();
     }
     const session = this.sessions.get(id);
     return session ? snapshotSession(session) : undefined;
@@ -335,6 +427,7 @@ export class SessionManager {
       };
       this.sessions.set(id, updated);
       this.saveToFile();
+      this.markFlushed(id);
       return snapshotSession(updated);
     });
   }
@@ -347,8 +440,13 @@ export class SessionManager {
       const session = this.sessions.get(id);
       if (session) {
         session.history.push(entry);
+        if (this.maxHistoryTurnsPerSession > 0) {
+          const excess = session.history.length - this.maxHistoryTurnsPerSession;
+          if (excess > 0) session.history.splice(0, excess);
+        }
         session.updatedAt = new Date().toISOString();
         this.saveToFile();
+        this.markFlushed(id);
       }
     });
   }
@@ -358,12 +456,44 @@ export class SessionManager {
    */
   public listSessions(): BridgeSession[] {
     if (this.persist) {
-      this.loadFromFile();
+      this.reloadFromDiskPreservingUnsaved();
     }
 
     return Array.from(this.sessions.values(), snapshotSession).sort(
       (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime(),
     );
+  }
+
+  /**
+   * Persists the exact shared-context block injected into one turn's prompt as
+   * a sidecar artifact next to the sessions storage file. This enables verbatim
+   * handoff audits (what did the downstream agent actually see, including
+   * truncation) without inflating the main JSON store.
+   *
+   * Returns the storage-relative artifact path plus byte/char sizes and digest,
+   * or undefined when persistence is disabled or content is empty.
+   */
+  public persistContextArtifact(
+    sessionId: string,
+    turnNumber: number,
+    content: string,
+  ): { file: string; bytes: number; sha256: string } | undefined {
+    if (!this.persist || !content) return undefined;
+    try {
+      const storageDir = path.dirname(this.storagePath);
+      const dir = path.join(storageDir, "contexts", sessionId);
+      fs.mkdirSync(dir, { recursive: true });
+      const fileName = `${String(turnNumber).padStart(3, "0")}.txt`;
+      fs.writeFileSync(path.join(dir, fileName), content, "utf-8");
+      return {
+        file: path.join("contexts", sessionId, fileName),
+        bytes: Buffer.byteLength(content, "utf-8"),
+        sha256: crypto.createHash("sha256").update(content, "utf-8").digest("hex"),
+      };
+    } catch {
+      // Audit artifacts are best-effort: losing one must not fail the turn.
+      return undefined;
+    }
   }
 
   /**
@@ -374,6 +504,7 @@ export class SessionManager {
       const deleted = this.sessions.delete(id);
       if (deleted) {
         this.saveToFile();
+        this.markFlushed(id);
       }
       return deleted;
     });
@@ -385,6 +516,7 @@ export class SessionManager {
   public clear(): void {
     this.withFileLock(() => {
       this.sessions.clear();
+      this.unsavedSessions.clear();
       this.saveToFile();
     });
   }

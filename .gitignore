@@ -32,6 +32,7 @@ Thumbs.db
 
 # AgentMesh session files
 .agentmesh/
+.zcode
 
 # docs
 docs

@@ -132,6 +132,7 @@ export class OpenCodeAdapter extends BaseAdapter {
         env: options.env,
         timeoutMs: options.timeoutMs,
         signal: options.signal,
+        taskActivity: options.taskActivity,
       });
 
       const parsed = parseOpenCodeJsonLines(res.stdout);

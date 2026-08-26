@@ -212,6 +212,7 @@ export class ClaudeAdapter extends BaseAdapter {
         env: options.env,
         timeoutMs: options.timeoutMs,
         signal: options.signal,
+        taskActivity: options.taskActivity,
       });
 
       const parsed = this.parseJsonOutput(res.stdout);

@@ -204,6 +204,7 @@ export class AntigravityAdapter extends BaseAdapter {
         env: options.env,
         timeoutMs: options.timeoutMs,
         signal: options.signal,
+        taskActivity: options.taskActivity,
       });
 
       const parsed = parseAntigravityJsonOutput(res.stdout);

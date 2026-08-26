@@ -58,6 +58,7 @@ export class ZCodeAdapter extends BaseAdapter {
         env: options.env,
         timeoutMs: options.timeoutMs,
         signal: options.signal,
+        taskActivity: options.taskActivity,
       });
 
       const fullOutput = [res.stdout, res.stderr].filter(Boolean).join("\n").trim();

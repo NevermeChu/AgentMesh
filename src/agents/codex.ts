@@ -419,6 +419,7 @@ export class CodexAdapter extends BaseAdapter {
           env: options.env,
           timeoutMs: options.timeoutMs,
           signal: options.signal,
+          taskActivity: options.taskActivity,
         });
         return await this.settleCliExecution(
           res,

@@ -8,6 +8,11 @@ import {
   BackgroundTaskRegistry,
   isPidAlive,
 } from "../../src/core/background.js";
+import {
+  executeCommand,
+  forgetActivityHandle,
+  getActivityHandle,
+} from "../../src/core/executor.js";
 
 describe("core/background registry", () => {
   let homeDir: string;
@@ -232,5 +237,57 @@ describe("core/background registry", () => {
     expect(isPidAlive(process.pid)).toBe(true);
     // Pids near the theoretical maximum are safe to treat as absent.
     expect(isPidAlive(4_000_000_000)).toBe(false);
+  });
+});
+
+describe("core/executor task activity tee", () => {
+  let homeDir: string;
+
+  beforeEach(() => {
+    homeDir = path.join(
+      os.tmpdir(),
+      `agentmesh_tee_test_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+    );
+  });
+
+  afterEach(() => {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it("tees stdout/stderr to the task output file and tracks activity", async () => {
+    const taskId = "bg_tee_1";
+    const outputFile = path.join(homeDir, "tasks", `${taskId}.output`);
+    const script = [
+      "process.stdout.write('OUT-1\\n');",
+      "setTimeout(() => { process.stderr.write('ERR-1\\n'); }, 80);",
+      "setTimeout(() => { process.stdout.write('OUT-2\\n'); }, 160);",
+    ].join("");
+
+    try {
+      await executeCommand(process.execPath, ["-e", script], {
+        taskActivity: { taskId, outputFile },
+      });
+
+      const teeContent = await fsp.readFile(outputFile, "utf-8");
+      expect(teeContent).toContain("OUT-1\n");
+      expect(teeContent).toContain("ERR-1\n");
+      expect(teeContent).toContain("OUT-2\n");
+
+      const handle = getActivityHandle(taskId);
+      expect(handle).toBeDefined();
+      expect(handle?.getLastOutputAtMs()).toBeGreaterThan(0);
+      expect(handle?.getChildPid()).toBeGreaterThan(0);
+    } finally {
+      forgetActivityHandle(taskId);
+    }
+    expect(getActivityHandle(taskId)).toBeUndefined();
+  });
+
+  it("keeps no activity record when the spawn itself fails", async () => {
+    const taskId = "bg_tee_missing";
+    await expect(
+      executeCommand("definitely-missing-executable-agentmesh", [], {}),
+    ).rejects.toBeInstanceOf(Error);
+    expect(getActivityHandle(taskId)).toBeUndefined();
   });
 });

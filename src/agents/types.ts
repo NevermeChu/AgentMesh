@@ -39,6 +39,12 @@ export interface RunAgentOptions extends AgentModelOptions {
   reviewVerdictRequired?: boolean;
   /** Aborts the underlying agent process; the run resolves as a cancelled failure. */
   signal?: AbortSignal;
+  /**
+   * T1.4 background mode telemetry: CLI transports tee stdout/stderr to this
+   * task output file and refresh its last-output timestamp so poll_task can
+   * observe incremental progress. Absent for foreground dispatches.
+   */
+  taskActivity?: { taskId: string; outputFile: string };
 }
 
 export interface ContinueAgentOptions extends AgentModelOptions {

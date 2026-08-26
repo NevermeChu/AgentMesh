@@ -1,7 +1,50 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import { buildPolicyChildEnvironment } from "./envPolicy.js";
+
+/**
+ * T1.4 background mode: when a dispatch runs with task activity attached,
+ * every stdout/stderr chunk is tee'd (appended) to outputFile and the last
+ * output instant is tracked so the stalled watchdog can observe progress
+ * without touching the in-memory stdout buffers used for the result.
+ */
+export interface TaskActivityContext {
+  taskId: string;
+  /** Absolute path of `<agentmeshHome>/tasks/<taskId>.output`. */
+  outputFile: string;
+}
+
+interface TaskActivityState {
+  lastOutputAtMs: number;
+  childPid?: number;
+  outputFile: string;
+}
+
+const activityByTaskId = new Map<string, TaskActivityState>();
+
+export interface TaskActivityHandle {
+  readonly taskId: string;
+  getLastOutputAtMs(): number | undefined;
+  getChildPid(): number | undefined;
+}
+
+/** Read-only view of one task's output activity; undefined when never spawned. */
+export function getActivityHandle(taskId: string): TaskActivityHandle | undefined {
+  const state = activityByTaskId.get(taskId);
+  if (!state) return undefined;
+  return {
+    taskId,
+    getLastOutputAtMs: () => state.lastOutputAtMs,
+    getChildPid: () => state.childPid,
+  };
+}
+
+/** Drops the activity record once the caller consumed the final output. */
+export function forgetActivityHandle(taskId: string): void {
+  activityByTaskId.delete(taskId);
+}
 
 export interface ExecutionOptions {
   cwd?: string;
@@ -11,6 +54,12 @@ export interface ExecutionOptions {
   shell?: boolean;
   /** Aborts the run: the process tree is terminated and the result resolves with `aborted: true`. */
   signal?: AbortSignal;
+  /**
+   * T1.4 background mode telemetry: appends every stdout/stderr chunk to
+   * outputFile and refreshes the per-task last-output timestamp exposed via
+   * getActivityHandle for the stalled watchdog.
+   */
+  taskActivity?: TaskActivityContext;
 }
 
 export interface ExecutionResult {
@@ -439,6 +488,30 @@ export async function executeCommand(
       );
     }
 
+    // T1.4 output tee: registered only after a successful spawn so a failed
+    // launch never leaves an activity record behind. Chunks are appended
+    // through a per-task promise chain to preserve ordering on disk.
+    const activity = options.taskActivity;
+    if (activity) {
+      activityByTaskId.set(activity.taskId, {
+        lastOutputAtMs: startTime,
+        childPid: childProcess.pid ?? undefined,
+        outputFile: activity.outputFile,
+      });
+      void fsp.mkdir(path.dirname(activity.outputFile), { recursive: true }).catch(() => {});
+    }
+    let teeChain: Promise<void> = Promise.resolve();
+    const teeChunk = (chunk: Buffer): void => {
+      if (!activity) return;
+      const state = activityByTaskId.get(activity.taskId);
+      if (state) state.lastOutputAtMs = Date.now();
+      teeChain = teeChain
+        .then(() => fsp.appendFile(activity.outputFile, chunk))
+        .catch(() => {
+          // The tee is advisory telemetry; in-memory capture stays authoritative.
+        });
+    };
+
     if (childProcess.stdin) {
       // A child that exits before draining stdin raises an async EPIPE error;
       // without a listener it would crash the AgentMesh process.
@@ -480,10 +553,12 @@ export async function executeCommand(
 
     childProcess.stdout?.on("data", (chunk: Buffer) => {
       stdoutChunks.push(chunk);
+      teeChunk(chunk);
     });
 
     childProcess.stderr?.on("data", (chunk: Buffer) => {
       stderrChunks.push(chunk);
+      teeChunk(chunk);
     });
 
     childProcess.on("error", (err: Error) => {
@@ -515,6 +590,10 @@ export async function executeCommand(
         // cleanup outcome; settle only after it has finished so the reported
         // evidence is complete.
         await pendingTermination?.catch(() => undefined);
+        if (isSettled) return;
+        // Background consumers read the tee'd output as soon as the terminal
+        // state becomes observable; flush pending appends first.
+        await teeChain;
         if (isSettled) return;
         isSettled = true;
         clearTimers();

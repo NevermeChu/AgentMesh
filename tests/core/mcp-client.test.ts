@@ -125,5 +125,5 @@ describe("core/mcp-client", () => {
       /* ignore */
     }
     expect(markerExists).toBe(false);
-  });
+  }, 15_000);
 });

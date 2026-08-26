@@ -2,13 +2,22 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { CodexAdapter, type CodexAgentResult } from "../../src/agents/codex.js";
+import { CodexAdapter } from "../../src/agents/codex.js";
 
 const SALVAGE_THREAD_ID = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d";
 
 describe("agents/codex-channel wiring", () => {
   let temporaryDirectory: string;
   let originalCodexBin: string | undefined;
+  const fakeEnvOriginals = new Map<string, string | undefined>();
+
+  /** Fixture variables must ride the parent environment snapshot: the env
+   * override whitelist drops unknown keys by design (T3.3), so test harnesses
+   * inject fixture state the same way a real host would carry it. */
+  function setFakeEnv(name: string, value: string): void {
+    if (!fakeEnvOriginals.has(name)) fakeEnvOriginals.set(name, process.env[name]);
+    process.env[name] = value;
+  }
 
   beforeEach(() => {
     temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-codex-channel-"));
@@ -17,27 +26,30 @@ describe("agents/codex-channel wiring", () => {
 
   afterEach(async () => {
     restoreEnvironment("CODEX_BIN", originalCodexBin);
+    for (const [name, value] of fakeEnvOriginals) restoreEnvironment(name, value);
+    fakeEnvOriginals.clear();
     await fs.promises.rm(temporaryDirectory, { recursive: true, force: true });
   });
 
   it("prefers the official --output-last-message channel over JSONL scraping", async () => {
     const { capturePath } = installFakeCodex();
+    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv("FAKE_LAST_MESSAGE_CONTENT", "OFFICIAL final answer.");
+    setFakeEnv(
+      "FAKE_STDOUT",
+      [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-official-1" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "JSONL fallback answer." },
+        }),
+      ].join("\n"),
+    );
     const result = await new CodexAdapter().run({
       task: "Implement feature",
       cwd: temporaryDirectory,
       role: "worker",
       mode: "cli",
-      env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_LAST_MESSAGE_CONTENT: "OFFICIAL final answer.",
-        FAKE_STDOUT: [
-          JSON.stringify({ type: "thread.started", thread_id: "thread-official-1" }),
-          JSON.stringify({
-            type: "item.completed",
-            item: { type: "agent_message", text: "JSONL fallback answer." },
-          }),
-        ].join("\n"),
-      },
     });
 
     expect(result.status).toBe("success");
@@ -49,18 +61,19 @@ describe("agents/codex-channel wiring", () => {
 
   it("falls back to JSONL parsing with a warning when the official file is empty", async () => {
     const { capturePath } = installFakeCodex();
+    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv(
+      "FAKE_STDOUT",
+      JSON.stringify({
+        type: "item.completed",
+        item: { type: "agent_message", text: "Recovered from JSONL." },
+      }),
+    );
     const result = await new CodexAdapter().run({
       task: "Implement feature",
       cwd: temporaryDirectory,
       role: "worker",
       mode: "cli",
-      env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: JSON.stringify({
-          type: "item.completed",
-          item: { type: "agent_message", text: "Recovered from JSONL." },
-        }),
-      },
     });
 
     expect(result.status).toBe("success");
@@ -71,32 +84,32 @@ describe("agents/codex-channel wiring", () => {
 
   it("records thread-cumulative usage from turn.completed events", async () => {
     installFakeCodex();
+    setFakeEnv("FAKE_LAST_MESSAGE_CONTENT", "Done.");
+    setFakeEnv(
+      "FAKE_STDOUT",
+      [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-usage-9" }),
+        JSON.stringify({
+          type: "turn.completed",
+          usage: {
+            input_tokens: 200,
+            cached_input_tokens: 50,
+            cache_write_input_tokens: 10,
+            output_tokens: 80,
+            reasoning_output_tokens: 25,
+          },
+        }),
+      ].join("\n"),
+    );
     const result = await new CodexAdapter().run({
       task: "Implement feature",
       cwd: temporaryDirectory,
       role: "worker",
       mode: "cli",
-      env: {
-        FAKE_LAST_MESSAGE_CONTENT: "Done.",
-        FAKE_STDOUT: [
-          JSON.stringify({ type: "thread.started", thread_id: "thread-usage-9" }),
-          JSON.stringify({
-            type: "turn.completed",
-            usage: {
-              input_tokens: 200,
-              cached_input_tokens: 50,
-              cache_write_input_tokens: 10,
-              output_tokens: 80,
-              reasoning_output_tokens: 25,
-            },
-          }),
-        ].join("\n"),
-      },
     });
 
     expect(result.status).toBe("success");
-    // `usage` rides the window-scoped CodexAgentResult extension (BRANCH_NOTES.md).
-    expect((result as CodexAgentResult).usage).toEqual({
+    expect(result.usage).toEqual({
       inputTokens: 200,
       cachedInputTokens: 50,
       cacheWriteInputTokens: 10,
@@ -110,6 +123,16 @@ describe("agents/codex-channel wiring", () => {
   it("salvages the completed answer and usage from rollout after abnormal death", async () => {
     installFakeCodex();
     const codexHome = path.join(temporaryDirectory, "codex-home");
+    setFakeEnv("FAKE_ROLLOUT_SESSION_ID", SALVAGE_THREAD_ID);
+    setFakeEnv("FAKE_ROLLOUT_ANSWER", "Salvaged final answer.");
+    setFakeEnv(
+      "FAKE_STDOUT",
+      JSON.stringify({
+        type: "thread.started",
+        thread_id: SALVAGE_THREAD_ID,
+      }),
+    );
+    setFakeEnv("FAKE_EXIT_CODE", "137");
     const result = await new CodexAdapter().run({
       task: "Long running task",
       cwd: temporaryDirectory,
@@ -117,13 +140,6 @@ describe("agents/codex-channel wiring", () => {
       mode: "cli",
       env: {
         CODEX_HOME: codexHome,
-        FAKE_ROLLOUT_SESSION_ID: SALVAGE_THREAD_ID,
-        FAKE_ROLLOUT_ANSWER: "Salvaged final answer.",
-        FAKE_STDOUT: JSON.stringify({
-          type: "thread.started",
-          thread_id: SALVAGE_THREAD_ID,
-        }),
-        FAKE_EXIT_CODE: "137",
       },
     });
 
@@ -131,7 +147,7 @@ describe("agents/codex-channel wiring", () => {
     expect(result.exitCode).toBe(137);
     expect(result.finalAnswer).toBe("Salvaged final answer.");
     // Recovered usage comes from the rollout token_count totals.
-    expect((result as CodexAgentResult).usage).toMatchObject({ inputTokens: 11, totalTokens: 23 });
+    expect(result.usage).toMatchObject({ inputTokens: 11, totalTokens: 23 });
     expect(result.warning).toContain("Crash salvage");
     expect(result.warning).toContain("rollout");
   });
@@ -153,6 +169,15 @@ describe("agents/codex-channel wiring", () => {
 
   it("enforces the reviewer output-schema contract and machine-readable verdicts", async () => {
     const { capturePath } = installFakeCodex();
+    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv(
+      "FAKE_LAST_MESSAGE_CONTENT",
+      JSON.stringify({
+        verdict: "PASS",
+        findings: [],
+      }),
+    );
+    setFakeEnv("FAKE_STDOUT", "review finished");
     const result = await new CodexAdapter().run({
       task: "Review changes",
       cwd: temporaryDirectory,
@@ -160,14 +185,6 @@ describe("agents/codex-channel wiring", () => {
       baseCommit: "main",
       mode: "cli",
       reviewVerdictRequired: true,
-      env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_LAST_MESSAGE_CONTENT: JSON.stringify({
-          verdict: "PASS",
-          findings: [],
-        }),
-        FAKE_STDOUT: "review finished",
-      },
     });
 
     const captured = readCapture(capturePath);
@@ -260,14 +277,12 @@ describe("agents/codex-channel wiring", () => {
   }
 
   async function runReviewerWithVerdict(verdictPayload: unknown) {
+    setFakeEnv("FAKE_LAST_MESSAGE_CONTENT", JSON.stringify(verdictPayload));
     return new CodexAdapter().run({
       task: "Review again",
       cwd: temporaryDirectory,
       role: "reviewer",
       mode: "cli",
-      env: {
-        FAKE_LAST_MESSAGE_CONTENT: JSON.stringify(verdictPayload),
-      },
     });
   }
 });

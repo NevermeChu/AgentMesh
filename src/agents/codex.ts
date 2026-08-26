@@ -11,6 +11,7 @@ import type {
   ReviewFinding,
   SandboxMechanism,
   TransportMode,
+  UsageInfo,
 } from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { executeViaMcpClient } from "../core/mcp-client.js";
@@ -28,32 +29,15 @@ import {
   CodexSecurityViolationError,
 } from "../core/codexSecurity.js";
 
-/** Token usage reported by the codex `turn.completed` event or rollout recovery. */
-export interface CodexUsage {
-  inputTokens?: number;
-  cachedInputTokens?: number;
-  cacheWriteInputTokens?: number;
-  outputTokens?: number;
-  reasoningOutputTokens?: number;
-  totalTokens?: number;
-}
-
-/**
- * Window-scoped extension of {@link AgentResult} until the shared type gains
- * the `usage` field (see BRANCH_NOTES.md for the convergence request). The
- * reported values are THREAD-CUMULATIVE per the vendor contract; single-turn
- * deltas require runner-level aggregation across turns.
- */
-export interface CodexAgentResult extends AgentResult {
-  usage?: CodexUsage;
-}
-
 export interface ParsedCodexOutput {
   output: string;
   sessionId?: string;
   error?: string;
-  /** Usage from the last `turn.completed` event (thread-cumulative). */
-  usage?: CodexUsage;
+  /**
+   * Usage from the last `turn.completed` event (THREAD-CUMULATIVE per the
+   * vendor contract; single-turn deltas require runner-level aggregation).
+   */
+  usage?: UsageInfo;
 }
 
 function findSessionId(value: unknown, depth = 0): string | undefined {
@@ -73,10 +57,10 @@ function pickNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function mapExecUsage(raw: unknown): CodexUsage | undefined {
+function mapExecUsage(raw: unknown): UsageInfo | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const source = raw as Record<string, unknown>;
-  const usage: CodexUsage = {
+  const usage: UsageInfo = {
     inputTokens: pickNumber(source.input_tokens),
     cachedInputTokens: pickNumber(source.cached_input_tokens),
     cacheWriteInputTokens: pickNumber(source.cache_write_input_tokens),
@@ -92,7 +76,7 @@ export function parseCodexJsonLines(output: string): ParsedCodexOutput {
   let sessionId: string | undefined;
   let finalMessage = "";
   let error: string | undefined;
-  let usage: CodexUsage | undefined;
+  let usage: UsageInfo | undefined;
 
   for (const line of output.split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -415,7 +399,7 @@ export class CodexAdapter extends BaseAdapter {
    * event stream remains a fallback. Abnormal deaths trigger rollout-file
    * salvage so SIGKILL-level crashes still recover results.
    */
-  protected override async runViaCli(options: RunAgentOptions): Promise<CodexAgentResult> {
+  protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
     const startTime = Date.now();
     const bin = await this.getExecutablePath();
     const role = options.role ?? "worker";
@@ -465,7 +449,7 @@ export class CodexAdapter extends BaseAdapter {
           ...(salvaged?.answerText ? { finalAnswer: salvaged.answerText } : {}),
           ...(salvaged?.recovery.usage ? { usage: salvaged.recovery.usage } : {}),
           ...(salvaged && !baseOutput.includes(salvaged.note) ? { warning: salvaged.note } : {}),
-        } satisfies CodexAgentResult;
+        } satisfies AgentResult;
       }
       return this.formatErrorResult(err, startTime);
     }
@@ -477,7 +461,7 @@ export class CodexAdapter extends BaseAdapter {
     role: AgentRole,
     lastMessageFile: string,
     startTime: number,
-  ): Promise<CodexAgentResult> {
+  ): Promise<AgentResult> {
     const parsed = this.parseJsonLines(res.stdout);
     // Official extraction channel first ([CX] --output-last-message); JSONL
     // parsing demoted to fallback with a mandatory warning.
@@ -541,7 +525,7 @@ export class CodexAdapter extends BaseAdapter {
       exitCode: res.exitCode,
       finalAnswer: extractedAnswer || undefined,
       role,
-    }) as CodexAgentResult;
+    });
 
     result.usage = parsed.usage;
     const warnings = [semanticError, fallbackWarning].filter(Boolean);
@@ -558,7 +542,7 @@ export class CodexAdapter extends BaseAdapter {
    * from the `--output-schema` contract. Unparseable answers stay on the
    * legacy pipeline (which fails closed under the strict contract).
    */
-  private applyStructuredReviewVerdict(result: CodexAgentResult): void {
+  private applyStructuredReviewVerdict(result: AgentResult): void {
     const structured = parseStructuredReviewVerdict(result.finalAnswer ?? result.output);
     if (!structured) return;
     result.reviewOutcome = structured.outcome;

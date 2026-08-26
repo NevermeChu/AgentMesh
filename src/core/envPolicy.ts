@@ -128,6 +128,9 @@ export const ENV_OVERRIDE_ALLOWED_KEYS: readonly string[] = [
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "XAI_API_KEY",
+  // Agent-governance directory consumed and re-injected by the codex adapter
+  // (dedicated CODEX_HOME per role, see core/codexSecurity.ts withCodexHome)
+  "CODEX_HOME",
 ];
 
 /**

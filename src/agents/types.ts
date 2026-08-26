@@ -76,6 +76,7 @@ export interface TransportFallbackEvidence {
 export interface UsageInfo {
   inputTokens?: number;
   cachedInputTokens?: number;
+  cacheWriteInputTokens?: number;
   outputTokens?: number;
   reasoningOutputTokens?: number;
   totalTokens?: number;

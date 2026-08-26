@@ -18,6 +18,8 @@ import {
   parseAntigravityJsonOutput,
 } from "../../src/agents/antigravity.js";
 import { OpenCodeAdapter, parseOpenCodeJsonLines } from "../../src/agents/opencode.js";
+import { GrokAdapter } from "../../src/agents/grok.js";
+import { ZCodeAdapter } from "../../src/agents/zcode.js";
 
 describe("agents/args construction", () => {
   it("maps model and reasoning settings to Codex CLI without leaking them into MCP", () => {
@@ -309,5 +311,63 @@ describe("agents/args construction", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("MCP mode is not supported by Anthropic Claude Code");
     expect(new ClaudeAdapter().supportedModes).toEqual(["cli"]);
+  });
+});
+
+describe("agents/extraArgs allowlists (P3/T3.3)", () => {
+  it("forwards only allowlisted extraArgs in adapter argv construction", () => {
+    const claudeArgs = new ClaudeAdapter().buildCliArgs({
+      task: "work",
+      role: "worker",
+      extraArgs: ["--model", "claude-sonnet-4", "--yolo"],
+    });
+    expect(claudeArgs).toContain("--model");
+    expect(claudeArgs).toContain("claude-sonnet-4");
+    expect(claudeArgs.join(" ")).not.toContain("yolo");
+
+    const opencodeArgs = new OpenCodeAdapter().buildCliArgs({
+      task: "work",
+      extraArgs: ["--model", "provider/model", "--share"],
+    });
+    expect(opencodeArgs).toContain("provider/model");
+    expect(opencodeArgs).not.toContain("--share");
+
+    const agyArgs = new AntigravityAdapter().buildCliArgs({
+      task: "work",
+      extraArgs: ["--dangerously-bypass-approvals-and-sandbox"],
+    });
+    // Only the adapter's own managed skip-permissions flag may appear.
+    expect(agyArgs.filter((arg) => arg.includes("bypass"))).toEqual([]);
+    expect(agyArgs).toContain("--dangerously-skip-permissions");
+  });
+
+  it.each([
+    ["grok", new GrokAdapter()],
+    ["zcode", new ZCodeAdapter()],
+    ["opencode", new OpenCodeAdapter()],
+    ["antigravity", new AntigravityAdapter()],
+    ["claude", new ClaudeAdapter()],
+  ] as const)(
+    "%s rejects a privilege-escalation extraArg with ARG_REJECTED without spawning",
+    async (_agent, adapter) => {
+      const result = await adapter.run({ task: "work", extraArgs: ["--yolo"] });
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("ARG_REJECTED");
+      expect(result.error).toContain("--yolo");
+      expect(result.summary).toContain("ARG_REJECTED");
+    },
+  );
+
+  it("keeps reviewer extraArgs fully banned regardless of allowlists", async () => {
+    const result = await new GrokAdapter().run({
+      task: "review",
+      role: "reviewer",
+      extraArgs: ["--model", "x"],
+    });
+    // The blanket reviewer ban fires in the base adapter before any allowlist
+    // logic or process work happens.
+    expect(result.status).toBe("failed");
+    expect(result.summary).toContain("not allowed");
+    expect(result.output).toContain("could override safety controls");
   });
 });

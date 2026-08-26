@@ -8,6 +8,7 @@ import type {
 } from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
+import { ARG_REJECTED, describeArgRejections, validateExtraArgs } from "../core/argPolicy.js";
 
 export class GrokAdapter extends BaseAdapter {
   readonly name: AgentName = "grok";
@@ -23,6 +24,20 @@ export class GrokAdapter extends BaseAdapter {
    */
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
     const startTime = Date.now();
+    // P3/T3.3: caller extraArgs must match this adapter's allowlist before any
+    // process work happens; rejections fail closed without spawning.
+    const extraArgsVerdict = validateExtraArgs(this.name, options.extraArgs);
+    if (extraArgsVerdict.rejections.length > 0) {
+      const detail = `${ARG_REJECTED}: ${describeArgRejections(extraArgsVerdict.rejections)}`;
+      return {
+        status: "failed",
+        agent: this.name,
+        output: "",
+        summary: detail,
+        error: detail,
+        durationMs: Date.now() - startTime,
+      };
+    }
     const bin = await this.getExecutablePath();
     const role = options.role ?? "worker";
     const prompt = buildRolePrompt(options.task, role, {
@@ -33,8 +48,8 @@ export class GrokAdapter extends BaseAdapter {
 
     const args: string[] = ["-p", prompt];
 
-    if (options.extraArgs && options.extraArgs.length > 0) {
-      args.push(...options.extraArgs);
+    if (extraArgsVerdict.accepted.length > 0) {
+      args.push(...extraArgsVerdict.accepted);
     }
 
     try {

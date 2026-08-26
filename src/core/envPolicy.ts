@@ -130,8 +130,18 @@ export const ENV_OVERRIDE_ALLOWED_KEYS: readonly string[] = [
   "XAI_API_KEY",
 ];
 
+/**
+ * Override prefixes reserved for AgentMesh-owned plumbing (e.g. the
+ * AGENTMESH_HEARTBEAT_FILE execution-evidence path used by the executor
+ * process-group integ fixture). Remote MCP callers cannot inject environment
+ * variables today (no tool schema exposes one), so these keys only ever carry
+ * values produced by trusted internal code or local test harnesses.
+ */
+export const ENV_OVERRIDE_ALLOWED_PREFIXES: readonly string[] = ["AGENTMESH_"];
+
 const BLACKLIST_SET = new Set(ENV_PERMANENT_BLACKLIST_KEYS.map((key) => key.toUpperCase()));
 const OVERRIDE_SET = new Set(ENV_OVERRIDE_ALLOWED_KEYS.map((key) => key.toUpperCase()));
+const OVERRIDE_PREFIXES = ENV_OVERRIDE_ALLOWED_PREFIXES.map((prefix) => prefix.toUpperCase());
 
 /** True when the key must never reach a vendor child process. */
 export function isPermanentBlacklistedEnvKey(key: string): boolean {
@@ -147,7 +157,8 @@ export function isEnvOverrideAllowed(key: string): boolean {
   if (ENV_PERMANENT_BLACKLIST_PREFIXES.some((prefix) => upper.startsWith(prefix.toUpperCase()))) {
     return false;
   }
-  return OVERRIDE_SET.has(upper);
+  if (OVERRIDE_SET.has(upper)) return true;
+  return OVERRIDE_PREFIXES.some((prefix) => upper.startsWith(prefix));
 }
 
 export interface EnvOverrideFilterResult {

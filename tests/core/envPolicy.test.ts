@@ -76,6 +76,15 @@ describe("core/envPolicy", () => {
     expect(isEnvOverrideAllowed("")).toBe(false);
   });
 
+  it("accepts AgentMesh-owned override prefixes for internal plumbing", () => {
+    expect(isEnvOverrideAllowed("AGENTMESH_HEARTBEAT_FILE")).toBe(true);
+    expect(isEnvOverrideAllowed("agentmesh_task_marker")).toBe(true);
+
+    const result = filterEnvOverrides({ AGENTMESH_HEARTBEAT_FILE: "D:/tmp/hb.txt" });
+    expect(result.accepted.AGENTMESH_HEARTBEAT_FILE).toBe("D:/tmp/hb.txt");
+    expect(result.rejectedKeys).toEqual([]);
+  });
+
   it("splits overrides into accepted and rejected key lists", () => {
     const result = filterEnvOverrides({
       TZ: "Asia/Shanghai",

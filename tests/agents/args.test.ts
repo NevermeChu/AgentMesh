@@ -18,6 +18,8 @@ import {
   parseAntigravityJsonOutput,
 } from "../../src/agents/antigravity.js";
 import { OpenCodeAdapter, parseOpenCodeJsonLines } from "../../src/agents/opencode.js";
+import { GrokAdapter } from "../../src/agents/grok.js";
+import { ZCodeAdapter } from "../../src/agents/zcode.js";
 
 describe("agents/args construction", () => {
   it("maps model and reasoning settings to Codex CLI without leaking them into MCP", () => {
@@ -309,5 +311,116 @@ describe("agents/args construction", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("MCP mode is not supported by Anthropic Claude Code");
     expect(new ClaudeAdapter().supportedModes).toEqual(["cli"]);
+  });
+});
+
+describe("agents/extraArgs allowlists (P3/T3.3)", () => {
+  it("forwards only allowlisted extraArgs in adapter argv construction", () => {
+    const claudeArgs = new ClaudeAdapter().buildCliArgs({
+      task: "work",
+      role: "worker",
+      extraArgs: ["--model", "claude-sonnet-4", "--yolo"],
+    });
+    expect(claudeArgs).toContain("--model");
+    expect(claudeArgs).toContain("claude-sonnet-4");
+    expect(claudeArgs.join(" ")).not.toContain("yolo");
+
+    const opencodeArgs = new OpenCodeAdapter().buildCliArgs({
+      task: "work",
+      extraArgs: ["--model", "provider/model", "--share"],
+    });
+    expect(opencodeArgs).toContain("provider/model");
+    expect(opencodeArgs).not.toContain("--share");
+
+    const agyArgs = new AntigravityAdapter().buildCliArgs({
+      task: "work",
+      extraArgs: ["--dangerously-bypass-approvals-and-sandbox"],
+    });
+    // Only the adapter's own managed skip-permissions flag may appear.
+    expect(agyArgs.filter((arg) => arg.includes("bypass"))).toEqual([]);
+    expect(agyArgs).toContain("--dangerously-skip-permissions");
+  });
+
+  it.each([
+    ["grok", new GrokAdapter()],
+    ["zcode", new ZCodeAdapter()],
+    ["opencode", new OpenCodeAdapter()],
+    ["antigravity", new AntigravityAdapter()],
+    ["claude", new ClaudeAdapter()],
+  ] as const)(
+    "%s rejects a privilege-escalation extraArg with ARG_REJECTED without spawning",
+    async (_agent, adapter) => {
+      const result = await adapter.run({ task: "work", extraArgs: ["--yolo"] });
+      expect(result.status).toBe("failed");
+      expect(result.error).toContain("ARG_REJECTED");
+      expect(result.error).toContain("--yolo");
+      expect(result.summary).toContain("ARG_REJECTED");
+    },
+  );
+
+  it("keeps reviewer extraArgs fully banned regardless of allowlists", async () => {
+    const result = await new GrokAdapter().run({
+      task: "review",
+      role: "reviewer",
+      extraArgs: ["--model", "x"],
+    });
+    // The blanket reviewer ban fires in the base adapter before any allowlist
+    // logic or process work happens.
+    expect(result.status).toBe("failed");
+    expect(result.summary).toContain("not allowed");
+    expect(result.output).toContain("could override safety controls");
+  });
+
+  it("places worker deny-policy injection args after the bypass flag", () => {
+    const adapter = new ClaudeAdapter();
+    const injected = ["--settings", "D:/h/.agentmesh/policy/s/settings.json"];
+    const args = adapter.buildCliArgs({ task: "work", role: "worker" }, injected);
+    const bypassIndex = args.indexOf("--dangerously-skip-permissions");
+    const settingsIndex = args.indexOf("--settings");
+    expect(bypassIndex).toBeGreaterThan(-1);
+    expect(settingsIndex).toBe(bypassIndex + 1);
+    expect(args.slice(settingsIndex, settingsIndex + injected.length)).toEqual(injected);
+
+    // Reviewers never receive injection arguments.
+    const reviewerArgs = adapter.buildCliArgs({ task: "review", role: "reviewer" }, injected);
+    expect(reviewerArgs).not.toContain("--settings");
+  });
+
+  it("writes the generated deny policy and returns disclosure warning for workers", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-claude-policy-"));
+    try {
+      const adapter = new ClaudeAdapter();
+      const { args, warning } = adapter.prepareWorkerPolicy("native-thread-77", home);
+
+      expect(args).toContain("--settings");
+      const settingsPath = args[args.indexOf("--settings") + 1] ?? "";
+      expect(settingsPath.startsWith(path.join(home, ".agentmesh", "policy"))).toBe(true);
+      expect(fs.existsSync(settingsPath)).toBe(true);
+      const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+        permissions: { deny: string[] };
+      };
+      expect(parsed.permissions.deny.length).toBeGreaterThan(0);
+      expect(warning).toContain("deny policy active");
+      expect(warning).toContain("Bash(curl:*)");
+
+      // Reviewer path stays policy-free.
+      expect(new ClaudeAdapter().prepareWorkerPolicy(undefined, home).warning).toContain(
+        "deny policy active",
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades to an explicit no-policy warning when the policy write fails", () => {
+    const blockedRoot = path.join(os.tmpdir(), `agentmesh-claude-blocked-${Date.now()}`);
+    fs.writeFileSync(blockedRoot, "not a directory", "utf8");
+    try {
+      const { args, warning } = new ClaudeAdapter().prepareWorkerPolicy("s1", blockedRoot);
+      expect(args).toEqual([]);
+      expect(warning).toContain("WITHOUT the deny fallback");
+    } finally {
+      fs.rmSync(blockedRoot, { force: true });
+    }
   });
 });

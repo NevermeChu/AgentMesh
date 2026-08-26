@@ -11,6 +11,7 @@ import type {
 } from "./types.js";
 import { executeCommand, findExecutableOnPath, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
+import { ARG_REJECTED, describeArgRejections, validateExtraArgs } from "../core/argPolicy.js";
 
 export interface ParsedAntigravityOutput {
   output: string;
@@ -166,8 +167,10 @@ export class AntigravityAdapter extends BaseAdapter {
     args.push("--dangerously-skip-permissions");
     if (role === "reviewer") args.push("--mode", "plan");
     else if (role === "worker") args.push("--mode", "accept-edits");
+    // P3/T3.3: forward only allowlisted extraArgs; validation failures are
+    // reported by runViaCli before any process is spawned.
     if (options.extraArgs && options.extraArgs.length > 0) {
-      args.push(...options.extraArgs);
+      args.push(...validateExtraArgs(this.name, options.extraArgs).accepted);
     }
     return args;
   }
@@ -177,6 +180,20 @@ export class AntigravityAdapter extends BaseAdapter {
    */
   protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
     const startTime = Date.now();
+    // P3/T3.3: caller extraArgs must match this adapter's allowlist before any
+    // process work happens; rejections fail closed without spawning.
+    const extraArgsVerdict = validateExtraArgs(this.name, options.extraArgs);
+    if (extraArgsVerdict.rejections.length > 0) {
+      const detail = `${ARG_REJECTED}: ${describeArgRejections(extraArgsVerdict.rejections)}`;
+      return {
+        status: "failed",
+        agent: this.name,
+        output: "",
+        summary: detail,
+        error: detail,
+        durationMs: Date.now() - startTime,
+      };
+    }
     const bin = await this.getExecutablePath();
     const role = options.role ?? "worker";
     const args = this.buildCliArgs(options);

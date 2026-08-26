@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import { buildPolicyChildEnvironment } from "./envPolicy.js";
 
 export interface ExecutionOptions {
   cwd?: string;
@@ -251,6 +252,14 @@ const SIGNAL_EXIT_CODES: Record<string, number> = {
 /**
  * Builds the child environment from the parent process plus task-scoped overrides.
  *
+ * Since P3/T3.3 the construction is policy-driven (see core/envPolicy.ts):
+ * permanently blacklisted variables are stripped from the parent snapshot and
+ * caller overrides are accepted only when whitelisted — rejected keys are
+ * reported by `buildPolicyChildEnvironment` so callers can surface an
+ * `envOverrideRejected:[...]` warning. Execution-critical baseline keys such as
+ * PATH are inherited exclusively from the AgentMesh process and can never be
+ * swapped through overrides.
+ *
  * Shell-injected `PWD`/`OLDPWD` describe the launcher's directory, not the
  * spawned working directory; vendor CLIs may trust `PWD` over `process.cwd()`
  * and would then operate on the wrong repository. They are removed on Windows
@@ -260,18 +269,7 @@ export function buildChildEnvironment(
   cwd: string | undefined,
   overrides?: Record<string, string>,
 ): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (typeof value === "string") env[key] = value;
-  }
-  Object.assign(env, overrides ?? {});
-  if (process.platform === "win32") {
-    delete env.PWD;
-    delete env.OLDPWD;
-  } else if (cwd) {
-    env.PWD = cwd;
-  }
-  return env;
+  return buildPolicyChildEnvironment(cwd, overrides, process.env).env;
 }
 
 /**

@@ -10,6 +10,29 @@ import type {
 
 export type ConfigurableRole = AgentRole | "orchestrator";
 
+export type AgentTier = "strong" | "medium" | "weak";
+
+/**
+ * Self-declared protection level for an agent channel. Mirrors the runtime
+ * SandboxMechanism vocabulary so metadata stays comparable with diagnostics.
+ */
+export type AgentSandboxLevel = "native-sandbox" | "tool-filtering" | "prompt-only";
+
+export interface AgentMetadata {
+  tier?: AgentTier;
+  costLevel?: number;
+  speed?: string;
+  strengths?: string[];
+  notGoodAt?: string[];
+  sandboxLevel?: AgentSandboxLevel;
+  notes?: string;
+  /**
+   * Declared upgrade chain. Entries must reference a known agent alias or a
+   * sibling key declared in the same agents map (e.g. codex profile variants).
+   */
+  candidates?: string[];
+}
+
 export interface RoleAssignment {
   agent: string;
   mode?: TransportMode;
@@ -22,6 +45,7 @@ export interface RoleAssignment {
 export interface AgentMeshProjectConfig {
   version: 1;
   roles: Partial<Record<ConfigurableRole, RoleAssignment>>;
+  agents?: Record<string, AgentMetadata>;
 }
 
 export interface LoadedProjectConfig {
@@ -29,6 +53,15 @@ export interface LoadedProjectConfig {
   projectRoot: string;
   config: AgentMeshProjectConfig;
 }
+
+export interface ConfigParseIssue {
+  field: string;
+  message: string;
+}
+
+export type ProjectConfigParseResult =
+  | { success: true; config: AgentMeshProjectConfig }
+  | { success: false; issues: ConfigParseIssue[] };
 
 const NonBlankString = z.string().trim().min(1);
 const AssignmentObjectSchema = z
@@ -48,6 +81,30 @@ const ReviewerRoleAssignmentSchema = z.union([
   }).strict(),
 ]);
 
+const MAX_AGENT_METADATA_ENTRIES = 32;
+const MAX_LISTED_TRAITS = 32;
+const MAX_CANDIDATES = 16;
+
+export const AgentMetadataSchema = z
+  .object({
+    tier: z.enum(["strong", "medium", "weak"]).optional(),
+    costLevel: z.number().int().min(1).max(5).optional(),
+    speed: NonBlankString.max(100).optional(),
+    strengths: z.array(NonBlankString.max(200)).max(MAX_LISTED_TRAITS).optional(),
+    notGoodAt: z.array(NonBlankString.max(200)).max(MAX_LISTED_TRAITS).optional(),
+    sandboxLevel: z.enum(["native-sandbox", "tool-filtering", "prompt-only"]).optional(),
+    notes: NonBlankString.max(2000).optional(),
+    candidates: z.array(NonBlankString.max(200)).max(MAX_CANDIDATES).optional(),
+  })
+  .strict();
+
+const AgentsMetadataSchema = z
+  .record(z.string().trim().min(1), AgentMetadataSchema)
+  .refine(
+    (entries) => Object.keys(entries).length <= MAX_AGENT_METADATA_ENTRIES,
+    `agents section must declare at most ${MAX_AGENT_METADATA_ENTRIES} entries`,
+  );
+
 const ProjectConfigSchema = z
   .object({
     version: z.literal(1),
@@ -59,6 +116,7 @@ const ProjectConfigSchema = z
         tester: RoleAssignmentSchema.optional(),
       })
       .strict(),
+    agents: AgentsMetadataSchema.optional(),
   })
   .strict();
 
@@ -69,6 +127,45 @@ function normalizeAssignment(
     | undefined,
 ): RoleAssignment | undefined {
   return typeof value === "string" ? { agent: value } : value;
+}
+
+/**
+ * Parses raw config text into a validated project config. Field-level issues
+ * are returned individually so callers (e.g. `agentmesh config validate`) can
+ * point at the exact offending path instead of a joined blob.
+ */
+export function parseProjectConfigText(text: string): ProjectConfigParseResult {
+  let parsedJson: unknown;
+  try {
+    // Editors on Windows commonly persist UTF-8 with a BOM; JSON.parse rejects it.
+    parsedJson = JSON.parse(text.replace(/^\uFEFF/, ""));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, issues: [{ field: "config", message: `Invalid JSON: ${message}` }] };
+  }
+
+  const parsed = ProjectConfigSchema.safeParse(parsedJson);
+  if (!parsed.success) {
+    return {
+      success: false,
+      issues: parsed.error.issues.map((issue) => ({
+        field: issue.path.join(".") || "config",
+        message: issue.message,
+      })),
+    };
+  }
+
+  const config: AgentMeshProjectConfig = {
+    version: 1,
+    roles: {
+      orchestrator: normalizeAssignment(parsed.data.roles.orchestrator),
+      worker: normalizeAssignment(parsed.data.roles.worker),
+      reviewer: normalizeAssignment(parsed.data.roles.reviewer),
+      tester: normalizeAssignment(parsed.data.roles.tester),
+    },
+  };
+  if (parsed.data.agents) config.agents = parsed.data.agents;
+  return { success: true, config };
 }
 
 export function findProjectConfigPath(startDirectory: string): string | undefined {
@@ -90,9 +187,9 @@ export function loadProjectConfig(startDirectory: string): LoadedProjectConfig |
   const configPath = findProjectConfigPath(startDirectory);
   if (!configPath) return undefined;
 
-  let parsedJson: unknown;
+  let text: string;
   try {
-    parsedJson = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    text = fs.readFileSync(configPath, "utf-8");
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to read AgentMesh project config '${configPath}': ${message}`, {
@@ -100,26 +197,16 @@ export function loadProjectConfig(startDirectory: string): LoadedProjectConfig |
     });
   }
 
-  const parsed = ProjectConfigSchema.safeParse(parsedJson);
+  const parsed = parseProjectConfigText(text);
   if (!parsed.success) {
-    const details = parsed.error.issues
-      .map((issue) => `${issue.path.join(".") || "config"}: ${issue.message}`)
-      .join("; ");
+    const details = parsed.issues.map((issue) => `${issue.field}: ${issue.message}`).join("; ");
     throw new Error(`Invalid AgentMesh project config '${configPath}': ${details}`);
   }
 
   return {
     path: configPath,
     projectRoot: path.dirname(path.dirname(configPath)),
-    config: {
-      version: 1,
-      roles: {
-        orchestrator: normalizeAssignment(parsed.data.roles.orchestrator),
-        worker: normalizeAssignment(parsed.data.roles.worker),
-        reviewer: normalizeAssignment(parsed.data.roles.reviewer),
-        tester: normalizeAssignment(parsed.data.roles.tester),
-      },
-    },
+    config: parsed.config,
   };
 }
 

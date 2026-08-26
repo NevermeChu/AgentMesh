@@ -11,8 +11,10 @@ import {
   parseMode,
   parseRole,
   parseTimeout,
+  renderConfigValidationReport,
   resolveReviewInput,
   resolveRunInput,
+  validateConfigFile,
 } from "./validation.js";
 
 const program = new Command();
@@ -46,6 +48,10 @@ interface ContinueCommandOptions {
 }
 
 interface DoctorCommandOptions {
+  json?: boolean;
+}
+
+interface ConfigValidateCommandOptions {
   json?: boolean;
 }
 
@@ -233,7 +239,7 @@ capabilitiesProgram.command("show [cwd]").action((cwd: string | undefined) => {
   }
 });
 
-program
+const configProgram = program
   .command("config [cwd]")
   .description("Show and validate the nearest project .agentmesh/config.json")
   .action((cwd: string | undefined) => {
@@ -245,6 +251,31 @@ program
         return;
       }
       console.log(JSON.stringify(loaded, null, 2));
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  });
+
+configProgram
+  .command("validate [cwd]")
+  .description(
+    "Validate the project config: schema, agent alias resolvability, candidates references, tier/sandbox consistency",
+  )
+  .option("--json", "Emit a machine-readable validation report", false)
+  .action((cwd: string | undefined, options: ConfigValidateCommandOptions) => {
+    try {
+      const report = validateConfigFile(cwd || process.cwd(), (nameOrAlias) =>
+        defaultRegistry.resolveName(nameOrAlias),
+      );
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        renderConfigValidationReport(report);
+      }
+      if (report.summary.errors > 0) {
+        process.exitCode = 1;
+      }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;

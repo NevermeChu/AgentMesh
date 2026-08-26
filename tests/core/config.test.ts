@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   findProjectConfigPath,
   loadProjectConfig,
+  parseProjectConfigText,
   resolveRoleAssignment,
 } from "../../src/core/config.js";
 
@@ -77,5 +78,183 @@ describe("core/project config", () => {
     const nestedRepository = path.join(parent.root, "nested-repo");
     fs.mkdirSync(path.join(nestedRepository, ".git"), { recursive: true });
     expect(findProjectConfigPath(nestedRepository)).toBeUndefined();
+  });
+});
+
+describe("core/project config agents metadata", () => {
+  it("parses a full valid agents metadata section with trimmed values", () => {
+    const result = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: { worker: "codex" },
+        agents: {
+          codex: {
+            tier: "strong",
+            costLevel: 5,
+            speed: "slow (~3min per task)",
+            strengths: ["deep refactoring", "architecture review"],
+            notGoodAt: ["quick one-liners"],
+            sandboxLevel: "native-sandbox",
+            notes: "Preferred for high-stakes changes",
+            candidates: ["codex-medium", "zcode"],
+          },
+          zcode: { tier: "weak", costLevel: 1 },
+        },
+      }),
+    );
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.config.agents).toEqual({
+      codex: {
+        tier: "strong",
+        costLevel: 5,
+        speed: "slow (~3min per task)",
+        strengths: ["deep refactoring", "architecture review"],
+        notGoodAt: ["quick one-liners"],
+        sandboxLevel: "native-sandbox",
+        notes: "Preferred for high-stakes changes",
+        candidates: ["codex-medium", "zcode"],
+      },
+      zcode: { tier: "weak", costLevel: 1 },
+    });
+  });
+
+  it("keeps configs without an agents section fully backward compatible", () => {
+    const project = createProject({ version: 1, roles: { worker: "antigravity" } });
+    const loaded = loadProjectConfig(project.nested)!;
+    expect(loaded.config.agents).toBeUndefined();
+    expect(loaded.config.roles.worker).toEqual({ agent: "antigravity" });
+    expect(resolveRoleAssignment(project.root, "worker").assignment?.agent).toBe("antigravity");
+  });
+
+  it("rejects an invalid tier and reports the exact field path", () => {
+    const result = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: {},
+        agents: { codex: { tier: "powerful" } },
+      }),
+    );
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const fields = result.issues.map((issue) => issue.field);
+    expect(fields).toContain("agents.codex.tier");
+  });
+
+  it.each([0, 6, 2.5, "3"])("rejects costLevel %p outside integer range 1-5", (costLevel) => {
+    const result = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: {},
+        agents: { codex: { costLevel } },
+      }),
+    );
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    const target = result.issues.find((issue) => issue.field.startsWith("agents.codex.costLevel"));
+    expect(target).toBeDefined();
+  });
+
+  it("rejects unknown metadata keys so typos fail fast", () => {
+    const project = createProject({
+      version: 1,
+      roles: {},
+      agents: { codex: { tuer: "typo of tier" } },
+    });
+    expect(() => loadProjectConfig(project.root)).toThrow(/Unrecognized key/);
+  });
+
+  it("rejects blank agent keys in the agents map", () => {
+    const result = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { "": { tier: "weak" } } }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("rejects non-array strengths and oversized candidate chains", () => {
+    const badStrengths = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { codex: { strengths: "review" } } }),
+    );
+    expect(badStrengths.success).toBe(false);
+
+    const tooManyCandidates = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: {},
+        agents: { codex: { candidates: Array.from({ length: 17 }, (_, i) => `a${i}`) } },
+      }),
+    );
+    expect(tooManyCandidates.success).toBe(false);
+    if (tooManyCandidates.success) return;
+    expect(tooManyCandidates.issues.map((issue) => issue.field)).toContain(
+      "agents.codex.candidates",
+    );
+  });
+
+  it("reports invalid JSON as a single config-level issue", () => {
+    const result = parseProjectConfigText("{ not json");
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.issues).toHaveLength(1);
+    const [jsonIssue] = result.issues;
+    expect(jsonIssue?.field).toBe("config");
+    expect(jsonIssue?.message).toContain("Invalid JSON");
+  });
+
+  it("accepts UTF-8 BOM prefixed config text written by Windows editors", () => {
+    const result = parseProjectConfigText(
+      `\uFEFF${JSON.stringify({ version: 1, roles: { worker: "codex" } })}`,
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.config.roles.worker).toEqual({ agent: "codex" });
+  });
+
+  it("accepts a minimal agents entry where every field is optional", () => {
+    const result = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: {},
+        agents: { claude: { notes: "Reviewer of record" } },
+      }),
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.config.agents).toEqual({ claude: { notes: "Reviewer of record" } });
+  });
+
+  it("enforces documented size bounds on free-text and list fields", () => {
+    const oversizedSpeed = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { codex: { speed: "x".repeat(101) } } }),
+    );
+    expect(oversizedSpeed.success).toBe(false);
+
+    const oversizedNotes = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { codex: { notes: "x".repeat(2001) } } }),
+    );
+    expect(oversizedNotes.success).toBe(false);
+    if (oversizedNotes.success) return;
+    expect(oversizedNotes.issues.map((issue) => issue.field)).toContain("agents.codex.notes");
+  });
+
+  it("rejects more than 32 agent entries", () => {
+    const entries: Record<string, unknown> = {};
+    for (let i = 0; i < 33; i++) entries[`agent-${i}`] = { tier: "weak" };
+    const result = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: entries }),
+    );
+    expect(result.success).toBe(false);
+  });
+
+  it("still fails loadProjectConfig with the aggregated legacy error format", () => {
+    const project = createProject({
+      version: 1,
+      roles: {},
+      agents: { codex: { costLevel: 9 } },
+    });
+    expect(() => loadProjectConfig(project.root)).toThrow(
+      /Invalid AgentMesh project config .*agents\.codex\.costLevel/,
+    );
   });
 });

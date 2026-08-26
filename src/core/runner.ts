@@ -73,6 +73,12 @@ export interface DelegateTaskParams {
   idempotencyKey?: string;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
+  /**
+   * T1.4 background telemetry: tees CLI stdout/stderr to the given task output
+   * file and feeds last-output timestamps to the stalled watchdog. Set only by
+   * the background delegate path (mcp/tools.ts).
+   */
+  taskActivity?: { taskId: string; outputFile: string };
 }
 
 export interface ReviewChangesParams {
@@ -964,6 +970,7 @@ export class MultiAgentRunner {
       historyContext: sharedContext?.text,
       reviewVerdictRequired: params.reviewVerdictRequired,
       signal: inFlight.signal,
+      taskActivity: params.taskActivity,
     };
 
     try {

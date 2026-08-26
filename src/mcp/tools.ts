@@ -1,9 +1,12 @@
+import * as crypto from "node:crypto";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
+import { BackgroundTaskNotFoundError, BackgroundTaskRegistry } from "../core/background.js";
+import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
 import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
@@ -63,6 +66,86 @@ async function sendProgress(
     });
   } catch {
     // Progress is advisory and must not change the task outcome.
+  }
+}
+
+/** Combines the MCP request signal with a background dispatch controller. */
+function mergeAbortSignals(external: AbortSignal | undefined, internal: AbortSignal): AbortSignal {
+  const anyImpl = (AbortSignal as unknown as { any?: (signals: AbortSignal[]) => AbortSignal }).any;
+  if (external && anyImpl) return anyImpl([external, internal]);
+  return internal;
+}
+
+export interface BackgroundLaunchParams {
+  taskId: string;
+  outputFile: string;
+  run: (signal: AbortSignal) => Promise<AgentResult>;
+}
+
+/**
+ * Owns in-process background dispatches (T1.4). Each launch registers its
+ * promise for graceful shutdown and writes the terminal outcome into the
+ * task registry so poll_task can report completed/failed states — including
+ * after the MCP response that started the work has long returned.
+ */
+export class BackgroundDispatchService {
+  readonly registry: BackgroundTaskRegistry;
+  private readonly pending = new Map<
+    string,
+    { promise: Promise<void>; controller: AbortController }
+  >();
+
+  constructor(registry: BackgroundTaskRegistry = new BackgroundTaskRegistry()) {
+    this.registry = registry;
+    this.registry.enableStalledWatchdog({
+      getActivityHandle: (taskId) => getActivityHandle(taskId),
+    });
+  }
+
+  /** Number of background dispatches still running in this process. */
+  public get activeCount(): number {
+    return this.pending.size;
+  }
+
+  public launch(params: BackgroundLaunchParams): void {
+    const controller = new AbortController();
+    const promise = (async () => {
+      try {
+        const result = await params.run(controller.signal);
+        await this.registry.writeStoredResult({
+          taskId: params.taskId,
+          status: result.status === "success" ? "completed" : "failed",
+          summary: result.summary,
+          finalAnswer: result.finalAnswer,
+          error: result.error,
+          exitCode: result.exitCode,
+          completedAtMs: Date.now(),
+        });
+      } catch (err) {
+        await this.registry.writeStoredResult({
+          taskId: params.taskId,
+          status: "failed",
+          error: err instanceof Error ? err.message : String(err),
+          completedAtMs: Date.now(),
+        });
+      } finally {
+        forgetActivityHandle(params.taskId);
+        this.registry.releaseTask(params.taskId);
+        this.pending.delete(params.taskId);
+      }
+    })();
+    this.pending.set(params.taskId, { promise, controller });
+  }
+
+  /**
+   * Shutdown path: aborts every running dispatch through their controllers
+   * (reusing the runner's tree-termination path) and waits for each to record
+   * its terminal state.
+   */
+  public async abortAll(reason: string): Promise<void> {
+    const entries = [...this.pending.values()];
+    for (const entry of entries) entry.controller.abort(new Error(reason));
+    await Promise.allSettled(entries.map((entry) => entry.promise));
   }
 }
 
@@ -150,6 +233,28 @@ export const DelegateTaskInputSchema = z.object({
         "flight, callers receive an in-flight reference instead of a second execution; after it reaches " +
         "a terminal state, retries within a 20-minute window replay the recorded result (replayed:true) " +
         "with a STALE warning when the repository changed since. Use a distinct key per logical task",
+    ),
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      "Run asynchronously: returns immediately with taskId and outputFile; use poll_task to observe " +
+        "progress and collect the terminal result",
+    ),
+});
+
+export const PollTaskInputSchema = z.object({
+  taskId: NonBlankString.describe(
+    "Background task ID previously returned by delegate_task(background:true)",
+  ),
+  sinceOffset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe(
+      "Byte offset into the task output file; only new bytes past this offset are returned. " +
+        "Pass nextOffset from the previous poll_task response",
     ),
 });
 
@@ -241,7 +346,12 @@ export const GetRoleConfigInputSchema = z.object({
   ),
 });
 
-export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
+export function registerMcpTools(
+  server: McpServer,
+  runner: MultiAgentRunner,
+  options: { background?: BackgroundDispatchService } = {},
+) {
+  const background = options.background ?? new BackgroundDispatchService();
   // delegate_task
   server.tool(
     "delegate_task",
@@ -249,6 +359,54 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
     DelegateTaskInputSchema.shape,
     async (args: z.infer<typeof DelegateTaskInputSchema>, extra) => {
       try {
+        if (args.background) {
+          const taskId = `bgtask_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+          const outputFile = background.registry.outputFilePath(taskId);
+          background.registry.registerTask({
+            taskId,
+            pid: process.pid,
+            startedAtMs: Date.now(),
+            outputFile,
+          });
+          background.launch({
+            taskId,
+            outputFile,
+            run: (signal) =>
+              runner.delegateTask({
+                agent: args.agent,
+                task: args.task,
+                cwd: args.cwd,
+                role: args.role,
+                mode: args.mode,
+                timeoutMs: args.timeoutMs,
+                model: args.model,
+                reasoningEffort: args.reasoningEffort,
+                sessionId: args.sessionId,
+                contextSessionId: args.contextSessionId,
+                contextSessionIds: args.contextSessionIds,
+                baseCommit: args.baseCommit,
+                idempotencyKey: args.idempotencyKey,
+                signal: mergeAbortSignals(extra.signal, signal),
+                taskActivity: { taskId, outputFile },
+              }),
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: [
+                  "[Background Task Accepted]",
+                  `Task ID: ${taskId}`,
+                  `Output File: ${outputFile}`,
+                  "Status: RUNNING",
+                  "",
+                  "The task is executing asynchronously; use poll_task to observe.",
+                  `Call poll_task with taskId="${taskId}" to read incremental output and the terminal result.`,
+                ].join("\n"),
+              },
+            ],
+          };
+        }
         const result = await runWithProgress(extra, "Agent task", () =>
           runner.delegateTask({
             agent: args.agent,
@@ -294,6 +452,55 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             {
               type: "text",
               text: `Bridge Error in delegate_task: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // poll_task
+  server.tool(
+    "poll_task",
+    "Observes a background delegate_task: reports status (running/completed/failed/stalled), the incremental output since a byte offset, and the terminal result once available",
+    PollTaskInputSchema.shape,
+    async (args: z.infer<typeof PollTaskInputSchema>) => {
+      try {
+        const outcome = await background.registry.pollTask({
+          taskId: args.taskId,
+          sinceOffset: args.sinceOffset,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(outcome, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        if (err instanceof BackgroundTaskNotFoundError) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  { error: "NOT_FOUND", taskId: err.taskId, message: err.message },
+                  null,
+                  2,
+                ),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in poll_task: ${errorMsg}`,
             },
           ],
           isError: true,

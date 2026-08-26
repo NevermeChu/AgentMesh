@@ -137,7 +137,8 @@ function normalizeAssignment(
 export function parseProjectConfigText(text: string): ProjectConfigParseResult {
   let parsedJson: unknown;
   try {
-    parsedJson = JSON.parse(text);
+    // Editors on Windows commonly persist UTF-8 with a BOM; JSON.parse rejects it.
+    parsedJson = JSON.parse(text.replace(/^\uFEFF/, ""));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { success: false, issues: [{ field: "config", message: `Invalid JSON: ${message}` }] };

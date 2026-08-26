@@ -49,6 +49,31 @@ class MockAdapter extends BaseAdapter {
   }
 }
 
+const COMPACT_SUMMARY_FIXTURE =
+  "<analysis>\nprivate scratch that must not reach the sidecar\n</analysis>\n" +
+  "<summary>\n1. Original Intent: mocked intent\n7. Current State and Key Data: STATE_SENTINEL\n" +
+  "完整原文存于 Bridge session 'src' ，需要细节请按需读取。\n</summary>";
+
+/** Serves a fixed eight-section summary whenever it receives a summary task. */
+class SummarizerAdapter extends MockAdapter {
+  protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+    if (options.task.includes("TRIGGER_ERROR")) {
+      throw new Error("Simulated agent error");
+    }
+    this.lastRunOptions = options;
+    if (!options.task.includes("<summary>")) return super.runViaCli(options);
+    return {
+      status: "success",
+      agent: this.name,
+      summary: "Produced handoff summary",
+      output: "summary written",
+      finalAnswer: COMPACT_SUMMARY_FIXTURE,
+      exitCode: 0,
+      durationMs: 5,
+    };
+  }
+}
+
 describe("core/runner", () => {
   let runner: MultiAgentRunner;
   let registry: AgentRegistry;
@@ -1081,5 +1106,176 @@ describe("core/runner", () => {
     expect(hint).toContain("--test-isolation=none");
     expect(sandboxSpawnHint("codex", "cli", { output: "spawn EPERM" })).toBeUndefined();
     expect(sandboxSpawnHint("codex", "mcp", { output: "all good" })).toBeUndefined();
+  });
+
+  it("compacts a source session into a fresh sidecar and injects summary plus pointer downstream (T2.3)", async () => {
+    const summarizer = new SummarizerAdapter();
+    registry.register(summarizer);
+    const source = await runner.delegateTask({ agent: "codex", task: "Build the feature" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "Original detailed work",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "did things",
+      finalAnswer: "FULL_TEXT_SENTINEL only visible without a fresh summary",
+    });
+    const sessionsBefore = runner.listSessions().length;
+
+    const { outcomes } = await runner.compactContext({
+      sourceSessionIds: [source.sessionId!],
+    });
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.status).toBe("summarized");
+    expect(outcomes[0]?.truncated).toBe(false);
+    expect(outcomes[0]?.summarizedTurns).toBe(2);
+
+    // The sidecar lives on the SOURCE session; analysis draft was stripped.
+    const stored = sessionManager.getSummary(source.sessionId!);
+    expect(stored?.text).toContain("mocked intent");
+    expect(stored?.text).not.toContain("private scratch");
+    expect(stored?.text).toContain("需要细节请按需读取");
+
+    // The throwaway summarization session left no residue.
+    expect(runner.listSessions()).toHaveLength(sessionsBefore);
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume compacted source",
+      contextSessionIds: [source.sessionId!],
+    });
+    const context = summarizer.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain(
+      "[Semantic summary via compact_context covering all 2 recorded turn(s)]",
+    );
+    expect(context).toContain("STATE_SENTINEL");
+    expect(context).toContain("use get_session to read specifics on demand");
+    expect(context).not.toContain("FULL_TEXT_SENTINEL");
+  });
+
+  it("falls back to full transcript injection when the source gains turns after compaction (T2.3 STALE)", async () => {
+    const summarizer = new SummarizerAdapter();
+    registry.register(summarizer);
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed work" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "Original detailed work",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "did things",
+      finalAnswer: "FULL_TEXT_SENTINEL",
+    });
+    const first = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    expect(first.outcomes[0]?.status).toBe("summarized");
+
+    // A new turn invalidates the snapshot: rendering returns to full history.
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "NEW_TURN_AFTER_COMPACT",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "progressed",
+    });
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume grown source",
+      contextSessionIds: [source.sessionId!],
+    });
+    const context = summarizer.lastRunOptions?.historyContext ?? "";
+    expect(context).not.toContain("[Semantic summary via compact_context");
+    expect(context).toContain("NEW_TURN_AFTER_COMPACT");
+    expect(context).toContain("FULL_TEXT_SENTINEL");
+  });
+
+  it("marks and truncates oversized summaries at the token budget (T2.3)", async () => {
+    class GiantSummarizer extends MockAdapter {
+      override readonly name: AgentName = "claude";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "success",
+          agent: this.name,
+          summary: "giant summary",
+          output: "giant",
+          finalAnswer: `<analysis>x</analysis><summary>${"G".repeat(9_000)}</summary>`,
+          exitCode: 0,
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new GiantSummarizer());
+    const source = sessionManager.createSession({
+      agent: "claude",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(source.id, {
+      role: "worker",
+      task: "seed",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "seeded",
+    });
+
+    const { outcomes } = await runner.compactContext({ sourceSessionIds: [source.id] });
+
+    expect(outcomes[0]?.status).toBe("summarized");
+    expect(outcomes[0]?.truncated).toBe(true);
+    const stored = sessionManager.getSummary(source.id);
+    expect(stored?.text.length).toBeLessThanOrEqual(8_000);
+    expect(stored?.text).toContain("[summary truncated]");
+    expect(stored?.text).not.toContain("<analysis>");
+  });
+
+  it("deduplicates concurrent compactions of the same source session with an in-flight notice (T2.3)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class BlockingSummarizer extends SummarizerAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        if (options.task.includes("<summary>")) {
+          await gate;
+        }
+        return super.runViaCli(options);
+      }
+    }
+    registry.register(new BlockingSummarizer());
+
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed for concurrency" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "extra turn",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "ok",
+    });
+
+    const first = runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    const second = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    expect(second.outcomes[0]?.status).toBe("in-flight");
+    expect(second.outcomes[0]?.reason).toContain("already running");
+
+    release();
+    const firstOutcome = (await first).outcomes[0];
+    expect(firstOutcome?.status).toBe("summarized");
+    expect(sessionManager.getSummary(source.sessionId!)).toBeDefined();
+  });
+
+  it("records failed compaction without writing a sidecar or leaving scratch sessions", async () => {
+    registry.register(new SummarizerAdapter());
+    // The failing marker rides inside the source turn, so the summarization
+    // prompt carries it into the mock adapter's rejection branch.
+    const source = await runner.delegateTask({ agent: "codex", task: "TRIGGER_ERROR seed" });
+    expect(source.status).toBe("failed");
+
+    const { outcomes } = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+
+    expect(outcomes[0]?.status).toBe("failed");
+    expect(outcomes[0]?.reason).toContain("Simulated agent error");
+    expect(sessionManager.getSummary(source.sessionId!)).toBeUndefined();
+    expect(runner.listSessions()).toHaveLength(1);
   });
 });

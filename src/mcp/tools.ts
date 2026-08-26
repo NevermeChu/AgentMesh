@@ -241,6 +241,16 @@ export const GetRoleConfigInputSchema = z.object({
   ),
 });
 
+export const CompactContextInputSchema = z.object({
+  sourceSessionIds: z
+    .array(NonBlankString)
+    .min(1)
+    .max(4)
+    .describe(
+      "Up to 4 Bridge sessions whose normalized history should be condensed into a semantic summary sidecar",
+    ),
+});
+
 export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
   // delegate_task
   server.tool(
@@ -465,6 +475,45 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
               text: `Error listing agents: ${errorMsg}`,
             },
           ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // compact_context
+  server.tool(
+    "compact_context",
+    "Condenses each listed Bridge session's normalized history into a semantic summary sidecar using that session's own agent in one tool-free turn (≤2000 tokens). Downstream shared-context injection prefers a fresh summary plus a full-transcript pointer; any new turn on the source session invalidates the summary and falls back to the full transcript. Concurrent compactions of the same session are deduplicated with an in-flight notice.",
+    CompactContextInputSchema.shape,
+    async (args: z.infer<typeof CompactContextInputSchema>) => {
+      try {
+        const { outcomes } = await runner.compactContext({
+          sourceSessionIds: args.sourceSessionIds,
+        });
+        const sections = outcomes.map((outcome) => {
+          const header = `[Session: ${outcome.sourceSessionId} | Status: ${outcome.status.toUpperCase()}]`;
+          switch (outcome.status) {
+            case "summarized":
+              return [
+                `${header} Turns covered: ${outcome.summarizedTurns}${outcome.truncated ? " | Summary truncated" : ""}`,
+                outcome.summary ?? "",
+              ].join("\n");
+            case "in-flight":
+            case "skipped":
+            case "failed":
+              return `${header} ${outcome.reason ?? ""}`.trim();
+          }
+        });
+        const isError = outcomes.every((outcome) => outcome.status === "failed");
+        return {
+          content: [{ type: "text", text: sections.join("\n\n") }],
+          isError,
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Bridge Error in compact_context: ${errorMsg}` }],
           isError: true,
         };
       }

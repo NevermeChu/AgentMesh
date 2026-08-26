@@ -13,10 +13,12 @@ import type {
 import { defaultRegistry } from "../agents/registry.js";
 import type { AgentRegistry } from "../agents/registry.js";
 import { evaluateModelOptionSupport } from "./capabilities.js";
-import { defaultSessionManager, SessionManager } from "./session.js";
+import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
+import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
 import { classifyErrorCode } from "./resilience.js";
+import { buildSummaryPrompt, stripAnalysisDraft } from "./prompts.js";
 import { truncateText } from "./text.js";
 import type {
   BridgeSession,
@@ -32,6 +34,19 @@ import { idempotencyScopeKey } from "./types.js";
 
 /** Upper bound for one delegated agent process when no timeout is configured anywhere. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+
+/**
+ * Hard cap for one stored compact summary, ~2000 tokens at the conventional
+ * 4-chars-per-token estimate (T2.3). Oversized model output is truncated with
+ * an explicit marker instead of being stored unbounded.
+ */
+export const COMPACT_SUMMARY_MAX_CHARS = 8_000;
+
+/** Error codes eligible for the T4.4 upgrade-candidate hint. */
+export const UPGRADEABLE_ERROR_CODES: readonly ErrorCode[] = [
+  "MODEL_REJECTED",
+  "SANDBOX_UNAVAILABLE",
+];
 
 /** Terminal-result tombstone TTL for idempotency keys (P1 T1.1). */
 export const DEFAULT_IDEMPOTENCY_TTL_MS = 20 * 60 * 1000;
@@ -207,6 +222,16 @@ interface SourceRenderStats {
   truncated: boolean;
 }
 
+/**
+ * T2.3 freshness gate: a stored summary stays injectable only while the source
+ * session has not grown past the turn count captured at compaction time.
+ */
+function readFreshSessionSummary(session: BridgeSession): SessionSummary | undefined {
+  const summary = readSessionSummary(session);
+  if (!summary) return undefined;
+  return session.history.length <= summary.summarizedTurns ? summary : undefined;
+}
+
 interface SharedContextRender {
   text: string;
   sources: SourceRenderStats[];
@@ -223,6 +248,19 @@ function renderSourceBlock(
     `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`,
     `Context freshness: ${formatFreshness(session, current)}`,
   ].join("\n");
+
+  // T2.3: a fresh compact summary replaces the verbatim transcript; any turn
+  // appended after compaction invalidates it and falls back to full injection.
+  const summary = readFreshSessionSummary(session);
+  if (summary) {
+    const text = [
+      header,
+      `[Semantic summary via compact_context covering all ${summary.summarizedTurns} recorded turn(s)]`,
+      summary.text,
+      `[Full transcript: Bridge session '${session.id}' with ${session.history.length} turn(s) — use get_session to read specifics on demand.]`,
+    ].join("\n\n");
+    return { text, truncated: false };
+  }
 
   let turns = session.history.slice(-MAX_SHARED_TURNS);
   let omittedTurns = session.history.length - turns.length;
@@ -511,6 +549,23 @@ function applyReviewerSafety(result: AgentResult, report: ReviewerSafetyReport):
   ];
 }
 
+export interface CompactContextSourceOutcome {
+  sourceSessionId: string;
+  /** summarized = sidecar written; in-flight = deduplicated; skipped/failed carry reason. */
+  status: "summarized" | "in-flight" | "skipped" | "failed";
+  reason?: string;
+  summary?: string;
+  summarizedTurns?: number;
+  truncated?: boolean;
+  durationMs?: number;
+}
+
+export interface CompactContextResult {
+  outcomes: CompactContextSourceOutcome[];
+}
+
+const COMPACT_CONTEXT_MAX_SOURCES = 4;
+
 export class MultiAgentRunner {
   private registry: AgentRegistry;
   private sessionManager: SessionManager;
@@ -518,6 +573,8 @@ export class MultiAgentRunner {
   private readonly now: () => number;
   private readonly idempotencyTtlMs: number;
   private readonly idempotencyInFlight = new Map<string, IdempotencyInFlightEntry>();
+  /** Per-source compaction promises enabling the T2.3 in-flight dedupe. */
+  private readonly compactInFlight = new Map<string, Promise<CompactContextSourceOutcome>>();
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
@@ -1316,6 +1373,147 @@ export class MultiAgentRunner {
     } finally {
       inFlight.finish();
     }
+  }
+
+  /**
+   * T2.3 compact_context: condenses each source session's normalized history
+   * into a semantic summary sidecar using the session's own agent in a single
+   * tool-free worker turn. Summaries are injected by shared-context rendering
+   * only while fresh (no new turns since compaction). Concurrent compactions
+   * of the same session are deduplicated: later callers receive an in-flight
+   * notice instead of a second agent run.
+   */
+  public async compactContext(params: {
+    sourceSessionIds: string[];
+  }): Promise<CompactContextResult> {
+    if (params.sourceSessionIds.length > COMPACT_CONTEXT_MAX_SOURCES) {
+      throw new Error(
+        `At most ${COMPACT_CONTEXT_MAX_SOURCES} source sessions are supported per compact_context call, but ${params.sourceSessionIds.length} were requested.`,
+      );
+    }
+    const outcomes = await Promise.all(
+      params.sourceSessionIds.map((id) => this.compactOneSource(id)),
+    );
+    return { outcomes };
+  }
+
+  /** Synchronous dedupe gate: check-and-register without awaits in between. */
+  private compactOneSource(sourceSessionId: string): Promise<CompactContextSourceOutcome> {
+    const existing = this.compactInFlight.get(sourceSessionId);
+    if (existing) {
+      return Promise.resolve({
+        sourceSessionId,
+        status: "in-flight",
+        reason:
+          "A compaction for this session is already running; wait for it to complete instead of dispatching another.",
+      });
+    }
+    const task = this.runCompaction(sourceSessionId).finally(() => {
+      this.compactInFlight.delete(sourceSessionId);
+    });
+    this.compactInFlight.set(sourceSessionId, task);
+    return task;
+  }
+
+  private async runCompaction(sourceSessionId: string): Promise<CompactContextSourceOutcome> {
+    const startTime = Date.now();
+    const session = this.sessionManager.getSession(sourceSessionId);
+    if (!session) {
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: `Session '${sourceSessionId}' not found.`,
+      };
+    }
+    if (session.history.length === 0) {
+      return {
+        sourceSessionId,
+        status: "skipped",
+        reason: "The session has no recorded turns to summarize.",
+      };
+    }
+    if (!this.registry.getAdapter(session.agent)) {
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: `No adapter is available for the session's agent '${session.agent}'.`,
+      };
+    }
+
+    const turnCountAtCompaction = session.history.length;
+    const normalizedHistory = buildSharedContextDetailed([session])?.text ?? "";
+    // Tool-free summarization contract; the pointer names where details live.
+    const prompt = buildSummaryPrompt(normalizedHistory, `Bridge session '${session.id}'`);
+
+    const result = await this.delegateTask({
+      agent: session.agent,
+      cwd: session.cwd,
+      role: "worker",
+      task: prompt,
+    });
+    // The summarization turn runs on a throwaway bridge session bound to the
+    // same agent/cwd. Delete it so compaction leaves exactly one durable
+    // trace: the summary sidecar on the source session itself.
+    const scratchSessionId =
+      result.sessionId && result.sessionId !== sourceSessionId ? result.sessionId : undefined;
+
+    const cleanupScratch = () => {
+      if (scratchSessionId) this.sessionManager.deleteSession(scratchSessionId);
+    };
+
+    if (result.status !== "success") {
+      cleanupScratch();
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: result.error || result.summary || "The summarization turn failed.",
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    let text = stripAnalysisDraft(result.finalAnswer || result.output || "");
+    let truncated = false;
+    if (!text.trim()) {
+      cleanupScratch();
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: "The summarization turn produced no usable summary text.",
+        durationMs: Date.now() - startTime,
+      };
+    }
+    const pointerLine = `完整原文存于 Bridge session '${session.id}' ，需要细节请按需读取。`;
+    const pointerTail = `\n${pointerLine}`;
+    if (!text.includes("需要细节请按需读取")) {
+      text += pointerTail;
+    }
+    if (text.length > COMPACT_SUMMARY_MAX_CHARS) {
+      // Truncate with an explicit marker, keeping room so the provenance
+      // pointer survives even a maximally oversized model answer.
+      text =
+        truncateText(
+          text,
+          COMPACT_SUMMARY_MAX_CHARS - pointerTail.length,
+          "\n... [summary truncated]",
+        ) + pointerTail;
+      truncated = true;
+    }
+
+    const stored = this.sessionManager.setSummary(session.id, {
+      text,
+      summarizedTurns: turnCountAtCompaction,
+      createdAt: new Date().toISOString(),
+    });
+    cleanupScratch();
+    return {
+      sourceSessionId,
+      status: stored ? "summarized" : "failed",
+      ...(stored ? {} : { reason: "The source session disappeared during compaction." }),
+      ...(stored ? { summary: text } : {}),
+      summarizedTurns: turnCountAtCompaction,
+      truncated,
+      durationMs: Date.now() - startTime,
+    };
   }
 
   /**

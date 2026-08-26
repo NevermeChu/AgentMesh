@@ -130,6 +130,34 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("list_agents");
     expect(toolNames).toContain("get_session");
     expect(toolNames).toContain("get_role_config");
+    expect(toolNames).toContain("compact_context");
+  });
+
+  it("compacts a source session over MCP and reports the summarized outcome (T2.3)", async () => {
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed compaction source" });
+
+    const res = await client.callTool({
+      name: "compact_context",
+      arguments: { sourceSessionIds: [source.sessionId!] },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("| Status: SUMMARIZED] Turns covered: 1");
+    // The echoed answer unwraps to the template's eight-section deliverable.
+    expect(content[0]?.text).toContain("Original Intent");
+    expect(runner.getSession(source.sessionId!)?.history).toHaveLength(1);
+  });
+
+  it("reports a failed compaction for an unknown session as an MCP error", async () => {
+    const res = await client.callTool({
+      name: "compact_context",
+      arguments: { sourceSessionIds: ["bridge-sess_missing"] },
+    });
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("| Status: FAILED]");
+    expect(content[0]?.text).toContain("not found");
   });
 
   it("delegates a worker task through MCP", async () => {

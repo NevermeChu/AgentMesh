@@ -135,6 +135,48 @@ export const DEFAULT_MAX_HISTORY_TURNS_PER_SESSION = 50;
 export const DEFAULT_MAX_SESSIONS = 200;
 
 /**
+ * T2.3 summary sidecar stored inside a session's metadata bag (the persisted
+ * BridgeSession shape stays untouched). `summarizedTurns` pins the summary to
+ * a history length: any turn appended afterwards makes the snapshot incomplete
+ * and sends shared-context rendering back to the full transcript.
+ */
+export interface SessionSummary {
+  /** Deliverable summary text; the <analysis> draft is stripped by the caller. */
+  text: string;
+  /** Number of source-session history turns covered at compaction time. */
+  summarizedTurns: number;
+  /** ISO timestamp of when the summary was produced. */
+  createdAt: string;
+}
+
+const METADATA_SUMMARY_KEY = "compactSummary";
+
+/**
+ * Narrows the untyped metadata bag entry into a SessionSummary. Returns
+ * undefined for absent or malformed entries instead of throwing, so older
+ * sessions and partial writes degrade to "no summary".
+ */
+export function readSessionSummary(session: BridgeSession): SessionSummary | undefined {
+  const raw = session.metadata?.[METADATA_SUMMARY_KEY];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+  const candidate = raw as Record<string, unknown>;
+  if (typeof candidate.text !== "string" || !candidate.text.trim()) return undefined;
+  if (
+    typeof candidate.summarizedTurns !== "number" ||
+    !Number.isInteger(candidate.summarizedTurns) ||
+    candidate.summarizedTurns < 0
+  ) {
+    return undefined;
+  }
+  if (typeof candidate.createdAt !== "string") return undefined;
+  return {
+    text: candidate.text,
+    summarizedTurns: candidate.summarizedTurns,
+    createdAt: candidate.createdAt,
+  };
+}
+
+/**
  * Resolves the effective sessions storage path exactly like the SessionManager
  * constructor, without constructing one. Read-only diagnostics (doctor) use
  * this to inspect storage without triggering load-time quarantine side effects.
@@ -551,6 +593,32 @@ export class SessionManager {
   /** Records (or overwrites) the terminal tombstone for an idempotency scope key. */
   public setIdempotencyTombstone(scopeKey: string, tombstone: IdempotencyTombstone): void {
     this.idempotencyTombstones.set(scopeKey, structuredClone(tombstone));
+  }
+
+  /**
+   * T2.3 summary sidecar write. Stores the compact summary in the session's
+   * metadata bag without touching history, so turn-count-based freshness
+   * checks stay meaningful. Returns false when the session no longer exists.
+   */
+  public setSummary(id: string, summary: SessionSummary): boolean {
+    return this.withFileLock(() => {
+      const existing = this.sessions.get(id);
+      if (!existing) return false;
+      existing.metadata = {
+        ...(existing.metadata ?? {}),
+        [METADATA_SUMMARY_KEY]: structuredClone(summary),
+      };
+      existing.updatedAt = new Date().toISOString();
+      this.saveToFile();
+      this.markFlushed(id);
+      return true;
+    });
+  }
+
+  /** T2.3 summary sidecar read; undefined when absent or malformed. */
+  public getSummary(id: string): SessionSummary | undefined {
+    const session = this.getSession(id);
+    return session ? readSessionSummary(session) : undefined;
   }
 
   /**

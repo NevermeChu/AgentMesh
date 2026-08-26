@@ -12,7 +12,17 @@ import type {
 } from "./types.js";
 import { findExecutableOnPath, ProcessExecutionError } from "../core/executor.js";
 import { extractSummary, parseReviewOutput } from "../core/prompts.js";
-import { classifyErrorCode } from "../core/resilience.js";
+import {
+  classifyErrorCode,
+  defaultSleep,
+  evaluateCircuitBreaker,
+  executeWithResilientRetries,
+  initialCircuitBreakerState,
+  isRetriableFailure,
+  recordExecutionOutcome,
+  RETRY_BACKOFF_DELAYS_MS,
+} from "../core/resilience.js";
+import type { CircuitBreakerState } from "../core/resilience.js";
 
 export abstract class BaseAdapter implements AgentAdapter {
   abstract readonly name: AgentName;
@@ -30,6 +40,9 @@ export abstract class BaseAdapter implements AgentAdapter {
    * Default executable name to look up in system PATH.
    */
   abstract readonly defaultExecutableName: string;
+
+  /** P1 T1.3 per-adapter circuit state; adapters are process-level singletons. */
+  private circuitBreakerState: CircuitBreakerState = initialCircuitBreakerState();
 
   /**
    * Resolves the actual binary/command path.
@@ -75,8 +88,64 @@ export abstract class BaseAdapter implements AgentAdapter {
 
   /**
    * Main entry point for executing a task with the agent.
+   *
+   * Wrapped by the P1 T1.3 resilience layer: a per-adapter circuit breaker
+   * fails fast after repeated consecutive failures, and pre-work failures are
+   * retried automatically with constant backoff. Failures that already produced
+   * work are never retried — they surface to the orchestrator for decisions.
    */
   public async run(options: RunAgentOptions): Promise<AgentResult> {
+    const circuit = evaluateCircuitBreaker(this.circuitBreakerState, Date.now());
+    if (!circuit.allowed) {
+      const recoverySeconds = Math.ceil(circuit.retryAfterMs / 1000);
+      const message =
+        `${this.displayName} dispatch rejected by the circuit breaker after ` +
+        `${this.circuitBreakerState.consecutiveFailures} consecutive failures ` +
+        `(fail-fast CIRCUIT_OPEN). Expected recovery in about ${recoverySeconds}s; ` +
+        "retry later or switch agents/roles in the meantime.";
+      return {
+        status: "failed",
+        agent: this.name,
+        summary: message,
+        output: message,
+        error: message,
+        exitCode: 1,
+        errorCode: "CIRCUIT_OPEN",
+        retryAfterMs: circuit.retryAfterMs,
+        durationMs: 0,
+      };
+    }
+
+    const { result, attempts } = await executeWithResilientRetries({
+      operation: () => this.runOnce(options),
+      isRetriable: (candidate) => isRetriableFailure(candidate, Boolean(options.signal?.aborted)),
+      signal: options.signal,
+      sleep: (ms, signal) => this.resilienceSleep(ms, signal),
+    });
+
+    // One logical dispatch outcome feeds the breaker (retries included).
+    // Client-cancellation outcomes are not adapter failures and do not count.
+    this.circuitBreakerState = recordExecutionOutcome(this.circuitBreakerState, {
+      ok: result.status === "success" || result.errorCode === "CANCELLED",
+      nowMs: Date.now(),
+    });
+
+    result.attempts = attempts;
+    if (attempts > 1) {
+      const note =
+        `Recovered after ${attempts} automatic attempts ` +
+        `(pre-work failure retries with ${RETRY_BACKOFF_DELAYS_MS.join("/")}ms backoff).`;
+      result.warning = [result.warning, note].filter(Boolean).join(" ");
+    }
+    return result;
+  }
+
+  /** Injectable wait for tests; production uses the abort-aware default sleep. */
+  protected resilienceSleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return defaultSleep(ms, signal);
+  }
+
+  private async runOnce(options: RunAgentOptions): Promise<AgentResult> {
     const result = await this.runUnchecked(options);
     if (!options.signal?.aborted) return result;
     // The client cancelled mid-run; surface that instead of a bare exit code and

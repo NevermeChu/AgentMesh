@@ -1017,3 +1017,156 @@ S1–S10 全部通过（VERDICT: PASS）：S2/S5/S6/S7/S8 AGREE（部分附实�
 - PROBLEMS.md：P-053 追加二次增强说明；新增 P-054～P-059 六条。
 - CHANGELOG：Added/Changed 各追加对应条目。
 - 未实施（如实声明）：批次 4 的 S9 孤儿进程检测版与 S8 doctor 子命令为可选项，本轮未做；「MCP 忽略 model」真实链路验证需消耗配额，留待下一轮真实测试覆盖。
+
+---
+
+# 第十二轮：semver-lab 双 opencode 模型/变体真实流水线测试（2026-08-25）
+
+## 0. 方法与隔离
+
+- 隔离仓库：`~\agentmesh-real-r12\semver-lab`（独立 Git 根，种子提交 `2c9acee`，仅 SPEC.md + README + .agentmesh/config.json）；证据持久化于 `~\agentmesh-real-r12\out\`。主仓库源码未被真实 Agent 修改（仅未跟踪驱动脚本 `driver-r12.mjs`，沿用 r11 先例）。
+- **本轮编排主题（按用户指定角色）**：Worker 与 Reviewer 均为 opencode 但**不同模型/变体**——Worker=`opencode/x-preview-f-free --variant max`，Reviewer=新开会话 `opencode/muse-spark-1.2-contributor-free --variant high`，Tester=antigravity。AgentMesh 无 variant 参数（N-R11-C），沿用 r11 的 OPENCODE_BIN shim 方案并升级为**双 shim**：每阶段独立 MCP server 进程，经 env 分别指向 `opencode-max.cmd` / `opencode-high.cmd`（entry.cjs spawnSync 追加 `--variant` 转发真实 opencode.exe 1.18.23）。
+- SPEC 签发前机械验证：orchestrator 先写参考实现 + sanity 断言（约 100 条手算期望），抓出参考实现 2 处缺陷（漏实现 `~`/`^` 前缀、范围 token 前导零漏检）修复后生成 147 条验收向量（A1–A7 附录由同一数据机械生成）。消耗了真实配额（5 次正式调用 + 2 次冒烟）。
+- 资源采样：PowerShell 采样器 3 秒间隔，先 9s 冒烟（102 行）后正式启用（22,447 样本全程覆盖）。
+
+## 1. 小任务是在做什么
+
+实现无依赖严格 SemVer 子集引擎：Phase 1（w0）实现 `src/version.mjs`（parseVersion 语法/错误三分法 TypeError/SyntaxError/RangeError、formatVersion 往返、compareVersions SemVer 2.0.0 §11 优先级含 build 忽略与 prerelease 数字<字母规则）；Phase 2 经 `continue_task` **原生续接同会话**实现 `src/range.mjs`（比较器集合反规范化：caret 零头规则、tilde、hyphen 部分 side、x-range 尾随通配、多处**故意偏离 npm 的收紧决策**、prerelease gating 同元组门控规则）。Tester 独立编写全量边界套件；Reviewer 只读评审未提交 diff；终检将 [reviewer,tester] 回流原 worker 会话交叉核对。验收：附录 A 全部向量成立、`node --test "tests/*.test.mjs"`（glob 形式）exit 0、`git diff --check` 干净、零提交。
+
+## 2. 真实阶段结果
+
+| 阶段                  | Agent                          | Session                           | 结果                                                     |   耗时 |
+| --------------------- | ------------------------------ | --------------------------------- | -------------------------------------------------------- | -----: |
+| smoke-w               | opencode/x-preview-f-free(max) | `bridge-sess_59507125aca1`        | SUCCESS（回显模型确认）                                  |  15.3s |
+| smoke-r               | opencode/muse-spark-…(high)    | `bridge-sess_b14793410fdc`        | SUCCESS（回显模型确认）                                  |  20.0s |
+| w0 实现 version.mjs   | opencode worker                | `bridge-sess_e5e443e710f0`(turn0) | SUCCESS，自检套件落盘                                    | 490.9s |
+| w1 continue range.mjs | 同会话原生续接                 | 同上(turn1)                       | SUCCESS，确认复用 version 导出                           | 838.2s |
+| rev review_changes    | opencode reviewer(新会话)      | `bridge-sess_5d9d639577fb`        | **PASS + 3 low 非阻塞 findings → SUCCESS/isError=false** | 131.0s |
+| tester 独立测试       | antigravity                    | `bridge-sess_443f1f37f822`        | VERDICT PASS，40/40（文件直接落盘工作区）                | 175.9s |
+| final 终检 continue   | 原 worker 会话 [rev,tester]    | 同上(turn2)                       | FINAL VERDICT: ACCEPT                                    |  91.1s |
+
+Orchestrator 独立复核：签发前 147 条权威向量直接打 worker 实现 **147/147 通过**；tester 套件复跑 **40/40**；worker 自有套件 24/24；HEAD 保持种子提交、仅 src/+tests/ 未跟踪、`git diff --check` 干净。修复闭环未触发（findings 全部 low 非阻塞，合理结果）。
+
+## 3. 上下文是否损失及程度：无损/有效（轻微尾部截断均已量化）
+
+- **contextSources 全链路持久化**：rev turn0=[worker]；tester=[worker,reviewer]；final=[reviewer,tester]。三个下游会话均实录来源 session ID。
+- **per-source freshness 多写者实景再次精确判定**：终检注入侧 reviewer 源=STALE（tester 在 reviewer 快照之后新增 qa_verification.test.mjs）、tester 源=MATCHED——与实际写入时序完全一致（sidecar 原文取证）；tester 侧双源 MATCHED；reviewer 侧 worker MATCHED。freshness 提示语要求 STALE 源重验后复用，终检 worker 报告确认其对 STALE 源逐项直读仓库核对。
+- **sharedContextAudit 逐字节对账（第三次实证）**：三份注入 sidecar 落盘于 `~/.agentmesh/contexts/<sid>/`，SHA256 与会话内审计记录逐一比对全部一致（如 reviewer 侧 `72816974b5436bbc…`、终检侧 `59c09472ae30c860…`）。
+- **截断量化（唯一信息损失点，等级：轻微截断）**：①reviewer←worker 注入 12,209 字符，worker finalAnswer 渲染带 `[truncated]` 标记（fa 4079 字符超 per-answer 预算，尾部被切，repository evidence 保留完整）；②final←[reviewer 8617 chars / tester 7015 chars] 双源均 truncated=true。均为文档化预算行为而非机制丢失，且两个被截方都靠直读仓库补齐细节。
+- **模型/变体请求持久化**：两会话 `requestedModel` 如实入库（x-preview-f-free 三轮不变；muse-spark-1.2-contributor-free 一轮）；本轮 CLI 传输声明支持 model，无 capability diagnostic 触发场景（符合 F6 设计）。
+- 归因约束生效：reviewer 明确引用 worker 会话 ID 并区分「直接验证 vs 交接内容」；终检 worker 对两条下游结论逐项给出 ACCEPT 依据。
+
+## 4. 是否重复做无意义操作
+
+- Reviewer 独立复跑 24/24 套件 + 手工边界 spot checks（gating 矩阵、strictness 拒绝、desugar 形状）属只读评审职责；其 3 个 findings 均为实质观察而非重复劳动。
+- Tester 全量重写 40 项断言（含 A4 的 64 对两两比较、A6 gating 矩阵全覆盖）为角色独立性成本，非无效重复；未信任上游结论的任何未验证主张。
+- w1 期间 vendor 出现一次「write 输出截断/损坏 → agent 自行重写完整模块」的自恢复（opencode 内部噪声，一次成功，无空转循环）。
+- 未观察到因上下文缺失或误判引发的重复检索/重复推导/被动闭环；两次冒烟是编排设计内的机制验证。
+
+## 5. 暴露的问题
+
+### 新问题（本轮核心产出）
+
+1. **N-R12-A（中，orchestrator 测试工具链）向量生成器两类序列化缺陷**：①A7 表渲染用 `expected ?? error`，把「期望值为 null」与「字段缺失」混淆，输出字面 `undefined`（worker 发现并按 §2.3 决议为 null，决议正确且已注入绑定说明链）；②A6-39/40 错误向量把原始非字符串输入（数字 `1`、`null`）经 `String()` 序列化成字符串形式打印，「期望 TypeError」与打印输入在语法层面矛盾（authority harness 首跑即暴露）。根因均在 `ref/gen-vectors.mjs` 的模板插值/错误向量序列化，不在 AgentMesh。教训：SPEC 附录生成器必须对 expected=null 显式分支，错误向量必须保留原始 JS 类型标记。
+2. **N-R12-B（低，SPEC 文字缺陷）验收标准 7 写「import from ./version.js」而实际模块文件为 version.mjs**：Node ESM 要求精确扩展名，`.mjs` 行为正确、意图满足；reviewer 以 low finding 抓到字面不一致。属 orchestrator 措辞疏漏。
+3. **N-R12-C（低，SPEC prose 与双方实现的宽松分歧，reviewer 实质发现）**：SPEC 2.1 文字要求 hyphen 两侧「恰好单空格」，但 worker 实现（与我的参考实现一致）用 `\s+` 切分，接受多空格形式 `1.2.3  -  2.3.4`；无 A 向量覆盖该点，lenient-only 不拒绝合法输入。终检 worker 确认 finding 属实并归类为「预披露宽松」。若要严格，需在 SPEC 中定义空白语义或补负向向量——本轮以「记录分歧、不修代码」收束（PASS 语义下无阻塞）。
+4. **N-R12-D（机制知识，非缺陷）F 批次 .cmd 加固的 shim 兼容约束**：shim 解包正则要求 `%~dp0\entry.cjs`（**必须带反斜杠**）才会被识别解包；`node "%~dp0entry.cjs"`（无反斜杠）触发 fail-fast「not a recognized Node.js CLI shim」。另发现 Windows 下 cmd 直接调用 `.cjs`（依赖文件关联）会吞掉 stdout，shim 内层必须显式 `node` 前缀。两条已固化进本轮 shim，后续轮次可直接复用。
+
+### 正向确认清单（真实链路）
+
+- **双模型双变体 shim 注入端到端生效**：冒烟回显各自模型名；正式调用 requestedModel 持久化；同机同轮内 Worker/Reviewer 各走各的 variant 无串扰。
+- **opencode continue_task 原生续接可用**：nativeSessionId（ses_fc7d1cbf…）跨 w0→w1→final 三轮保持，CLI 传输三轮 finalAnswer 全部持久化（2862/4079/3147 字符）。
+- **P-049 严重度语义持续生效**：PASS+3 low → `SUCCESS/isError=false`，summary=`Review PASSED with 3 non-blocking finding(s).`
+- **P9 未复发**：antigravity 测试文件 `qa_verification.test.mjs` 直接落盘工作区并可复核（附 shell 写入降级指引未被迫使用）。
+- Reviewer safety 如实申报 prompt-only/workspaceChanged=false；失败轮无；超时无。
+
+## 6. 历史问题状态更新
+
+| 问题                 | 本轮观察                                                                                               | 状态                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------- |
+| P1/P2/P3-P8/P7       | CLI 全链路，finalAnswer/summary/多源转发全部正常                                                       | 维持已解决                      |
+| P9 artifact 路径     | 测试文件直接落盘                                                                                       | 维持已解决（持续观察）          |
+| P10 孤儿进程         | 终扫窗口内创建进程零存活；存活 codex/OpenCode 均为用户并行活动（创建早于管线或父进程存活，非本轮产物） | 维持已解决                      |
+| P-049 PASS+备注      | 直接覆盖生效                                                                                           | 维持已解决                      |
+| N-R11-C variant 缺口 | 双 shim 方案第二次成功实践（首次双变体并行对照）                                                       | 维持缓解（BIN shim 为唯一通道） |
+| P6 spawn EPERM       | 本轮 worker/reviewer 均 opencode，未触发 codex MCP 场景                                                | 不适用                          |
+
+## 7. 资源与清理
+
+- **采样方法**：3 秒间隔枚举 node/codex/agy/gemini/opencode（PID/PPID/WS/CPU/命令行前缀），启用前 9s 冒烟验证（102 行）；正式样本 22,447 行覆盖 09:06–09:41Z 全程。
+- **观测**：agy.exe 峰值 WS 203.5MB，在场时长与 tester 175.9s 精确吻合；真实 opencode.exe 五个阶段进程生命周期逐一吻合（smoke-w 18s / w0 488s / w1 835s / rev 127s / final 127s），峰值 636.6MB（w1）；node.exe 峰值 1410MB 含宿主与本机并行活动不作归因。局限：3s 采样无法捕获亚秒峰值；未采集 GPU/句柄/磁盘 IO，不做推断。
+- **清理**：终扫（procscan）显示管线窗口内创建的 vendor 进程零残留；采样器按 stop 文件正常退出并写 done 标记；隔离仓库零提交；证据位于持久化路径。
+
+## 8. 本轮结论
+
+业务目标完成：SemVer 引擎两阶段实现经 147 条权威向量交叉验证（147/147）、40 项独立测试、PASS+3low 只读评审与 STALE-aware 终检收敛，全链路 SUCCESS/PASS/ACCEPT、零提交、零孤儿、零修复闭环。**用户指定的双 opencode 模型/变体隔离方案在 AgentMesh 当前能力下可行且全程生效**（OPENCODE_BIN 双 shim + 分阶段 server env）。上下文交接无损有效（唯一截断为文档化预算行为且 sidecar 可逐字节审计）；无意义重复为零。最有价值的产出是三个 orchestrator 侧 SPEC 工具链缺陷（N-R12-A/B/C——全部由 worker/reviewer 在真实链路中抓出并按统一决议收束）与一条 shim 机制约束（N-R12-D），均已如实记录供后续轮次规避。
+
+---
+
+# 第十三轮：globlab 异常路径 + 双模型并发真实测试——无 codex（2026-08-25）
+
+## 0. 方法与隔离
+
+- 隔离仓库：`~\agentmesh-real-r13\globlab`（独立 Git 根，种子提交 `bca6b18`）；证据持久化于 `~\agentmesh-real-r13\out\`；主仓库仅新增未跟踪驱动 `driver-r13.mjs`。**按用户约束本轮完全未使用 codex**：Worker A=opencode/x-preview-f-free(max shim)、Worker B=opencode/muse-spark-1.2-contributor-free(high shim)、Reviewer=opencode 新会话(muse high shim)、Tester=antigravity。
+- **本轮主题=补 r12 声明的覆盖缺口**：①45s 超时探针；②请求级取消探针（20s abort）；③**两个不同 opencode 模型真实并发**各自实现独立模块；④三源 review_changes；⑤organic FAIL→fix 分支（预留驱动 phase，未强制触发）。
+- SPEC 签发前机械验证落实 N-R12-A 整改：生成器对 expected=null 显式分支、错误向量保留原始参数类型标记、文件名/空白语义措辞逐一自查。参考实现 + 约 110 条手算断言抓出**一个真实设计缺陷**（尾随 `**` 吞零段使 `a/**` 错误匹配 `a`）→ 新增规则 G3 后全绿，才生成 90 条验收向量（A1–A6）。资源采样冒烟先行（93 行）后正式启用（14,063 样本全程）。
+
+## 1. 小任务是在做什么
+
+三层迷你 glob 引擎：Worker A 实现 `src/wildcard.mjs`（`*`/`?`/`[...]` 类/转义，首`]`字面、边界`-`字面、逆序区间拒绝、类内无转义）；Worker B **并发**实现 `src/brace.mjs`（嵌套花括号展开，顺序敏感：外层文本序×内层递归、跨组笛卡尔积、转义逐字保留、孤`}`字面/未闭`{`报错的不对称设计）；Worker A 经 continue_task 注入 [B] 会话后实现集成层 `src/pathglob.mjs`（先整模式 brace 展开→分段匹配，globstar 规则 G1/G2/G3）。Tester 以 [A,B] 独立编写全量套件；Reviewer 以 [A,B,tester] 三源只读评审；终检 [reviewer,tester] 回流 A 会话。验收：附录 90 向量成立、glob 形式测试命令 exit 0、零提交。
+
+## 2. 真实阶段结果
+
+| 阶段       | Agent                            | Session                        | 结果                                                                                                                                                                         |   耗时 |
+| ---------- | -------------------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -----: |
+| 超时探针   | opencode(x-preview,max)          | `bridge-sess_b370bebafe5a`     | **FAILED 如设计**：45.7s 截止，exit 124，部分 vendor 输出留痕，独立会话零污染                                                                                                |  45.7s |
+| 取消探针   | opencode(x-preview,max)          | `bridge-sess_45bcfbc3df78`     | `-32001` 于 19.6s 传播✓；turn0=failed 且 **evidence 内 aborted=true/cancelReason=client_cancel/cleanupMethod=taskkill-tree/cleanupSucceeded=true**，前后仓库指纹一致零副作用 |   ~20s |
+| duo 并发 A | opencode/x-preview(max)          | `bridge-sess_dcbaa8fcb2cb`(t0) | SUCCESS，wildcard.mjs+4 测试文件落盘                                                                                                                                         | 303.4s |
+| duo 并发 B | opencode/muse-spark(high)        | `bridge-sess_ff8929623b07`(t0) | SUCCESS，brace.mjs+向量测试落盘                                                                                                                                              | 197.6s |
+| w1 集成    | A 原生续接 ctx=[B]               | 同 A(t1)                       | SUCCESS，pathglob.mjs 落盘，套件 122/122                                                                                                                                     | 255.0s |
+| tester     | antigravity ctx=[A,B]            | `bridge-sess_e099d61e67c5`     | VERDICT PASS，**135/135**（qa 文件直接落盘）                                                                                                                                 | 246.7s |
+| rev        | opencode 新会话 ctx=[A,B,tester] | `bridge-sess_15bcd6655e5e`     | PASS + 3 low 非阻塞 findings，独立复跑 135/135                                                                                                                               | 134.9s |
+| final      | A 续接 ctx=[rev,tester]          | 同 A(t2)                       | FINAL VERDICT: ACCEPT                                                                                                                                                        | 112.4s |
+
+Orchestrator 独立复核：90 条权威向量打实现 **92/92 通过**（含 2 条专项非字符串 TypeError 检查）；worker-B 的 brace 模块与参考实现在 A3 全组 **16/16 一致**（并发独立实现零漂移）；tester 套件复跑 **135/135**；HEAD 保持种子；`git diff --check` 干净。duo 墙钟≈305s < 串行和 501s，确认真实并行。
+
+## 3. 上下文是否损失及程度：无损/有效
+
+- **contextSources 全程实录**：w1-t1=[B]；tester=[A,B]；**reviewer=[A,B,tester]（本流水线首次真实三源 review_changes）**；final=[rev,tester]。
+- **per-source freshness 全谱系再实证（最精细的一次）**：w1←B=STALE（B 快照早于 A 在 duo 尾段继续补写的测试文件）；tester←A=MATCHED/←B=STALE；reviewer←A=STALE/←B=STALE/←tester=MATCHED；final←双源 MATCHED。每个判定都与多写者写入时序精确对应（sidecar 原文取证），STALE 源均被下游以直读文件方式正确处置。
+- **sidecar SHA256 对账**：四份注入 sidecar 计算哈希与会话审计记录前缀逐一吻合（3ec928d1…/84c346d1…/6ecd2767…/e140ba22…）。
+- **截断量化**：w1←B 未截断（5572 chars 全量）；tester←双源均未截断；reviewer←[A 6384 truncated/B 5572 完整/tester 6930 truncated]；final←[rev 7612/tester 6930 均 truncated]。均为预算内行为，等级：轻微截断。
+- 失败会话留痕完整且零污染：超时/取消两个 probe 会话未被注入任何下游阶段。
+
+## 4. 是否重复做无意义操作
+
+- Reviewer 独立复跑全套件并手工 spot-check globstar 矩阵（含 `a/**` vs `a/`、`**/**` vs `""` 等边角）属职责内必要验证；其 3 个 low findings 为实质观察。
+- Tester 重写 135 项断言为角色独立性成本；对上游结论的引用均以其自行复刻的 90 向量为准。
+- 无任何因上下文缺失或误判导致的重复检索/重复推导/被动闭环；两个探针是本轮的设计目标本身而非浪费。
+
+## 5. 暴露的问题
+
+### AgentMesh 自身：本轮零新缺陷暴露（如实声明边界）
+
+1. 异常路径两项按设计精确工作：超时证据（exit 124/timedOut/部分输出保留）、取消证据（aborted/cancelReason/taskkill-tree/指纹不变）——r10 P-REAL-008/009 修复批次在真实链路持续有效。
+2. 并发两会话持久化零丢失、同仓不同路径分工无冲突；三源注入与预算降级正常。
+3. **覆盖边界如实声明**：①FAIL→fix 闭环分支再次未被触发（实现一次全绿，属良性结果而非覆盖证明，该分支自 T5/T11 后仍依赖历史验证）；②codex MCP 传输路径因配额约束连续两轮缺席；③enforced safety、断连式取消（disconnect）本轮亦未覆盖。
+
+### Orchestrator 侧小问题（非产品缺陷）
+
+4. **N-R13-A（低，工具噪声）**：authority harness 中一处动态 import 的异步 rejection 在汇总打印后崩溃（不影响 92/92 判定但污染输出）；PowerShell 5.1 `Set-Content -Encoding UTF8` 写 JSON 带 BOM 导致 Node JSON.parse 失败一次。均为驱动脚本层面问题，已当场绕过。
+
+### 正向确认清单
+
+- 双模型并发分工（不同 shim/不同模型/同仓不同路径）端到端可行，requestedModel 各自持久化无串扰。
+- P-049 严重度语义持续生效（PASS+3low→SUCCESS）；P9 antigravity artifact 问题连续第二轮未复发；P10 孤儿进程终扫零残留（窗口内创建进程存活数=0）。
+- opencode 原生续接跨 3 轮保持（ses_fc76…族 native id 稳定）。
+
+## 6. 资源与清理
+
+- 采样：3s 间隔全程 14,063 样本（冒烟 93 行先行验证）；agy.exe 生命周期与 tester 246.7s 吻合；opencode 五个正式阶段进程生命周期逐一对应各阶段时长；node.exe 高峰值含宿主与用户并行活动不作归因。局限：3s 采样无法捕获亚秒峰值，未采集 GPU/句柄/磁盘 IO，不做推断。
+- 清理：管线窗口内创建的 vendor 进程零存活、零孤儿；采样器按 stop 文件退出；隔离仓库零提交；证据位于持久化路径。
+
+## 7. 本轮结论
+
+在无 codex 约束下完成史上最复杂编排之一：异常探针（超时/取消）双双按设计留痕，两种 opencode 模型真实并发实现互补模块并经集成层合流，90 权威向量 92/92、135 项独立测试、三源评审与 ACCEPT 终检收敛，零提交零孤儿。AgentMesh 自身本轮零缺陷暴露——正常路径与已修复异常路径均稳定；**但 FAIL→fix 闭环、codex MCP、enforced safety、断连取消四个边界仍未在本轮覆盖，不能据此宣称全域稳定**。orchestrator 侧仅余两类工具脚本小噪声（N-R13-A），SPEC 机械验证流程经 N-R12-A 整改后首次全程零签发缺陷。

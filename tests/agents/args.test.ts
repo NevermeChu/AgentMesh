@@ -370,4 +370,57 @@ describe("agents/extraArgs allowlists (P3/T3.3)", () => {
     expect(result.summary).toContain("not allowed");
     expect(result.output).toContain("could override safety controls");
   });
+
+  it("places worker deny-policy injection args after the bypass flag", () => {
+    const adapter = new ClaudeAdapter();
+    const injected = ["--settings", "D:/h/.agentmesh/policy/s/settings.json"];
+    const args = adapter.buildCliArgs({ task: "work", role: "worker" }, injected);
+    const bypassIndex = args.indexOf("--dangerously-skip-permissions");
+    const settingsIndex = args.indexOf("--settings");
+    expect(bypassIndex).toBeGreaterThan(-1);
+    expect(settingsIndex).toBe(bypassIndex + 1);
+    expect(args.slice(settingsIndex, settingsIndex + injected.length)).toEqual(injected);
+
+    // Reviewers never receive injection arguments.
+    const reviewerArgs = adapter.buildCliArgs({ task: "review", role: "reviewer" }, injected);
+    expect(reviewerArgs).not.toContain("--settings");
+  });
+
+  it("writes the generated deny policy and returns disclosure warning for workers", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-claude-policy-"));
+    try {
+      const adapter = new ClaudeAdapter();
+      const { args, warning } = adapter.prepareWorkerPolicy("native-thread-77", home);
+
+      expect(args).toContain("--settings");
+      const settingsPath = args[args.indexOf("--settings") + 1] ?? "";
+      expect(settingsPath.startsWith(path.join(home, ".agentmesh", "policy"))).toBe(true);
+      expect(fs.existsSync(settingsPath)).toBe(true);
+      const parsed = JSON.parse(fs.readFileSync(settingsPath, "utf8")) as {
+        permissions: { deny: string[] };
+      };
+      expect(parsed.permissions.deny.length).toBeGreaterThan(0);
+      expect(warning).toContain("deny policy active");
+      expect(warning).toContain("Bash(curl:*)");
+
+      // Reviewer path stays policy-free.
+      expect(new ClaudeAdapter().prepareWorkerPolicy(undefined, home).warning).toContain(
+        "deny policy active",
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades to an explicit no-policy warning when the policy write fails", () => {
+    const blockedRoot = path.join(os.tmpdir(), `agentmesh-claude-blocked-${Date.now()}`);
+    fs.writeFileSync(blockedRoot, "not a directory", "utf8");
+    try {
+      const { args, warning } = new ClaudeAdapter().prepareWorkerPolicy("s1", blockedRoot);
+      expect(args).toEqual([]);
+      expect(warning).toContain("WITHOUT the deny fallback");
+    } finally {
+      fs.rmSync(blockedRoot, { force: true });
+    }
+  });
 });

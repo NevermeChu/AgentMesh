@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import * as fs from "node:fs";
 import { spawn } from "node:child_process";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -24,6 +25,48 @@ export interface McpClientExecutionResult {
   structuredResult?: unknown;
   durationMs: number;
   toolsDiscovered: string[];
+}
+
+/**
+ * Collects live descendant PIDs of `rootPid` by reading procfs `children`
+ * files. Linux only; other platforms return an empty list because they lack
+ * procfs. The snapshot must happen while the root process is still alive,
+ * otherwise deeper generations reparent to init and become untrackable.
+ */
+function collectDescendantPids(rootPid: number): number[] {
+  if (process.platform !== "linux") return [];
+  const descendants: number[] = [];
+  const seen = new Set<number>([rootPid]);
+  const queue: number[] = [rootPid];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) break;
+    let tasks: string[];
+    try {
+      tasks = fs.readdirSync(path.join("/proc", String(current), "task"));
+    } catch {
+      continue;
+    }
+    for (const task of tasks) {
+      let childLine: string;
+      try {
+        childLine = fs.readFileSync(
+          path.join("/proc", String(current), "task", task, "children"),
+          "utf8",
+        );
+      } catch {
+        continue;
+      }
+      for (const field of childLine.trim().split(/\s+/)) {
+        const childPid = Number(field);
+        if (!Number.isInteger(childPid) || childPid <= 0 || seen.has(childPid)) continue;
+        seen.add(childPid);
+        descendants.push(childPid);
+        queue.push(childPid);
+      }
+    }
+  }
+  return descendants;
 }
 
 /**
@@ -143,12 +186,15 @@ export async function executeViaMcpClient(
     if (timer) clearTimeout(timer);
     options.signal?.removeEventListener("abort", onAbort);
     // Reap the vendor process tree while the parent is still alive. The SDK's
-    // StdioClientTransport.close() only SIGTERMs/SIGKILLs its direct child;
-    // vendor MCP servers (e.g. `codex mcp-server`, antigravity) routinely fork
-    // subprocesses (`codex exec`, `agy`) that would survive that teardown as
-    // orphans once the direct child is reaped. taskkill /T /F the whole tree
-    // first so descendants do not leak after the caller's connection closes.
+    // StdioClientTransport spawns without a dedicated process group, and its
+    // close() only terminates the direct child; vendor MCP servers (e.g.
+    // `codex mcp-server`, antigravity) routinely fork subprocesses (`codex
+    // exec`, `agy`) that would survive as orphans. Windows gets taskkill /T /F;
+    // Linux snapshots the live descendant list from procfs so any survivor can
+    // be signalled once the direct child has been reaped below.
     const vendorPid = transport.pid;
+    const posixDescendants =
+      vendorPid && process.platform === "linux" ? collectDescendantPids(vendorPid) : [];
     if (process.platform === "win32" && vendorPid) {
       try {
         spawn("taskkill", ["/pid", vendorPid.toString(), "/T", "/F"], { stdio: "ignore" });
@@ -163,6 +209,13 @@ export async function executeViaMcpClient(
         await transport.close();
       } catch {
         // Ignore cleanup errors
+      }
+    }
+    for (const pid of posixDescendants) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Already exited between the snapshot and the signal.
       }
     }
   }

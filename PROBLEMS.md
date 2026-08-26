@@ -587,3 +587,13 @@
 **解决方法**：antigravity 适配器以常量特征匹配 "not a valid artifact path"，命中时经 warning 通道附加「产物可能未落盘工作区、需独立复核」警示；成功与致命失败两个分支均覆盖。不注入 findings，避免干扰 parseReviewOutput 的 fail-closed 语义。README 已知限制同步更新编排方降级指引建议。
 
 **状态**：已解决（2026-08-25，检测与警示层面；vendor 白名单本身属平台限制，如实记录）。
+
+## P-060 MCP 客户端在 POSIX 上不收割 vendor 子孙进程树（P10 回归在 Linux CI 暴露）
+
+**问题**：`executeViaMcpClient` 的进程树收割只实现了 Windows 分支（taskkill /T /F）；Linux 上 SDK `StdioClientTransport.close()` 只终止直接子进程，vendor MCP server fork 出的孙进程成为孤儿继续运行。P10 进程回收回归测试在 ubuntu CI 上断言失败（孤儿存活并写入 marker），此前该测试还因固定 3.5s 观察窗口叠加 CI 慢机时序超过 vitest 默认 5s 超时。
+
+**根因**：SDK 自行 spawn 子进程且不支持 detached/process-group 透传，executor.ts 的「detached + `-pid` 进程组信号」方案无法复用；mcp-client.ts 清理路径缺少 POSIX 等价实现。
+
+**解决方法**：teardown 前从 procfs `/proc/<pid>/task/*/children` 递归快照仍存活的后代 PID（快照必须在根进程存活时进行，否则深层后代会重新挂到 init 失去追踪），`client.close()` 之后对幸存者补发 SIGKILL。测试增加 15s 显式超时，与项目内其他慢测试惯例一致。
+
+**状态**：已解决（2026-08-26）。Linux 上孤儿被收割、回归测试通过；Windows 路径不变；macOS 无 procfs 时保持原有行为并在代码注释中如实说明。

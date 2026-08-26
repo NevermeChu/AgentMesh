@@ -239,6 +239,15 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
+### 委派纪律（协议即提示词）
+
+主控 Agent 通过 `delegate_task` 派发任务时应遵循四条实证纪律（已同步写入 `delegate_task` 工具 description，主模型无需另行学习）：
+
+1. **像给刚进门的聪明同事写简报；Never delegate understanding**：每条指令自带具体文件路径与要做的具体改动，不依赖下游自己"找答案"。反例："based on your findings, improve it"——下游没有你的理解，只有你写给它的字。
+2. **并行纪律**：只读任务（检索/评审/分析）可扇出并行执行；会写同一文件集合的写任务必须串行，避免互相踩踏。
+3. **continue-vs-fresh 决策表**：纠错类反馈用 `continue_task` 续同一会话（错误上下文天然延续）；验证/复审换新会话（fresh eyes，防锚定）；方向性全错同样换新会话，避免被旧思路带偏。
+4. **定义 done**：实现类任务的完成标准必须包含"回报测试结果与变更摘要"，缺任一项不算完成，不得验收。
+
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容按 **T2.4 分段限额**控制：共享轮次内的任务描述回显每条 ≤4000 字符、上游结论总量 ≤12000 字符（多来源均分）、环境快照 ≤2k 字符（超限截断并附 "run git status for full detail" 补救指令），三段独立计费互不挤占（总预留 24k，剩余 ~6k 为下游留白），所有截断都显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
 调用过 `compact_context` 的来源 Session 在共享上下文渲染时优先注入"摘要 + 指针"：只要源 Session 自压缩以来没有新增轮次，就注入八段语义摘要并附一行指针（完整原文存于哪个 Bridge Session，需要细节请用 `get_session` 按需读取）；源 Session 一旦有新增轮次即视为 STALE，自动回落为全文注入。仓库指纹的 MATCHED/STALE 判定照常叠加显示，二者互不影响。

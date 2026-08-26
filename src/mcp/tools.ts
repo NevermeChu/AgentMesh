@@ -281,7 +281,15 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
   // delegate_task
   server.tool(
     "delegate_task",
-    "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json",
+    [
+      "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json.",
+      "",
+      "Delegation discipline (protocol-as-prompt):",
+      "1. Brief like a smart colleague who just walked in — NEVER delegate understanding: every instruction must carry concrete file paths and the exact intended change. Anti-pattern: 'based on your findings' — the downstream agent has only what you wrote, not your understanding.",
+      "2. Parallelism: fan out read-only tasks (research/review/analysis) freely; strictly serialize write tasks that touch the same set of files.",
+      "3. Continue-vs-fresh: send correction feedback back to the SAME session so error context carries over; run verification in a NEW session for fresh eyes; also start a new session when the direction was fundamentally wrong to avoid anchoring.",
+      "4. Define done: an implementation task is done only when the report includes actual test results and a summary of changes made.",
+    ].join("\n"),
     DelegateTaskInputSchema.shape,
     async (args: z.infer<typeof DelegateTaskInputSchema>, extra) => {
       try {

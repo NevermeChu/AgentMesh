@@ -136,6 +136,18 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("compact_context");
   });
 
+  it("encodes the four delegation disciplines in the delegate_task description (T4.3)", async () => {
+    const response = await client.listTools();
+    const description = response.tools.find((tool) => tool.name === "delegate_task")?.description;
+
+    expect(description).toContain("NEVER delegate understanding");
+    expect(description).toContain("based on your findings");
+    expect(description).toContain("serialize write tasks");
+    expect(description).toContain("SAME session");
+    expect(description).toContain("fresh eyes");
+    expect(description).toContain("test results and a summary of changes");
+  });
+
   it("compacts a source session over MCP and reports the summarized outcome (T2.3)", async () => {
     const source = await runner.delegateTask({ agent: "codex", task: "Seed compaction source" });
 

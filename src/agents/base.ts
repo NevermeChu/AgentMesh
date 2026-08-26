@@ -12,6 +12,7 @@ import type {
 } from "./types.js";
 import { findExecutableOnPath, ProcessExecutionError } from "../core/executor.js";
 import { extractSummary, parseReviewOutput } from "../core/prompts.js";
+import { classifyErrorCode } from "../core/resilience.js";
 
 export abstract class BaseAdapter implements AgentAdapter {
   abstract readonly name: AgentName;
@@ -86,6 +87,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       status: "failed",
       summary: `${result.summary} (${note})`,
       error: result.error ? `${result.error}; ${note}` : note,
+      errorCode: result.errorCode ?? "CANCELLED",
     };
   }
 
@@ -261,6 +263,12 @@ export abstract class BaseAdapter implements AgentAdapter {
       summary: `Failed to execute ${this.displayName}: ${errorMsg}`,
       error: errorMsg,
       exitCode: processError?.exitCode ?? 1,
+      errorCode: classifyErrorCode({
+        message: errorMsg,
+        exitCode: processError?.exitCode,
+        timedOut: processError?.timedOut,
+        aborted: processError?.aborted,
+      }),
       durationMs: Date.now() - startTime,
       timedOut: processError?.timedOut,
       aborted: processError?.aborted,

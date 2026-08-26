@@ -16,6 +16,7 @@ import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
+import { classifyErrorCode } from "./resilience.js";
 import { truncateText } from "./text.js";
 import type {
   BridgeSession,
@@ -977,6 +978,7 @@ export class MultiAgentRunner {
           summary: `Execution failed: ${errorMsg}`,
           output: errorMsg,
           error: errorMsg,
+          errorCode: classifyErrorCode({ message: errorMsg }),
           durationMs: Date.now() - startTime,
         };
       }
@@ -1222,6 +1224,7 @@ export class MultiAgentRunner {
           summary: `Continuation failed: ${errorMsg}`,
           output: errorMsg,
           error: errorMsg,
+          errorCode: classifyErrorCode({ message: errorMsg }),
           durationMs: Date.now() - startTime,
         };
       }
@@ -1350,6 +1353,7 @@ export class MultiAgentRunner {
         cancelReason:
           options.cancelReason ??
           (result.timedOut ? "timeout" : result.aborted ? "client_cancel" : undefined),
+        errorCode: result.errorCode,
         cleanupMethod: result.cleanupMethod,
         cleanupSucceeded: result.cleanupSucceeded,
         resourceEvidence: result.resourceEvidence,

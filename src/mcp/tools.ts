@@ -13,7 +13,8 @@ const PROGRESS_INTERVAL_MS = 15_000;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z.string().trim().min(1);
 
-function formatNormalizedResult(result: AgentResult): string[] {
+/** Exported for protocol tests: renders one normalized result as MCP detail lines. */
+export function formatNormalizedResult(result: AgentResult): string[] {
   const details = [`Summary: ${result.summary}`];
   if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
     details.push(
@@ -31,6 +32,7 @@ function formatNormalizedResult(result: AgentResult): string[] {
     details.push(`Raw Output:\n${truncateText(rawOutput, MAX_RAW_OUTPUT_CHARS)}`);
   }
   if (result.error) details.push(`Error: ${result.error}`);
+  if (result.errorCode) details.push(`error_code: ${result.errorCode}`);
   if (result.warning) details.push(`Warning: ${result.warning}`);
   if (result.timedOut) details.push("Execution Evidence: timed out");
   if (result.aborted) details.push("Execution Evidence: aborted");

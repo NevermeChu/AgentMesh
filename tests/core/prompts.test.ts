@@ -6,7 +6,53 @@ import {
   stripAnsi,
   extractSummary,
   parseReviewOutput,
+  SUMMARY_TEMPLATE,
+  buildSummaryPrompt,
+  stripAnalysisDraft,
 } from "../../src/core/prompts.js";
+
+describe("core/prompts compact summary contract (T2.3)", () => {
+  it("defines the eight-section tool-free summary contract with analysis-first ordering", () => {
+    const sections = [
+      "Original Intent",
+      "Key Technical Concepts",
+      "Files and Data Touched",
+      "Errors and Fixes",
+      "All User Instructions",
+      "Pending Tasks",
+      "Current State and Key Data",
+      "Next Steps",
+    ];
+    for (const section of sections) {
+      expect(SUMMARY_TEMPLATE).toContain(section);
+    }
+    expect(SUMMARY_TEMPLATE.indexOf("<analysis>")).toBeGreaterThan(-1);
+    expect(SUMMARY_TEMPLATE.indexOf("<analysis>")).toBeLessThan(
+      SUMMARY_TEMPLATE.indexOf("<summary>"),
+    );
+    expect(SUMMARY_TEMPLATE).toContain("Tools are disabled");
+    expect(SUMMARY_TEMPLATE).toContain("2000 tokens");
+    expect(SUMMARY_TEMPLATE).toContain("需要细节请按需读取");
+  });
+
+  it("builds the summarization task with the concrete source reference and history", () => {
+    const prompt = buildSummaryPrompt("HISTORY_BODY", "Bridge session 'abc'");
+    expect(prompt).toContain("完整原文存于 Bridge session 'abc' ，需要细节请按需读取。");
+    expect(prompt).toContain("## Conversation History to Summarize");
+    expect(prompt).toContain("HISTORY_BODY");
+    expect(prompt).not.toContain("<artifact/session reference>");
+  });
+
+  it("strips the analysis draft and unwraps the summary block", () => {
+    const out = stripAnalysisDraft(
+      "<analysis>private scratch that must vanish</analysis>\n<summary>\nSection A\n\n\n\nSection B\n</summary>",
+    );
+    expect(out).toBe("Section A\n\nSection B");
+    expect(out).not.toContain("scratch");
+    expect(stripAnalysisDraft("plain deliverable")).toBe("plain deliverable");
+    expect(stripAnalysisDraft("stray <summary>wrapped</summary> tail")).toBe("wrapped");
+  });
+});
 
 describe("core/prompts", () => {
   it("includes reviewer evidence, read-only, and verdict requirements", () => {

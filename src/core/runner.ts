@@ -8,15 +8,25 @@ import type {
   ReviewerSafetyPolicy,
   ReviewerSafetyReport,
   RunAgentOptions,
+  SandboxMechanism,
   TransportMode,
 } from "../agents/types.js";
 import { defaultRegistry } from "../agents/registry.js";
 import type { AgentRegistry } from "../agents/registry.js";
-import { evaluateModelOptionSupport } from "./capabilities.js";
-import { defaultSessionManager, SessionManager } from "./session.js";
+import {
+  evaluateModelOptionSupport,
+  getCapability,
+  readCapabilities,
+  staticCapabilities,
+} from "./capabilities.js";
+import type { CapabilitiesFile } from "./capabilities.js";
+import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
+import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
+import type { AgentMetadata } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
 import { classifyErrorCode } from "./resilience.js";
+import { buildSummaryPrompt, stripAnalysisDraft } from "./prompts.js";
 import { truncateText } from "./text.js";
 import type {
   BridgeSession,
@@ -32,6 +42,22 @@ import { idempotencyScopeKey } from "./types.js";
 
 /** Upper bound for one delegated agent process when no timeout is configured anywhere. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+
+/**
+ * Hard cap for one stored compact summary, ~2000 tokens at the conventional
+ * 4-chars-per-token estimate (T2.3). Oversized model output is truncated with
+ * an explicit marker instead of being stored unbounded.
+ */
+export const COMPACT_SUMMARY_MAX_CHARS = 8_000;
+
+/** Error codes eligible for the T4.4 upgrade-candidate hint. */
+export const UPGRADEABLE_ERROR_CODES: readonly ErrorCode[] = [
+  "MODEL_REJECTED",
+  "SANDBOX_UNAVAILABLE",
+];
+
+/** Upper bound for hint.nextCandidates suggestions attached to a failed dispatch. */
+const MAX_UPGRADE_HINTS = 3;
 
 /** Terminal-result tombstone TTL for idempotency keys (P1 T1.1). */
 export const DEFAULT_IDEMPOTENCY_TTL_MS = 20 * 60 * 1000;
@@ -116,11 +142,41 @@ export interface ContinueTaskParams {
 
 const MAX_SHARED_TURNS = 8;
 const MAX_SHARED_ANSWER_CHARS = 4_000;
-const MAX_SHARED_CONTEXT_CHARS = 24_000;
 const MAX_CONTEXT_SOURCES = 4;
+
+/**
+ * T2.4 segmented budgets replace the legacy single 24k pool: every segment has
+ * its own hard cap so one bloated segment can never starve the others (e.g.
+ * saturated upstream conclusions no longer crowd out the environment snapshot).
+ */
+/** Segment 1 — per-turn task-description echo carried inside shared history. */
+export const MAX_SHARED_TASK_DESC_CHARS = 4_000;
+/** Segment 2 — total upstream-conclusions budget, split evenly across sources. */
+export const UPSTREAM_CONCLUSIONS_BUDGET_CHARS = 12_000;
+/** Segment 3 — environment-snapshot cap before the self-service hint kicks in. */
+export const ENVIRONMENT_SNAPSHOT_BUDGET_CHARS = 2_000;
+/**
+ * Legacy overall ceiling, kept as the documented reserve: the three segments
+ * allocate at most 18k of it, leaving ~6k of headroom so the downstream agent
+ * keeps room for its own task framing and response planning.
+ */
+export const MAX_SHARED_CONTEXT_CHARS = 24_000;
 
 function truncateSharedText(value: string, maxChars: number = MAX_SHARED_ANSWER_CHARS): string {
   return truncateText(value, maxChars, "... [truncated]");
+}
+
+/**
+ * Renders the environment-snapshot segment under its own budget. When the
+ * evidence line overflows, the cut is marked explicitly and a self-service
+ * remediation instruction replaces the missing detail instead of silence.
+ */
+function renderEnvironmentSnapshot(evidence: RepositoryStateEvidence | undefined): string {
+  const line = evidence
+    ? `Current repository: ${formatRepositoryState(evidence)}`
+    : "Current repository: unavailable";
+  if (line.length <= ENVIRONMENT_SNAPSHOT_BUDGET_CHARS) return line;
+  return `${truncateSharedText(line, ENVIRONMENT_SNAPSHOT_BUDGET_CHARS)}\n[Environment snapshot truncated; run git status for full detail.]`;
 }
 
 function formatRepositoryState(evidence: RepositoryStateEvidence): string {
@@ -151,7 +207,7 @@ function renderSharedTurn(
 ): { text: string; answerTruncated: boolean } {
   const details = [
     `[Shared Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
-    `Task: ${history.task}`,
+    `Task: ${truncateSharedText(history.task, MAX_SHARED_TASK_DESC_CHARS)}`,
   ];
   let answerTruncated = false;
   if (history.summary) details.push(`Summary: ${history.summary}`);
@@ -183,6 +239,16 @@ interface SourceRenderStats {
   truncated: boolean;
 }
 
+/**
+ * T2.3 freshness gate: a stored summary stays injectable only while the source
+ * session has not grown past the turn count captured at compaction time.
+ */
+function readFreshSessionSummary(session: BridgeSession): SessionSummary | undefined {
+  const summary = readSessionSummary(session);
+  if (!summary) return undefined;
+  return session.history.length <= summary.summarizedTurns ? summary : undefined;
+}
+
 interface SharedContextRender {
   text: string;
   sources: SourceRenderStats[];
@@ -199,6 +265,19 @@ function renderSourceBlock(
     `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`,
     `Context freshness: ${formatFreshness(session, current)}`,
   ].join("\n");
+
+  // T2.3: a fresh compact summary replaces the verbatim transcript; any turn
+  // appended after compaction invalidates it and falls back to full injection.
+  const summary = readFreshSessionSummary(session);
+  if (summary) {
+    const text = [
+      header,
+      `[Semantic summary via compact_context covering all ${summary.summarizedTurns} recorded turn(s)]`,
+      summary.text,
+      `[Full transcript: Bridge session '${session.id}' with ${session.history.length} turn(s) — use get_session to read specifics on demand.]`,
+    ].join("\n\n");
+    return { text, truncated: false };
+  }
 
   let turns = session.history.slice(-MAX_SHARED_TURNS);
   let omittedTurns = session.history.length - turns.length;
@@ -232,7 +311,8 @@ function renderSourceBlock(
 /**
  * Renders the normalized history of one or more source sessions as first-hand
  * shared context, replacing orchestrator-side relay through task text. Each
- * source keeps its own freshness verdict and a bounded character budget.
+ * segment (per-turn task echo, upstream conclusions, environment snapshot)
+ * keeps its own bounded character budget per the T2.4 segmented scheme.
  *
  * Returns per-source injection statistics so callers can audit verbatim what
  * downstream agents actually received (see SharedContextAudit).
@@ -243,7 +323,10 @@ export function buildSharedContextDetailed(
 ): SharedContextRender | undefined {
   const usable = sources.filter((session) => session.history.length > 0);
   if (usable.length === 0) return undefined;
-  const perSourceBudget = Math.max(2_000, Math.floor(MAX_SHARED_CONTEXT_CHARS / usable.length));
+  const perSourceBudget = Math.max(
+    2_000,
+    Math.floor(UPSTREAM_CONCLUSIONS_BUDGET_CHARS / usable.length),
+  );
   const header =
     usable.length === 1 ? "## Shared Context" : `## Shared Context (${usable.length} sources)`;
   const blocks = usable.map((session, index) =>
@@ -253,9 +336,7 @@ export function buildSharedContextDetailed(
     text: [
       header,
       "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context.",
-      currentRepositoryState
-        ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
-        : "Current repository: unavailable",
+      renderEnvironmentSnapshot(currentRepositoryState),
       ...blocks.map((block) => block.text),
     ].join("\n\n"),
     sources: usable.map((session, index) => ({
@@ -485,6 +566,55 @@ function applyReviewerSafety(result: AgentResult, report: ReviewerSafetyReport):
   ];
 }
 
+export interface CompactContextSourceOutcome {
+  sourceSessionId: string;
+  /** summarized = sidecar written; in-flight = deduplicated; skipped/failed carry reason. */
+  status: "summarized" | "in-flight" | "skipped" | "failed";
+  reason?: string;
+  summary?: string;
+  summarizedTurns?: number;
+  truncated?: boolean;
+  durationMs?: number;
+}
+
+export interface CompactContextResult {
+  outcomes: CompactContextSourceOutcome[];
+}
+
+const COMPACT_CONTEXT_MAX_SOURCES = 4;
+
+/** One routing-table row for a registered adapter channel (T4.2). */
+export interface AgentRoutingEntry {
+  name: string;
+  displayName: string;
+  aliases: string[];
+  available: boolean;
+  availabilityNote?: string;
+  executablePath?: string;
+  preferredTransport: TransportMode;
+  supportedTransports: TransportMode[];
+  sandboxMechanism: SandboxMechanism;
+  /** Self-declared routing metadata from the config agents section, when present. */
+  metadata?: AgentMetadata;
+  /** Capability diagnostics recorded by this agent's most recent turn, if any. */
+  recentCapabilityDiagnostics: string[];
+}
+
+/** A declared tier/profile variant that is not a standalone binary (T4.2). */
+export interface RoutingVariantEntry {
+  key: string;
+  metadata: AgentMetadata;
+}
+
+export interface AgentRoutingTable {
+  /** Whether any agents metadata section was found for the working directory. */
+  source: "configured" | "unconfigured";
+  entries: AgentRoutingEntry[];
+  variants: RoutingVariantEntry[];
+  /** Present when the project config exists but could not be loaded. */
+  configWarning?: string;
+}
+
 export class MultiAgentRunner {
   private registry: AgentRegistry;
   private sessionManager: SessionManager;
@@ -492,6 +622,8 @@ export class MultiAgentRunner {
   private readonly now: () => number;
   private readonly idempotencyTtlMs: number;
   private readonly idempotencyInFlight = new Map<string, IdempotencyInFlightEntry>();
+  /** Per-source compaction promises enabling the T2.3 in-flight dedupe. */
+  private readonly compactInFlight = new Map<string, Promise<CompactContextSourceOutcome>>();
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
@@ -1062,6 +1194,28 @@ export class MultiAgentRunner {
         });
       }
 
+      // T4.4 failure-upgrade hint: advisory only, attached at the terminal
+      // failure exit so the orchestrator can reroute in one round trip.
+      if (
+        result.status === "failed" &&
+        UPGRADEABLE_ERROR_CODES.includes(result.errorCode as ErrorCode)
+      ) {
+        const nextCandidates = this.buildUpgradeHint({
+          declaredAgentKey: selectedAgent,
+          canonicalAgent: adapter.name,
+          requestedModel: effectiveRequestedModel,
+          requestedReasoningEffort: effectiveRequestedEffort,
+          transportUsed: result.transportUsed,
+          startDirectory: configCwd,
+        });
+        if (nextCandidates.length) {
+          const note =
+            `hint.nextCandidates=[${nextCandidates.join(", ")}] (upgrade suggestions ordered by costLevel; ` +
+            "the decision stays with the orchestrator — nothing is auto-redelivered)";
+          result.warning = [result.warning, note].filter(Boolean).join(" ");
+        }
+      }
+
       return result;
     } finally {
       inFlight.finish();
@@ -1294,6 +1448,232 @@ export class MultiAgentRunner {
   }
 
   /**
+   * T2.3 compact_context: condenses each source session's normalized history
+   * into a semantic summary sidecar using the session's own agent in a single
+   * tool-free worker turn. Summaries are injected by shared-context rendering
+   * only while fresh (no new turns since compaction). Concurrent compactions
+   * of the same session are deduplicated: later callers receive an in-flight
+   * notice instead of a second agent run.
+   */
+  public async compactContext(params: {
+    sourceSessionIds: string[];
+  }): Promise<CompactContextResult> {
+    if (params.sourceSessionIds.length > COMPACT_CONTEXT_MAX_SOURCES) {
+      throw new Error(
+        `At most ${COMPACT_CONTEXT_MAX_SOURCES} source sessions are supported per compact_context call, but ${params.sourceSessionIds.length} were requested.`,
+      );
+    }
+    const outcomes = await Promise.all(
+      params.sourceSessionIds.map((id) => this.compactOneSource(id)),
+    );
+    return { outcomes };
+  }
+
+  /** Synchronous dedupe gate: check-and-register without awaits in between. */
+  private compactOneSource(sourceSessionId: string): Promise<CompactContextSourceOutcome> {
+    const existing = this.compactInFlight.get(sourceSessionId);
+    if (existing) {
+      return Promise.resolve({
+        sourceSessionId,
+        status: "in-flight",
+        reason:
+          "A compaction for this session is already running; wait for it to complete instead of dispatching another.",
+      });
+    }
+    const task = this.runCompaction(sourceSessionId).finally(() => {
+      this.compactInFlight.delete(sourceSessionId);
+    });
+    this.compactInFlight.set(sourceSessionId, task);
+    return task;
+  }
+
+  private async runCompaction(sourceSessionId: string): Promise<CompactContextSourceOutcome> {
+    const startTime = Date.now();
+    const session = this.sessionManager.getSession(sourceSessionId);
+    if (!session) {
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: `Session '${sourceSessionId}' not found.`,
+      };
+    }
+    if (session.history.length === 0) {
+      return {
+        sourceSessionId,
+        status: "skipped",
+        reason: "The session has no recorded turns to summarize.",
+      };
+    }
+    if (!this.registry.getAdapter(session.agent)) {
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: `No adapter is available for the session's agent '${session.agent}'.`,
+      };
+    }
+
+    const turnCountAtCompaction = session.history.length;
+    const normalizedHistory = buildSharedContextDetailed([session])?.text ?? "";
+    // Tool-free summarization contract; the pointer names where details live.
+    const prompt = buildSummaryPrompt(normalizedHistory, `Bridge session '${session.id}'`);
+
+    const result = await this.delegateTask({
+      agent: session.agent,
+      cwd: session.cwd,
+      role: "worker",
+      task: prompt,
+    });
+    // The summarization turn runs on a throwaway bridge session bound to the
+    // same agent/cwd. Delete it so compaction leaves exactly one durable
+    // trace: the summary sidecar on the source session itself.
+    const scratchSessionId =
+      result.sessionId && result.sessionId !== sourceSessionId ? result.sessionId : undefined;
+
+    const cleanupScratch = () => {
+      if (scratchSessionId) this.sessionManager.deleteSession(scratchSessionId);
+    };
+
+    if (result.status !== "success") {
+      cleanupScratch();
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: result.error || result.summary || "The summarization turn failed.",
+        durationMs: Date.now() - startTime,
+      };
+    }
+
+    let text = stripAnalysisDraft(result.finalAnswer || result.output || "");
+    let truncated = false;
+    if (!text.trim()) {
+      cleanupScratch();
+      return {
+        sourceSessionId,
+        status: "failed",
+        reason: "The summarization turn produced no usable summary text.",
+        durationMs: Date.now() - startTime,
+      };
+    }
+    const pointerLine = `完整原文存于 Bridge session '${session.id}' ，需要细节请按需读取。`;
+    const pointerTail = `\n${pointerLine}`;
+    if (!text.includes("需要细节请按需读取")) {
+      text += pointerTail;
+    }
+    if (text.length > COMPACT_SUMMARY_MAX_CHARS) {
+      // Truncate with an explicit marker, keeping room so the provenance
+      // pointer survives even a maximally oversized model answer.
+      text =
+        truncateText(
+          text,
+          COMPACT_SUMMARY_MAX_CHARS - pointerTail.length,
+          "\n... [summary truncated]",
+        ) + pointerTail;
+      truncated = true;
+    }
+
+    const stored = this.sessionManager.setSummary(session.id, {
+      text,
+      summarizedTurns: turnCountAtCompaction,
+      createdAt: new Date().toISOString(),
+    });
+    cleanupScratch();
+    return {
+      sourceSessionId,
+      status: stored ? "summarized" : "failed",
+      ...(stored ? {} : { reason: "The source session disappeared during compaction." }),
+      ...(stored ? { summary: text } : {}),
+      summarizedTurns: turnCountAtCompaction,
+      truncated,
+      durationMs: Date.now() - startTime,
+    };
+  }
+
+  /**
+   * T4.4 failure-upgrade hint builder. When a dispatch failed with an
+   * upgradeable error code and the failed agent declares a candidates chain,
+   * this resolves up to three next-hop suggestions: capability-checked via
+   * evaluateModelOptionSupport (candidates whose transport would ignore the
+   * requested model/effort again are dropped), ordered by declared costLevel
+   * ascending (unmetered entries last, declaration order kept for ties).
+   * Purely advisory output — nothing is ever auto-redelivered.
+   */
+  private buildUpgradeHint(params: {
+    declaredAgentKey: string;
+    canonicalAgent: AgentName;
+    requestedModel?: string;
+    requestedReasoningEffort?: ReasoningEffort;
+    transportUsed?: "mcp" | "cli";
+    startDirectory?: string;
+  }): string[] {
+    let metadataMap: Record<string, AgentMetadata> | undefined;
+    try {
+      metadataMap = loadProjectConfig(params.startDirectory ?? process.cwd())?.config.agents;
+    } catch {
+      return [];
+    }
+    const chain =
+      metadataMap?.[params.declaredAgentKey]?.candidates ??
+      metadataMap?.[params.canonicalAgent]?.candidates;
+    if (!chain?.length) return [];
+
+    let capabilities: CapabilitiesFile["capabilities"];
+    try {
+      capabilities = readCapabilities(params.startDirectory ?? process.cwd()).capabilities;
+    } catch {
+      capabilities = staticCapabilities();
+    }
+    const effectiveTransport: TransportMode = params.transportUsed ?? "cli";
+
+    /** True only with positive evidence that this option would be ignored again. */
+    const optionBlocked = (
+      base: AgentName,
+      field: "model" | "reasoningEffort",
+      value: string | undefined,
+    ): boolean => {
+      if (!value) return false;
+      const cap = getCapability(capabilities, base, effectiveTransport, field);
+      if (!cap) return false;
+      if (cap.supported === false) return true;
+      return Boolean(cap.values && !cap.values.includes(value));
+    };
+
+    /** Resolves a chain entry to its backing binary; profile variants map to their base agent. */
+    const baseOf = (key: string): AgentName | undefined => {
+      const direct = this.registry.resolveName(key);
+      if (direct) return direct;
+      const parts = key.split("-");
+      while (parts.length > 1) {
+        parts.pop();
+        const resolved = this.registry.resolveName(parts.join("-"));
+        if (resolved) return resolved;
+      }
+      return undefined;
+    };
+
+    const meetsCapability = (key: string): boolean => {
+      const base = baseOf(key);
+      // Opaque keys carry unknown capabilities; leave the judgment to the orchestrator.
+      if (!base) return true;
+      return (
+        !optionBlocked(base, "model", params.requestedModel) &&
+        !optionBlocked(base, "reasoningEffort", params.requestedReasoningEffort)
+      );
+    };
+
+    return chain
+      .filter((key) => {
+        if (key === params.declaredAgentKey || key === params.canonicalAgent) return false;
+        const base = baseOf(key);
+        return base !== params.canonicalAgent;
+      })
+      .filter(meetsCapability)
+      .map((key) => ({ key, cost: metadataMap?.[key]?.costLevel }))
+      .sort((a, b) => (a.cost ?? Number.POSITIVE_INFINITY) - (b.cost ?? Number.POSITIVE_INFINITY))
+      .slice(0, MAX_UPGRADE_HINTS)
+      .map((entry) => entry.key);
+  }
+
+  /**
    * Persists native session binding changes and one normalized turn of
    * execution evidence. Shared by delegateTask and continueTask.
    */
@@ -1402,6 +1782,68 @@ export class MultiAgentRunner {
    */
   public async listAgents() {
     return this.registry.listAgentAvailability();
+  }
+
+  /**
+   * T4.2 routing table: one row per registered channel with live availability
+   * (registry scan front-loaded here), transport and sandbox declarations,
+   * self-declared metadata from the config agents section, the candidates
+   * upgrade chain, and this channel's most recent capability diagnostics.
+   * Declared tier/profile variants that are not standalone binaries are listed
+   * separately. Missing metadata degrades to "unconfigured" instead of error.
+   */
+  public async getAgentRoutingTable(
+    startDirectory: string = process.cwd(),
+  ): Promise<AgentRoutingTable> {
+    const availability = await this.registry.listAgentAvailability();
+
+    let metadataMap: Record<string, AgentMetadata> | undefined;
+    let configWarning: string | undefined;
+    try {
+      const loaded = loadProjectConfig(startDirectory);
+      metadataMap = loaded?.config.agents;
+    } catch (error) {
+      configWarning = error instanceof Error ? error.message : String(error);
+    }
+
+    // Most recent capability diagnostics per agent, scanning newest history
+    // entries first; sessions are returned most-recently-updated first.
+    const recentDiagnostics = new Map<AgentName, string[]>();
+    for (const session of this.sessionManager.listSessions()) {
+      if (recentDiagnostics.has(session.agent)) continue;
+      for (let i = session.history.length - 1; i >= 0; i--) {
+        const diagnostics = session.history[i]?.capabilityDiagnostics;
+        if (diagnostics?.length) {
+          recentDiagnostics.set(session.agent, diagnostics);
+          break;
+        }
+      }
+    }
+
+    const entries: AgentRoutingEntry[] = availability.map((channel) => ({
+      name: channel.name,
+      displayName: channel.displayName,
+      aliases: channel.aliases,
+      available: channel.available,
+      ...(channel.info.notes ? { availabilityNote: channel.info.notes } : {}),
+      ...(channel.info.path ? { executablePath: channel.info.path } : {}),
+      preferredTransport: channel.info.preferredTransport,
+      supportedTransports: channel.info.supportedTransports,
+      sandboxMechanism: channel.info.sandboxMechanism,
+      metadata: metadataMap?.[channel.name],
+      recentCapabilityDiagnostics: recentDiagnostics.get(channel.name) ?? [],
+    }));
+
+    const variants: RoutingVariantEntry[] = Object.entries(metadataMap ?? {})
+      .filter(([key]) => !this.registry.resolveName(key))
+      .map(([key, metadata]) => ({ key, metadata }));
+
+    return {
+      source: metadataMap ? "configured" : "unconfigured",
+      entries,
+      variants,
+      ...(configWarning ? { configWarning } : {}),
+    };
   }
 
   /** Returns the nearest project role configuration, if present. */

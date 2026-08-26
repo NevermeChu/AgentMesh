@@ -200,14 +200,18 @@ agentmesh capabilities show
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
    - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
 5. **`list_agents`**
-   - 查询所有支持的 Agent 及其在当前系统中的安装状态。
-   - 无参数。
+   - 输出**路由表视图**（T4.2）：每个注册 Agent 一块——名称/别名/**实时可用性**（registry 扫描前置到本次调用）/传输模式/沙箱申报/**路由元数据**（`tier`、`costLevel`、`strengths`、`notGoodAt`、`notes`，来自 `.agentmesh/config.json` 的 `agents` 段；未配置显示 `unmetered` 而非报错）/**candidates 升级链视图**/最近能力诊断；`agents` 段中无法解析为二进制的档位变体（如 codex profile 档）单列展示。主模型读一次即可完成全部任务分配。
+   - 参数：`cwd` (可选，用于定位最近的 `.agentmesh/config.json`，默认当前目录)。
 6. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
 7. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
    - 参数：`cwd` (可选，默认当前目录)。
+8. **`compact_context`**
+   - 把每个来源 Session 的规范化历史压缩为一份语义摘要 sidecar：用该 Session 绑定的 Agent 以 worker 角色发起一轮禁工具摘要任务（八段结构：原始意图/关键技术概念/涉及文件与数据/错误与修复/全部用户指令/待办/当前状态/下一步；先 `<analysis>` 草稿再 `<summary>` 交付，交付前剥除草稿），摘要 ≤2000 tokens（超长截断并显式标注），末尾固定一行指向完整原文的指针。
+   - 摘要写入源 Session 的 summary sidecar，**不改动其历史**；同一 Session 的并发 compact 调用会去重并返回进行中提示。
+   - 参数：`sourceSessionIds` (必填，1-4 个 Bridge Session ID)。
 
 ### 配置到 MCP 客户端
 
@@ -239,7 +243,18 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
-`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+### 委派纪律（协议即提示词）
+
+主控 Agent 通过 `delegate_task` 派发任务时应遵循四条实证纪律（已同步写入 `delegate_task` 工具 description，主模型无需另行学习）：
+
+1. **像给刚进门的聪明同事写简报；Never delegate understanding**：每条指令自带具体文件路径与要做的具体改动，不依赖下游自己找答案。反例："based on your findings, improve it"——下游没有你的理解，只有你写给它的文字。
+2. **并行纪律**：只读任务（检查/评审/分析）可扇出并行执行；会写同一文件集合的写任务必须串行，避免互相踩踏。
+3. **continue-vs-fresh 决策表**：纠错类反馈用 `continue_task` 续同一会话（错误上下文天然延续）；验证/复审换新会话（fresh eyes，防锚定）；方向性全错同样换新会话，避免被旧思路带偏。
+4. **定义 done**：实现类任务的完成标准必须包含"回报测试结果与变更摘要"，缺任一项不算完成，不得验收。
+
+`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容按 **T2.4 分段限额**控制：共享轮次内的任务描述回显每轮 ≤4000 字符、上游结论总量 ≤12000 字符（多来源均分）、环境快照 ≤2k 字符（超限截断并附 "run git status for full detail" 补救指令），三段独立计费互不挤占（总预算 24k，剩余 ~6k 为下游留白），所有截断都显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+
+调用了 `compact_context` 的来源 Session 在共享上下文渲染时优先注入"摘要 + 指针"：只要源 Session 自压缩以来没有新增轮次，就注入八段语义摘要并附一行指针（完整原文存于哪个 Bridge Session，需要细节请用 `get_session` 按需读取）；源 Session 一旦有新增轮次即视为 STALE，自动回落为全文注入。仓库指纹的 MATCHED/STALE 判定照常叠加显示，二者互不影响。
 
 每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文）。
 

@@ -27,6 +27,66 @@ export function buildRolePrompt(
 }
 
 /**
+ * Substituted by buildSummaryPrompt with the concrete artifact/session
+ * reference so the delivered summary always ends with a provenance pointer.
+ */
+const SUMMARY_SOURCE_REF_PLACEHOLDER = "<artifact/session reference>";
+
+/**
+ * T2.3 semantic handoff template. Merges the eight-section structure
+ * (original intent / key concepts / files & data / errors & fixes / all user
+ * instructions / pending tasks / current state / next steps) into one compact
+ * contract. The model drafts privately inside <analysis>, then emits the
+ * deliverable inside <summary>; the analysis block is stripped before storage
+ * (see stripAnalysisDraft). Tool use is forbidden for the summarization turn.
+ */
+export const SUMMARY_TEMPLATE = `You are producing a handoff summary of the conversation history printed below, so a later agent can resume the work without reading the full transcript.
+
+Respond with TEXT ONLY. Tools are disabled for this job: do not read files, run commands, or invoke any tool. Base every statement strictly on the provided history.
+
+Before writing the deliverable, draft your private reasoning inside an <analysis> block: walk the history chronologically and confirm every request, decision, file, failure, and open item is accounted for. This draft is discarded before delivery; it exists only to make the final summary complete.
+
+After the analysis, emit the deliverable inside a <summary> block with exactly these eight numbered sections. Keep the whole summary tight enough to fit in roughly 2000 tokens:
+
+<summary>
+1. Original Intent: what the requesting side ultimately wanted, stated precisely.
+2. Key Technical Concepts: technologies, modules, constraints, and design decisions the work depends on.
+3. Files and Data Touched: each file, function, dataset, or notable command result, always with concrete paths or identifiers.
+4. Errors and Fixes: every failure hit and how it was resolved, plus failures still unresolved.
+5. All User Instructions: every explicit instruction, preference, or restriction from the requesting side, kept specific rather than paraphrased away.
+6. Pending Tasks: work that was explicitly requested but is not finished.
+7. Current State and Key Data: completed progress, decisions taken, test/build status, and the critical values or snippets needed to resume safely.
+8. Next Steps: the immediate continuation implied by the latest state.
+</summary>
+
+Finish the <summary> block with this exact line, replacing only the placeholder with the real reference:
+完整原文存于 ${SUMMARY_SOURCE_REF_PLACEHOLDER} ，需要细节请按需读取。`;
+
+/**
+ * Assembles the tool-free summarization task for one source session:
+ * the template contract plus that session's normalized history rendering.
+ */
+export function buildSummaryPrompt(normalizedHistory: string, sourceReference: string): string {
+  return [
+    SUMMARY_TEMPLATE.replace(SUMMARY_SOURCE_REF_PLACEHOLDER, sourceReference),
+    "## Conversation History to Summarize",
+    normalizedHistory,
+  ].join("\n\n");
+}
+
+/**
+ * Removes the <analysis> drafting scratchpad and unwraps the <summary> block,
+ * leaving only the deliverable text. Models that skip the tags degrade
+ * gracefully: the raw text passes through with tags stripped.
+ */
+export function stripAnalysisDraft(text: string): string {
+  let value = text.replace(/<analysis>[\s\S]*?<\/analysis>/gi, "").trim();
+  const match = value.match(/<summary>([\s\S]*?)<\/summary>/i);
+  value = (match?.[1] ?? value.replace(/<\/?summary>/gi, "")).trim();
+  return value.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
  * Generates an independent, strict Reviewer prompt following the architectural requirements.
  */
 export function buildReviewerPrompt(

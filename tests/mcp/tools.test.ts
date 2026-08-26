@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -130,6 +133,46 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("list_agents");
     expect(toolNames).toContain("get_session");
     expect(toolNames).toContain("get_role_config");
+    expect(toolNames).toContain("compact_context");
+  });
+
+  it("encodes the four delegation disciplines in the delegate_task description (T4.3)", async () => {
+    const response = await client.listTools();
+    const description = response.tools.find((tool) => tool.name === "delegate_task")?.description;
+
+    expect(description).toContain("NEVER delegate understanding");
+    expect(description).toContain("based on your findings");
+    expect(description).toContain("serialize write tasks");
+    expect(description).toContain("SAME session");
+    expect(description).toContain("fresh eyes");
+    expect(description).toContain("test results and a summary of changes");
+  });
+
+  it("compacts a source session over MCP and reports the summarized outcome (T2.3)", async () => {
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed compaction source" });
+
+    const res = await client.callTool({
+      name: "compact_context",
+      arguments: { sourceSessionIds: [source.sessionId!] },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("| Status: SUMMARIZED] Turns covered: 1");
+    // The echoed answer unwraps to the template's eight-section deliverable.
+    expect(content[0]?.text).toContain("Original Intent");
+    expect(runner.getSession(source.sessionId!)?.history).toHaveLength(1);
+  });
+
+  it("reports a failed compaction for an unknown session as an MCP error", async () => {
+    const res = await client.callTool({
+      name: "compact_context",
+      arguments: { sourceSessionIds: ["bridge-sess_missing"] },
+    });
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("| Status: FAILED]");
+    expect(content[0]?.text).toContain("not found");
   });
 
   it("delegates a worker task through MCP", async () => {
@@ -355,5 +398,54 @@ describe("mcp/tools protocol integration", () => {
     expect(res.isError).toBe(true);
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("is not configured");
+  });
+
+  it("renders list_agents as a routing table with metadata, variants, and unmetered fallback (T4.2)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-routing-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { worker: "codex" },
+          agents: {
+            codex: {
+              tier: "weak",
+              costLevel: 1,
+              strengths: ["bulk edits"],
+              notGoodAt: ["architecture decisions"],
+              notes: "cheap lane for mechanical work",
+              candidates: ["codex-medium"],
+            },
+            "codex-medium": { tier: "medium", costLevel: 3 },
+          },
+        }),
+      );
+
+      const res = await client.callTool({
+        name: "list_agents",
+        arguments: { cwd: projectRoot },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const content = res.content as Array<{ type: string; text: string }>;
+      const text = content[0]?.text ?? "";
+      expect(text).toContain("Agent Routing Table");
+      expect(text).toContain("metadata source: configured");
+      expect(text).toContain("== codex (Test Codex Adapter) ==");
+      expect(text).toContain("Tier: weak | Cost level: 1");
+      expect(text).toContain("Strengths: bulk edits");
+      expect(text).toContain("Not good at: architecture decisions");
+      expect(text).toContain("Candidates chain: codex-medium");
+      // Channels without declared metadata degrade to unmetered, not errors.
+      expect(text).toContain("Tier: unmetered | Cost level: unmetered");
+      // A non-binary profile variant is listed in its own section.
+      expect(text).toContain("Declared routing variants");
+      expect(text).toContain("== codex-medium (variant) ==");
+      expect(text).toContain("Tier: medium | Cost level: 3");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

@@ -310,4 +310,53 @@ describe("core/session", () => {
       .filter((file) => file.startsWith(`${path.basename(tempStoragePath)}.corrupt-`));
     expect(corruptSiblings).toHaveLength(0);
   });
+
+  it("stores and reads the compact summary sidecar without touching history (T2.3)", () => {
+    const session = sessionManager.createSession({
+      agent: "codex",
+      cwd: "/test/path",
+      role: "worker",
+    });
+    expect(sessionManager.getSummary(session.id)).toBeUndefined();
+
+    expect(
+      sessionManager.setSummary(session.id, {
+        text: "Compact handoff summary",
+        summarizedTurns: 3,
+        createdAt: new Date().toISOString(),
+      }),
+    ).toBe(true);
+
+    const summary = sessionManager.getSummary(session.id);
+    expect(summary?.text).toBe("Compact handoff summary");
+    expect(summary?.summarizedTurns).toBe(3);
+
+    // The sidecar lives beside history, never inside it.
+    sessionManager.addHistory(session.id, {
+      role: "worker",
+      task: "later turn",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "ok",
+    });
+    expect(sessionManager.getSession(session.id)?.history).toHaveLength(1);
+    expect(sessionManager.getSummary(session.id)?.text).toBe("Compact handoff summary");
+
+    // Overwriting replaces the previous snapshot.
+    sessionManager.setSummary(session.id, {
+      text: "Refreshed",
+      summarizedTurns: 4,
+      createdAt: new Date().toISOString(),
+    });
+    expect(sessionManager.getSummary(session.id)?.summarizedTurns).toBe(4);
+
+    expect(
+      sessionManager.setSummary("bridge-sess_missing", {
+        text: "orphan",
+        summarizedTurns: 1,
+        createdAt: new Date().toISOString(),
+      }),
+    ).toBe(false);
+    expect(sessionManager.getSummary("bridge-sess_missing")).toBeUndefined();
+  });
 });

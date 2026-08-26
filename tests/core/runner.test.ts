@@ -49,6 +49,31 @@ class MockAdapter extends BaseAdapter {
   }
 }
 
+const COMPACT_SUMMARY_FIXTURE =
+  "<analysis>\nprivate scratch that must not reach the sidecar\n</analysis>\n" +
+  "<summary>\n1. Original Intent: mocked intent\n7. Current State and Key Data: STATE_SENTINEL\n" +
+  "完整原文存于 Bridge session 'src' ，需要细节请按需读取。\n</summary>";
+
+/** Serves a fixed eight-section summary whenever it receives a summary task. */
+class SummarizerAdapter extends MockAdapter {
+  protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+    if (options.task.includes("TRIGGER_ERROR")) {
+      throw new Error("Simulated agent error");
+    }
+    this.lastRunOptions = options;
+    if (!options.task.includes("<summary>")) return super.runViaCli(options);
+    return {
+      status: "success",
+      agent: this.name,
+      summary: "Produced handoff summary",
+      output: "summary written",
+      finalAnswer: COMPACT_SUMMARY_FIXTURE,
+      exitCode: 0,
+      durationMs: 5,
+    };
+  }
+}
+
 describe("core/runner", () => {
   let runner: MultiAgentRunner;
   let registry: AgentRegistry;
@@ -669,6 +694,113 @@ describe("core/runner", () => {
     expect(mock.lastRunOptions?.historyContext).toContain("[truncated]");
   });
 
+  it("keeps the environment snapshot intact while upstream conclusions saturate their own budget (T2.4)", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Oversized upstream report",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "big",
+      finalAnswer: "y".repeat(30_000),
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume saturated upstream",
+      contextSessionId: created.id,
+    });
+
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    // Upstream conclusions are capped at their own 12k segment (single source).
+    expect(context).toContain("[truncated]");
+    expect(context.length).toBeLessThan(16_000);
+    // The environment snapshot survives intact regardless of upstream bloat.
+    expect(context).toContain("Current repository: head=");
+    expect(context.match(/Current repository:/g)).toHaveLength(1);
+    expect(context).not.toContain("run git status for full detail");
+  });
+
+  it("caps each shared turn's task-description echo with an explicit marker (T2.4)", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    const oversizedTask = `${"t".repeat(5_900)}TAIL_SENTINEL`;
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: oversizedTask,
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "done",
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume long historical task text",
+      contextSessionId: created.id,
+    });
+
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain("... [truncated]");
+    expect(context).not.toContain("TAIL_SENTINEL");
+    const taskLine = context.split("\n").find((line) => line.startsWith("Task: "));
+    expect(taskLine!.length).toBeLessThanOrEqual("Task: ".length + 4_000);
+  });
+
+  it("truncates an oversized environment snapshot and appends the git-status remediation hint (T2.4)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-envsnap-"));
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      fs.writeFileSync(path.join(projectRoot, "seed.ts"), "export const seed = 1;\n");
+      execFileSync("git", ["add", "seed.ts"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+      // ~45 long untracked paths push the rendered evidence line past 2k chars.
+      for (let i = 0; i < 45; i++) {
+        fs.writeFileSync(
+          path.join(projectRoot, `untracked-${"p".repeat(48)}-${i}.ts`),
+          `export const v${i} = ${i};\n`,
+        );
+      }
+
+      const source = await runner.delegateTask({
+        agent: "codex",
+        task: "Seed source in dirty repo",
+        cwd: projectRoot,
+      });
+      await runner.delegateTask({
+        agent: "codex",
+        task: "Consume from the same dirty repo",
+        cwd: projectRoot,
+        contextSessionId: source.sessionId,
+      });
+
+      const context = mock.lastRunOptions?.historyContext ?? "";
+      expect(context).toContain("... [truncated]");
+      expect(context).toContain("run git status for full detail");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it("honors RunnerOptions timeout and session storage overrides", async () => {
     const sessionStoragePath = path.join(
       os.tmpdir(),
@@ -974,5 +1106,402 @@ describe("core/runner", () => {
     expect(hint).toContain("--test-isolation=none");
     expect(sandboxSpawnHint("codex", "cli", { output: "spawn EPERM" })).toBeUndefined();
     expect(sandboxSpawnHint("codex", "mcp", { output: "all good" })).toBeUndefined();
+  });
+
+  it("compacts a source session into a fresh sidecar and injects summary plus pointer downstream (T2.3)", async () => {
+    const summarizer = new SummarizerAdapter();
+    registry.register(summarizer);
+    const source = await runner.delegateTask({ agent: "codex", task: "Build the feature" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "Original detailed work",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "did things",
+      finalAnswer: "FULL_TEXT_SENTINEL only visible without a fresh summary",
+    });
+    const sessionsBefore = runner.listSessions().length;
+
+    const { outcomes } = await runner.compactContext({
+      sourceSessionIds: [source.sessionId!],
+    });
+
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]?.status).toBe("summarized");
+    expect(outcomes[0]?.truncated).toBe(false);
+    expect(outcomes[0]?.summarizedTurns).toBe(2);
+
+    // The sidecar lives on the SOURCE session; analysis draft was stripped.
+    const stored = sessionManager.getSummary(source.sessionId!);
+    expect(stored?.text).toContain("mocked intent");
+    expect(stored?.text).not.toContain("private scratch");
+    expect(stored?.text).toContain("需要细节请按需读取");
+
+    // The throwaway summarization session left no residue.
+    expect(runner.listSessions()).toHaveLength(sessionsBefore);
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume compacted source",
+      contextSessionIds: [source.sessionId!],
+    });
+    const context = summarizer.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain(
+      "[Semantic summary via compact_context covering all 2 recorded turn(s)]",
+    );
+    expect(context).toContain("STATE_SENTINEL");
+    expect(context).toContain("use get_session to read specifics on demand");
+    expect(context).not.toContain("FULL_TEXT_SENTINEL");
+  });
+
+  it("falls back to full transcript injection when the source gains turns after compaction (T2.3 STALE)", async () => {
+    const summarizer = new SummarizerAdapter();
+    registry.register(summarizer);
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed work" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "Original detailed work",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "did things",
+      finalAnswer: "FULL_TEXT_SENTINEL",
+    });
+    const first = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    expect(first.outcomes[0]?.status).toBe("summarized");
+
+    // A new turn invalidates the snapshot: rendering returns to full history.
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "NEW_TURN_AFTER_COMPACT",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "progressed",
+    });
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume grown source",
+      contextSessionIds: [source.sessionId!],
+    });
+    const context = summarizer.lastRunOptions?.historyContext ?? "";
+    expect(context).not.toContain("[Semantic summary via compact_context");
+    expect(context).toContain("NEW_TURN_AFTER_COMPACT");
+    expect(context).toContain("FULL_TEXT_SENTINEL");
+  });
+
+  it("marks and truncates oversized summaries at the token budget (T2.3)", async () => {
+    class GiantSummarizer extends MockAdapter {
+      override readonly name: AgentName = "claude";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "success",
+          agent: this.name,
+          summary: "giant summary",
+          output: "giant",
+          finalAnswer: `<analysis>x</analysis><summary>${"G".repeat(9_000)}</summary>`,
+          exitCode: 0,
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new GiantSummarizer());
+    const source = sessionManager.createSession({
+      agent: "claude",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(source.id, {
+      role: "worker",
+      task: "seed",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "seeded",
+    });
+
+    const { outcomes } = await runner.compactContext({ sourceSessionIds: [source.id] });
+
+    expect(outcomes[0]?.status).toBe("summarized");
+    expect(outcomes[0]?.truncated).toBe(true);
+    const stored = sessionManager.getSummary(source.id);
+    expect(stored?.text.length).toBeLessThanOrEqual(8_000);
+    expect(stored?.text).toContain("[summary truncated]");
+    expect(stored?.text).not.toContain("<analysis>");
+  });
+
+  it("deduplicates concurrent compactions of the same source session with an in-flight notice (T2.3)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class BlockingSummarizer extends SummarizerAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        if (options.task.includes("<summary>")) {
+          await gate;
+        }
+        return super.runViaCli(options);
+      }
+    }
+    registry.register(new BlockingSummarizer());
+
+    const source = await runner.delegateTask({ agent: "codex", task: "Seed for concurrency" });
+    sessionManager.addHistory(source.sessionId!, {
+      role: "worker",
+      task: "extra turn",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "ok",
+    });
+
+    const first = runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    const second = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+    expect(second.outcomes[0]?.status).toBe("in-flight");
+    expect(second.outcomes[0]?.reason).toContain("already running");
+
+    release();
+    const firstOutcome = (await first).outcomes[0];
+    expect(firstOutcome?.status).toBe("summarized");
+    expect(sessionManager.getSummary(source.sessionId!)).toBeDefined();
+  });
+
+  it("records failed compaction without writing a sidecar or leaving scratch sessions", async () => {
+    registry.register(new SummarizerAdapter());
+    // The failing marker rides inside the source turn, so the summarization
+    // prompt carries it into the mock adapter's rejection branch.
+    const source = await runner.delegateTask({ agent: "codex", task: "TRIGGER_ERROR seed" });
+    expect(source.status).toBe("failed");
+
+    const { outcomes } = await runner.compactContext({ sourceSessionIds: [source.sessionId!] });
+
+    expect(outcomes[0]?.status).toBe("failed");
+    expect(outcomes[0]?.reason).toContain("Simulated agent error");
+    expect(sessionManager.getSummary(source.sessionId!)).toBeUndefined();
+    expect(runner.listSessions()).toHaveLength(1);
+  });
+
+  it("assembles a routing table with metadata, variants, and recent diagnostics (T4.2)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-route-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { worker: "codex" },
+          agents: {
+            codex: {
+              tier: "strong",
+              costLevel: 5,
+              strengths: ["deep review"],
+              notGoodAt: [],
+              notes: "strong lane",
+              candidates: ["codex-medium"],
+            },
+            "codex-medium": { tier: "medium", costLevel: 3 },
+          },
+        }),
+      );
+
+      const bound = sessionManager.createSession({
+        agent: "codex",
+        cwd: projectRoot,
+        role: "worker",
+      });
+      sessionManager.addHistory(bound.id, {
+        role: "worker",
+        task: "diagnostic probe",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "ok",
+        capabilityDiagnostics: ["Capability diagnostic: model 'x' was requested but ignored"],
+      });
+
+      const table = await runner.getAgentRoutingTable(projectRoot);
+
+      expect(table.source).toBe("configured");
+      const codex = table.entries.find((entry) => entry.name === "codex");
+      expect(codex?.metadata?.tier).toBe("strong");
+      expect(codex?.metadata?.candidates).toEqual(["codex-medium"]);
+      expect(codex?.recentCapabilityDiagnostics).toContain(
+        "Capability diagnostic: model 'x' was requested but ignored",
+      );
+      // A channel with no declared metadata is present but unadorned.
+      const claude = table.entries.find((entry) => entry.name === "claude");
+      expect(claude?.metadata).toBeUndefined();
+      expect(claude).toBeDefined();
+      // Non-binary tier variants are surfaced separately.
+      expect(table.variants.map((variant) => variant.key)).toEqual(["codex-medium"]);
+      expect(table.variants[0]?.metadata.costLevel).toBe(3);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades the routing table to unconfigured without failing (T4.2)", async () => {
+    const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-noroute-"));
+    try {
+      const table = await runner.getAgentRoutingTable(plainRoot);
+      expect(table.source).toBe("unconfigured");
+      expect(table.configWarning).toBeUndefined();
+      expect(table.variants).toHaveLength(0);
+      expect(table.entries.length).toBeGreaterThanOrEqual(6);
+    } finally {
+      fs.rmSync(plainRoot, { recursive: true, force: true });
+    }
+  });
+
+  function writeRoutingProject(config: Record<string, unknown>): string {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-hint-"));
+    fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+    fs.writeFileSync(path.join(projectRoot, ".agentmesh", "config.json"), JSON.stringify(config));
+    return projectRoot;
+  }
+
+  it("attaches costLevel-sorted nextCandidates on upgradeable failures (T4.4)", async () => {
+    class RejectingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "failed",
+          agent: this.name,
+          summary: "vendor refused the request",
+          output: "refused",
+          error: "model rejected",
+          errorCode: "MODEL_REJECTED",
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new RejectingAdapter());
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: {
+        codex: {
+          tier: "weak",
+          costLevel: 2,
+          candidates: ["grok", "claude", "antigravity", "zcode"],
+        },
+        claude: { tier: "medium", costLevel: 3 },
+        antigravity: { tier: "medium", costLevel: 2 },
+        zcode: { tier: "weak", costLevel: 1 },
+      },
+    });
+    try {
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "Upgradeable failure probe",
+        cwd: projectRoot,
+      });
+
+      expect(res.status).toBe("failed");
+      expect(res.errorCode).toBe("MODEL_REJECTED");
+      // Unmetered grok sorts last and is cut by the ≤3 cap.
+      expect(res.warning).toContain("hint.nextCandidates=[zcode, antigravity, claude]");
+      expect(res.warning).toContain("nothing is auto-redelivered");
+
+      // SANDBOX_UNAVAILABLE is equally upgradeable.
+      class SandboxAdapter extends RejectingAdapter {
+        protected override async runViaCli(): Promise<AgentResult> {
+          return {
+            status: "failed",
+            agent: this.name,
+            summary: "sandbox missing",
+            output: "",
+            error: "sandbox unavailable on this platform",
+            errorCode: "SANDBOX_UNAVAILABLE",
+            durationMs: 5,
+          };
+        }
+      }
+      registry.register(new SandboxAdapter());
+      const sandboxRes = await runner.delegateTask({
+        agent: "codex",
+        task: "Sandbox failure probe",
+        cwd: projectRoot,
+      });
+      expect(sandboxRes.warning).toContain("hint.nextCandidates=");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("filters nextCandidates by capability match before sorting (T4.4)", async () => {
+    class RejectingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "failed",
+          agent: this.name,
+          summary: "vendor refused the model",
+          output: "refused",
+          error: "model rejected by vendor",
+          errorCode: "MODEL_REJECTED",
+          transportUsed: "cli",
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new RejectingAdapter());
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: {
+        codex: {
+          tier: "weak",
+          costLevel: 2,
+          candidates: ["codex-strong", "claude", "antigravity"],
+        },
+        "codex-strong": { tier: "strong", costLevel: 5 },
+        claude: { tier: "medium", costLevel: 3 },
+        antigravity: { tier: "medium", costLevel: 2 },
+      },
+    });
+    // The declared capabilities matrix restricts codex CLI models; a candidate
+    // backed by codex would ignore the requested model again and is filtered.
+    fs.writeFileSync(
+      path.join(projectRoot, ".agentmesh", "capabilities.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        generatedBy: { packageVersion: "0.0.0", at: "2026-01-01T00:00:00.000Z" },
+        configVersion: 1,
+        capabilities: {
+          codex: { transports: { cli: { model: { supported: true, values: ["good-model"] } } } },
+        },
+        provenance: { source: "manual", commands: [] },
+      }),
+    );
+    try {
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "Capability-filtered hint probe",
+        cwd: projectRoot,
+        model: "bad-model",
+      });
+
+      expect(res.errorCode).toBe("MODEL_REJECTED");
+      expect(res.warning).toContain("hint.nextCandidates=[antigravity, claude]");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("omits upgrade hints for non-upgradeable failures or undeclared chains (T4.4)", async () => {
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: { codex: { tier: "weak", costLevel: 2 } },
+    });
+    try {
+      const unclassified = await runner.delegateTask({
+        agent: "codex",
+        task: "TRIGGER_ERROR",
+        cwd: projectRoot,
+      });
+      expect(unclassified.status).toBe("failed");
+      expect(unclassified.warning ?? "").not.toContain("hint.nextCandidates");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

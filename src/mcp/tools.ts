@@ -8,6 +8,7 @@ import type { AgentResult } from "../agents/types.js";
 import { BackgroundTaskNotFoundError, BackgroundTaskRegistry } from "../core/background.js";
 import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
 import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
+import type { AgentMetadata } from "../core/config.js";
 import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
@@ -456,6 +457,41 @@ async function formatResultForMcp(
   });
 }
 
+export const ListAgentsInputSchema = z.object({
+  cwd: NonBlankString.optional().describe(
+    "Project directory used to locate the nearest .agentmesh/config.json agents metadata (defaults to current directory)",
+  ),
+});
+
+export const CompactContextInputSchema = z.object({
+  sourceSessionIds: z
+    .array(NonBlankString)
+    .min(1)
+    .max(4)
+    .describe(
+      "Up to 4 Bridge sessions whose normalized history should be condensed into a semantic summary sidecar",
+    ),
+});
+
+/** Formats one routing-metadata field group, degrading to "unmetered" (T4.2). */
+function formatRoutingMetadata(metadata: AgentMetadata | undefined): string[] {
+  if (!metadata) {
+    return [
+      "Tier: unmetered | Cost level: unmetered",
+      "Strengths: unmetered | Not good at: unmetered",
+      "Notes: unmetered (no agents metadata declared for this channel in .agentmesh/config.json)",
+    ];
+  }
+  const lines = [
+    `Tier: ${metadata.tier ?? "unmetered"} | Cost level: ${metadata.costLevel ?? "unmetered"}`,
+    `Speed: ${metadata.speed ?? "unmetered"}`,
+    `Strengths: ${metadata.strengths?.length ? metadata.strengths.join(", ") : "unmetered"}`,
+    `Not good at: ${metadata.notGoodAt?.length ? metadata.notGoodAt.join(", ") : "unmetered"}`,
+  ];
+  lines.push(`Notes: ${metadata.notes ?? "unmetered"}`);
+  return lines;
+}
+
 export function registerMcpTools(
   server: McpServer,
   runner: MultiAgentRunner,
@@ -465,7 +501,15 @@ export function registerMcpTools(
   // delegate_task
   server.tool(
     "delegate_task",
-    "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json",
+    [
+      "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json.",
+      "",
+      "Delegation discipline (protocol-as-prompt):",
+      "1. Brief like a smart colleague who just walked in — NEVER delegate understanding: every instruction must carry concrete file paths and the exact intended change. Anti-pattern: 'based on your findings' — the downstream agent has only what you wrote, not your understanding.",
+      "2. Parallelism: fan out read-only tasks (research/review/analysis) freely; strictly serialize write tasks that touch the same set of files.",
+      "3. Continue-vs-fresh: send correction feedback back to the SAME session so error context carries over; run verification in a NEW session for fresh eyes; also start a new session when the direction was fundamentally wrong to avoid anchoring.",
+      "4. Define done: an implementation task is done only when the report includes actual test results and a summary of changes made.",
+    ].join("\n"),
     DelegateTaskInputSchema.shape,
     async (args: z.infer<typeof DelegateTaskInputSchema>, extra) => {
       try {
@@ -757,21 +801,47 @@ export function registerMcpTools(
     },
   );
 
-  // list_agents
+  // list_agents — T4.2 routing-table view
   server.tool(
     "list_agents",
-    "Lists all supported agent adapters and queries their current availability and binary presence on the host system",
-    {},
-    async () => {
+    "Routing table over all supported agent channels: live availability (eager scan), transport modes, declared sandbox level, self-declared routing metadata (tier / costLevel / strengths / notGoodAt / notes from .agentmesh/config.json), the candidates upgrade chain, and the most recent capability diagnostics. Read this once to plan every delegation; missing metadata is reported as unmetered rather than an error.",
+    ListAgentsInputSchema.shape,
+    async (args: z.infer<typeof ListAgentsInputSchema>) => {
       try {
-        const agents = await runner.listAgents();
+        const table = await runner.getAgentRoutingTable(args.cwd ?? process.cwd());
+        const sections: string[] = [
+          `Agent Routing Table (${table.entries.length} channels, ${table.variants.length} declared variants; metadata source: ${table.source})`,
+          ...(table.configWarning ? [`Config warning: ${table.configWarning}`] : []),
+        ];
+        for (const entry of table.entries) {
+          sections.push(
+            [
+              `== ${entry.name} (${entry.displayName}) ==`,
+              `Availability: ${entry.available ? "available" : "unavailable"}${entry.executablePath ? ` — ${entry.executablePath}` : ""}`,
+              ...(entry.availabilityNote ? [entry.availabilityNote] : []),
+              `Aliases: ${entry.aliases.length ? entry.aliases.join(", ") : "(none)"}`,
+              `Transports: ${entry.supportedTransports.join(", ")} (preferred: ${entry.preferredTransport})`,
+              `Sandbox declared: ${entry.sandboxMechanism}`,
+              ...formatRoutingMetadata(entry.metadata),
+              `Candidates chain: ${entry.metadata?.candidates?.length ? entry.metadata.candidates.join(" -> ") : "(none declared)"}`,
+              `Recent capability diagnostics: ${entry.recentCapabilityDiagnostics.length ? "\n  - " + entry.recentCapabilityDiagnostics.join("\n  - ") : "none recorded"}`,
+            ].join("\n"),
+          );
+        }
+        if (table.variants.length) {
+          sections.push("Declared routing variants (profile-backed tier entries):");
+          for (const variant of table.variants) {
+            sections.push(
+              [
+                `== ${variant.key} (variant) ==`,
+                ...formatRoutingMetadata(variant.metadata),
+                `Candidates chain: ${variant.metadata.candidates?.length ? variant.metadata.candidates.join(" -> ") : "(none declared)"}`,
+              ].join("\n"),
+            );
+          }
+        }
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(agents, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: sections.join("\n\n") }],
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
@@ -782,6 +852,45 @@ export function registerMcpTools(
               text: `Error listing agents: ${errorMsg}`,
             },
           ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // compact_context
+  server.tool(
+    "compact_context",
+    "Condenses each listed Bridge session's normalized history into a semantic summary sidecar using that session's own agent in one tool-free turn (≤2000 tokens). Downstream shared-context injection prefers a fresh summary plus a full-transcript pointer; any new turn on the source session invalidates the summary and falls back to the full transcript. Concurrent compactions of the same session are deduplicated with an in-flight notice.",
+    CompactContextInputSchema.shape,
+    async (args: z.infer<typeof CompactContextInputSchema>) => {
+      try {
+        const { outcomes } = await runner.compactContext({
+          sourceSessionIds: args.sourceSessionIds,
+        });
+        const sections = outcomes.map((outcome) => {
+          const header = `[Session: ${outcome.sourceSessionId} | Status: ${outcome.status.toUpperCase()}]`;
+          switch (outcome.status) {
+            case "summarized":
+              return [
+                `${header} Turns covered: ${outcome.summarizedTurns}${outcome.truncated ? " | Summary truncated" : ""}`,
+                outcome.summary ?? "",
+              ].join("\n");
+            case "in-flight":
+            case "skipped":
+            case "failed":
+              return `${header} ${outcome.reason ?? ""}`.trim();
+          }
+        });
+        const isError = outcomes.every((outcome) => outcome.status === "failed");
+        return {
+          content: [{ type: "text", text: sections.join("\n\n") }],
+          isError,
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Bridge Error in compact_context: ${errorMsg}` }],
           isError: true,
         };
       }

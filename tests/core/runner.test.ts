@@ -1349,4 +1349,159 @@ describe("core/runner", () => {
       fs.rmSync(plainRoot, { recursive: true, force: true });
     }
   });
+
+  function writeRoutingProject(config: Record<string, unknown>): string {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-hint-"));
+    fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+    fs.writeFileSync(path.join(projectRoot, ".agentmesh", "config.json"), JSON.stringify(config));
+    return projectRoot;
+  }
+
+  it("attaches costLevel-sorted nextCandidates on upgradeable failures (T4.4)", async () => {
+    class RejectingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "failed",
+          agent: this.name,
+          summary: "vendor refused the request",
+          output: "refused",
+          error: "model rejected",
+          errorCode: "MODEL_REJECTED",
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new RejectingAdapter());
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: {
+        codex: {
+          tier: "weak",
+          costLevel: 2,
+          candidates: ["grok", "claude", "antigravity", "zcode"],
+        },
+        claude: { tier: "medium", costLevel: 3 },
+        antigravity: { tier: "medium", costLevel: 2 },
+        zcode: { tier: "weak", costLevel: 1 },
+      },
+    });
+    try {
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "Upgradeable failure probe",
+        cwd: projectRoot,
+      });
+
+      expect(res.status).toBe("failed");
+      expect(res.errorCode).toBe("MODEL_REJECTED");
+      // Unmetered grok sorts last and is cut by the ≤3 cap.
+      expect(res.warning).toContain("hint.nextCandidates=[zcode, antigravity, claude]");
+      expect(res.warning).toContain("nothing is auto-redelivered");
+
+      // SANDBOX_UNAVAILABLE is equally upgradeable.
+      class SandboxAdapter extends RejectingAdapter {
+        protected override async runViaCli(): Promise<AgentResult> {
+          return {
+            status: "failed",
+            agent: this.name,
+            summary: "sandbox missing",
+            output: "",
+            error: "sandbox unavailable on this platform",
+            errorCode: "SANDBOX_UNAVAILABLE",
+            durationMs: 5,
+          };
+        }
+      }
+      registry.register(new SandboxAdapter());
+      const sandboxRes = await runner.delegateTask({
+        agent: "codex",
+        task: "Sandbox failure probe",
+        cwd: projectRoot,
+      });
+      expect(sandboxRes.warning).toContain("hint.nextCandidates=");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("filters nextCandidates by capability match before sorting (T4.4)", async () => {
+    class RejectingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return {
+          status: "failed",
+          agent: this.name,
+          summary: "vendor refused the model",
+          output: "refused",
+          error: "model rejected by vendor",
+          errorCode: "MODEL_REJECTED",
+          transportUsed: "cli",
+          durationMs: 5,
+        };
+      }
+    }
+    registry.register(new RejectingAdapter());
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: {
+        codex: {
+          tier: "weak",
+          costLevel: 2,
+          candidates: ["codex-strong", "claude", "antigravity"],
+        },
+        "codex-strong": { tier: "strong", costLevel: 5 },
+        claude: { tier: "medium", costLevel: 3 },
+        antigravity: { tier: "medium", costLevel: 2 },
+      },
+    });
+    // The declared capabilities matrix restricts codex CLI models; a candidate
+    // backed by codex would ignore the requested model again and is filtered.
+    fs.writeFileSync(
+      path.join(projectRoot, ".agentmesh", "capabilities.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        generatedBy: { packageVersion: "0.0.0", at: "2026-01-01T00:00:00.000Z" },
+        configVersion: 1,
+        capabilities: {
+          codex: { transports: { cli: { model: { supported: true, values: ["good-model"] } } } },
+        },
+        provenance: { source: "manual", commands: [] },
+      }),
+    );
+    try {
+      const res = await runner.delegateTask({
+        agent: "codex",
+        task: "Capability-filtered hint probe",
+        cwd: projectRoot,
+        model: "bad-model",
+      });
+
+      expect(res.errorCode).toBe("MODEL_REJECTED");
+      expect(res.warning).toContain("hint.nextCandidates=[antigravity, claude]");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("omits upgrade hints for non-upgradeable failures or undeclared chains (T4.4)", async () => {
+    const projectRoot = writeRoutingProject({
+      version: 1,
+      roles: { worker: "codex" },
+      agents: { codex: { tier: "weak", costLevel: 2 } },
+    });
+    try {
+      const unclassified = await runner.delegateTask({
+        agent: "codex",
+        task: "TRIGGER_ERROR",
+        cwd: projectRoot,
+      });
+      expect(unclassified.status).toBe("failed");
+      expect(unclassified.warning ?? "").not.toContain("hint.nextCandidates");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
 });

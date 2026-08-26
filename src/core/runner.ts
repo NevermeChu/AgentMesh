@@ -13,7 +13,13 @@ import type {
 } from "../agents/types.js";
 import { defaultRegistry } from "../agents/registry.js";
 import type { AgentRegistry } from "../agents/registry.js";
-import { evaluateModelOptionSupport } from "./capabilities.js";
+import {
+  evaluateModelOptionSupport,
+  getCapability,
+  readCapabilities,
+  staticCapabilities,
+} from "./capabilities.js";
+import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
@@ -49,6 +55,9 @@ export const UPGRADEABLE_ERROR_CODES: readonly ErrorCode[] = [
   "MODEL_REJECTED",
   "SANDBOX_UNAVAILABLE",
 ];
+
+/** Upper bound for hint.nextCandidates suggestions attached to a failed dispatch. */
+const MAX_UPGRADE_HINTS = 3;
 
 /** Terminal-result tombstone TTL for idempotency keys (P1 T1.1). */
 export const DEFAULT_IDEMPOTENCY_TTL_MS = 20 * 60 * 1000;
@@ -1178,6 +1187,28 @@ export class MultiAgentRunner {
         });
       }
 
+      // T4.4 failure-upgrade hint: advisory only, attached at the terminal
+      // failure exit so the orchestrator can reroute in one round trip.
+      if (
+        result.status === "failed" &&
+        UPGRADEABLE_ERROR_CODES.includes(result.errorCode as ErrorCode)
+      ) {
+        const nextCandidates = this.buildUpgradeHint({
+          declaredAgentKey: selectedAgent,
+          canonicalAgent: adapter.name,
+          requestedModel: effectiveRequestedModel,
+          requestedReasoningEffort: effectiveRequestedEffort,
+          transportUsed: result.transportUsed,
+          startDirectory: configCwd,
+        });
+        if (nextCandidates.length) {
+          const note =
+            `hint.nextCandidates=[${nextCandidates.join(", ")}] (upgrade suggestions ordered by costLevel; ` +
+            "the decision stays with the orchestrator — nothing is auto-redelivered)";
+          result.warning = [result.warning, note].filter(Boolean).join(" ");
+        }
+      }
+
       return result;
     } finally {
       inFlight.finish();
@@ -1548,6 +1579,91 @@ export class MultiAgentRunner {
       truncated,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /**
+   * T4.4 failure-upgrade hint builder. When a dispatch failed with an
+   * upgradeable error code and the failed agent declares a candidates chain,
+   * this resolves up to three next-hop suggestions: capability-checked via
+   * evaluateModelOptionSupport (candidates whose transport would ignore the
+   * requested model/effort again are dropped), ordered by declared costLevel
+   * ascending (unmetered entries last, declaration order kept for ties).
+   * Purely advisory output — nothing is ever auto-redelivered.
+   */
+  private buildUpgradeHint(params: {
+    declaredAgentKey: string;
+    canonicalAgent: AgentName;
+    requestedModel?: string;
+    requestedReasoningEffort?: ReasoningEffort;
+    transportUsed?: "mcp" | "cli";
+    startDirectory?: string;
+  }): string[] {
+    let metadataMap: Record<string, AgentMetadata> | undefined;
+    try {
+      metadataMap = loadProjectConfig(params.startDirectory ?? process.cwd())?.config.agents;
+    } catch {
+      return [];
+    }
+    const chain =
+      metadataMap?.[params.declaredAgentKey]?.candidates ??
+      metadataMap?.[params.canonicalAgent]?.candidates;
+    if (!chain?.length) return [];
+
+    let capabilities: CapabilitiesFile["capabilities"];
+    try {
+      capabilities = readCapabilities(params.startDirectory ?? process.cwd()).capabilities;
+    } catch {
+      capabilities = staticCapabilities();
+    }
+    const effectiveTransport: TransportMode = params.transportUsed ?? "cli";
+
+    /** True only with positive evidence that this option would be ignored again. */
+    const optionBlocked = (
+      base: AgentName,
+      field: "model" | "reasoningEffort",
+      value: string | undefined,
+    ): boolean => {
+      if (!value) return false;
+      const cap = getCapability(capabilities, base, effectiveTransport, field);
+      if (!cap) return false;
+      if (cap.supported === false) return true;
+      return Boolean(cap.values && !cap.values.includes(value));
+    };
+
+    /** Resolves a chain entry to its backing binary; profile variants map to their base agent. */
+    const baseOf = (key: string): AgentName | undefined => {
+      const direct = this.registry.resolveName(key);
+      if (direct) return direct;
+      const parts = key.split("-");
+      while (parts.length > 1) {
+        parts.pop();
+        const resolved = this.registry.resolveName(parts.join("-"));
+        if (resolved) return resolved;
+      }
+      return undefined;
+    };
+
+    const meetsCapability = (key: string): boolean => {
+      const base = baseOf(key);
+      // Opaque keys carry unknown capabilities; leave the judgment to the orchestrator.
+      if (!base) return true;
+      return (
+        !optionBlocked(base, "model", params.requestedModel) &&
+        !optionBlocked(base, "reasoningEffort", params.requestedReasoningEffort)
+      );
+    };
+
+    return chain
+      .filter((key) => {
+        if (key === params.declaredAgentKey || key === params.canonicalAgent) return false;
+        const base = baseOf(key);
+        return base !== params.canonicalAgent;
+      })
+      .filter(meetsCapability)
+      .map((key) => ({ key, cost: metadataMap?.[key]?.costLevel }))
+      .sort((a, b) => (a.cost ?? Number.POSITIVE_INFINITY) - (b.cost ?? Number.POSITIVE_INFINITY))
+      .slice(0, MAX_UPGRADE_HINTS)
+      .map((entry) => entry.key);
   }
 
   /**

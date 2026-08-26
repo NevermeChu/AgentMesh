@@ -69,7 +69,8 @@ export function findCapabilitiesPath(startDirectory: string): string | undefined
   return path.join(path.dirname(configPath), capabilityFileName);
 }
 
-function staticCapabilities(): CapabilitiesFile["capabilities"] {
+/** Exported for read-only consumers needing the built-in matrix as fallback. */
+export function staticCapabilities(): CapabilitiesFile["capabilities"] {
   const cliModel = { supported: true as const, flag: "--model" };
   const unsupportedMcp = {
     supported: false as const,
@@ -157,12 +158,17 @@ export function readCapabilities(startDirectory: string): CapabilitiesFile {
 }
 
 export function getCapability(
-  capabilities: CapabilitiesFile | undefined,
+  capabilities: CapabilitiesFile | CapabilitiesFile["capabilities"] | undefined,
   agent: AgentName,
   mode: TransportMode,
   field: "model" | "reasoningEffort",
 ): z.infer<typeof CapabilityValueSchema> | undefined {
-  return capabilities?.capabilities[agent]?.transports[mode]?.[field];
+  // Accepts either the whole file or bare capabilities map; boundary casts are
+  // isolated here and guarded by optional chaining.
+  const map: CapabilitiesFile["capabilities"] | undefined =
+    (capabilities as Partial<CapabilitiesFile>)?.capabilities ??
+    (capabilities as CapabilitiesFile["capabilities"] | undefined);
+  return map?.[agent]?.transports[mode]?.[field];
 }
 
 export function capabilityConfigSummary(

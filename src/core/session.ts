@@ -47,6 +47,18 @@ const TransportFallbackEvidenceSchema = z.object({
   to: z.enum(["mcp", "cli"]),
   reason: z.string(),
 });
+const ErrorCodeSchema = z.enum([
+  "TRANSIENT_5XX",
+  "SPAWN_FAILED",
+  "TIMEOUT",
+  "MODEL_REJECTED",
+  "SANDBOX_UNAVAILABLE",
+  "PARSE_FAILURE",
+  "ARG_REJECTED",
+  "CANCELLED",
+  "CIRCUIT_OPEN",
+  "BUDGET_EXHAUSTED",
+]);
 const SessionExecutionEvidenceSchema = z.object({
   repositoryBefore: RepositoryStateEvidenceSchema.optional(),
   repositoryAfter: RepositoryStateEvidenceSchema.optional(),
@@ -56,6 +68,7 @@ const SessionExecutionEvidenceSchema = z.object({
   timedOut: z.boolean().optional(),
   aborted: z.boolean().optional(),
   cancelReason: z.enum(["timeout", "client_cancel", "client_disconnect", "unknown"]).optional(),
+  errorCode: ErrorCodeSchema.optional(),
   cleanupMethod: z.enum(["taskkill-tree", "signal", "unknown"]).optional(),
   cleanupSucceeded: z.boolean().optional(),
   resourceEvidence: ResourceEvidenceSchema.optional(),

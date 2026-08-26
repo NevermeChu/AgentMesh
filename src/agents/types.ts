@@ -1,3 +1,5 @@
+import type { ErrorCode } from "../core/types.js";
+
 export type AgentName =
   | "codex"
   | "gemini"
@@ -70,6 +72,15 @@ export interface TransportFallbackEvidence {
   reason: string;
 }
 
+/** Token usage reported by a vendor for one executed turn (P2 metering). */
+export interface UsageInfo {
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningOutputTokens?: number;
+  totalTokens?: number;
+}
+
 export interface AgentResult {
   status: "success" | "failed";
   agent: AgentName;
@@ -81,6 +92,13 @@ export interface AgentResult {
   nativeSessionId?: string;
   exitCode?: number;
   error?: string;
+  /**
+   * Machine-readable normalized failure reason (P1 T1.2). Present only when the
+   * failure could be classified with confidence; never fabricated.
+   */
+  errorCode?: ErrorCode;
+  /** Vendor-reported token usage for this turn when the transport exposes it. */
+  usage?: UsageInfo;
   /** Non-fatal vendor diagnostics preserved alongside substantive output. */
   warning?: string;
   durationMs?: number;
@@ -104,6 +122,12 @@ export interface AgentResult {
   reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
   findings?: ReviewFinding[];
   reviewerSafety?: ReviewerSafetyReport;
+  /** Total attempts made for one logical execution, including retries (P1 T1.3). */
+  attempts?: number;
+  /** Estimated time until a rejected dispatch may be retried, in milliseconds. */
+  retryAfterMs?: number;
+  /** True when this result was replayed from an idempotency tombstone (P1 T1.1). */
+  replayed?: boolean;
 }
 
 export type SandboxMechanism = "native-sandbox" | "tool-filtering" | "prompt-only";

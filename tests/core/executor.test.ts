@@ -160,9 +160,9 @@ describe("core/executor", () => {
     try {
       process.env.PWD = "D:\\launcher\\directory";
       process.env.OLDPWD = "D:\\launcher\\previous";
-      const env = buildChildEnvironment(spawnCwd, { TASK_MARKER: "1" });
+      const env = buildChildEnvironment(spawnCwd, { NODE_ENV: "test-child" });
 
-      expect(env.TASK_MARKER).toBe("1");
+      expect(env.NODE_ENV).toBe("test-child");
       if (process.platform === "win32") {
         expect(env.PWD).toBeUndefined();
         expect(env.OLDPWD).toBeUndefined();
@@ -174,6 +174,28 @@ describe("core/executor", () => {
       else process.env.PWD = previousPwd;
       if (previousOldPwd === undefined) delete process.env.OLDPWD;
       else process.env.OLDPWD = previousOldPwd;
+    }
+  });
+
+  it("applies the env allowlist policy at the spawn boundary", () => {
+    const previousPath = process.env.PATH;
+    try {
+      const env = buildChildEnvironment(undefined, {
+        PATH: "D:/hijacked",
+        DOCKER_HOST: "tcp://evil.example:2375",
+        LD_PRELOAD: "/tmp/evil.so",
+        NO_COLOR: "1",
+      });
+      // Baseline keys are inherited from the AgentMesh process only.
+      expect(env.PATH).toBe(previousPath);
+      // Permanently blacklisted keys never reach the child, whatever their origin.
+      expect(env.DOCKER_HOST).toBeUndefined();
+      expect(env.LD_PRELOAD).toBeUndefined();
+      // Whitelisted overrides still flow through.
+      expect(env.NO_COLOR).toBe("1");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
     }
   });
 

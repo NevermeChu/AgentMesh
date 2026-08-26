@@ -15,7 +15,7 @@ describe.skipIf(process.platform === "win32")("core/executor posix group cleanup
       script,
       [
         "#!/bin/sh",
-        `"${process.execPath}" -e "setInterval(() => require('node:fs').writeFileSync(${JSON.stringify(heartbeat)}, String(Date.now())), 100)" &`,
+        `"${process.execPath}" -e "setInterval(() => require('node:fs').writeFileSync(process.env.AGENTMESH_HEARTBEAT_FILE, String(Date.now())), 100)" &`,
         "wait",
       ].join("\n"),
       "utf8",
@@ -23,7 +23,10 @@ describe.skipIf(process.platform === "win32")("core/executor posix group cleanup
     await fs.chmod(script, 0o755);
 
     try {
-      const result = await executeCommand(script, [], { timeoutMs: 500 });
+      const result = await executeCommand(script, [], {
+        timeoutMs: 500,
+        env: { AGENTMESH_HEARTBEAT_FILE: heartbeat },
+      });
       expect(result.timedOut).toBe(true);
       expect(result.cleanupMethod).toBe("signal");
 

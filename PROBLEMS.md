@@ -597,3 +597,13 @@
 **解决方法**：teardown 前从 procfs `/proc/<pid>/task/*/children` 递归快照仍存活的后代 PID（快照必须在根进程存活时进行，否则深层后代会重新挂到 init 失去追踪），`client.close()` 之后对幸存者补发 SIGKILL。测试增加 15s 显式超时，与项目内其他慢测试惯例一致。
 
 **状态**：已解决（2026-08-26）。Linux 上孤儿被收割、回归测试通过；Windows 路径不变；macOS 无 procfs 时保持原有行为并在代码注释中如实说明。
+
+## P-061 posix executor 集成测试的 shell 引号注入导致脚本秒退（首次在 CI 上真正执行即失败）
+
+**问题**：`executor.integ.ts` 的 posix 进程组清理测试在 ubuntu CI 上 81ms 内断言失败（`timedOut` 为 false）。该测试 `skipIf(win32)` 且诞生于最后一次全绿 CI 之后，此前每次 CI 都在更早阶段失败而从未真正执行过它。
+
+**根因**：生成的 sh 脚本用双引号包裹 `-e` 的 JS 代码，又把 `JSON.stringify(heartbeat)` 的带引号路径插值进同一段双引号内——路径的双引号提前闭合了 shell 引号，路径以裸 token 进入 JS：`/tmp/...` 被 V8 解析为正则字面量，`writeFileSync(regex.txt, ...)` 抛 TypeError，后台 node 立即退出、`wait` 随即返回，进程远早于 500ms 超时结束。作者在 Windows 上开发时该测试被跳过，无法暴露。
+
+**解决方法**：心跳路径改经 `executeCommand` 的任务级环境变量（`AGENTMESH_HEARTBEAT_FILE`）传入子进程，脚本内引用 `process.env`，彻底消除对生成脚本的内插值注入；不再依赖路径不含空格/特殊字符的隐含假设。
+
+**状态**：已解决（2026-08-26）；教训：POSIX-only 测试在 Windows 开发机上不可见，依赖 CI 才能执行，生成 shell 脚本时禁止向引号定界符内部插值含引号的值。

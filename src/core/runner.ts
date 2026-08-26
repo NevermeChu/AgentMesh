@@ -19,15 +19,26 @@ import { captureRepositoryState } from "./repository.js";
 import { truncateText } from "./text.js";
 import type {
   BridgeSession,
+  ErrorCode,
+  IdempotencyTombstone,
   RepositoryStateEvidence,
   RunnerOptions,
   SessionExecutionEvidence,
   SessionHistoryEntry,
   SharedContextAudit,
 } from "./types.js";
+import { idempotencyScopeKey } from "./types.js";
 
 /** Upper bound for one delegated agent process when no timeout is configured anywhere. */
 export const DEFAULT_RUN_TIMEOUT_MS = 600_000;
+
+/** Terminal-result tombstone TTL for idempotency keys (P1 T1.1). */
+export const DEFAULT_IDEMPOTENCY_TTL_MS = 20 * 60 * 1000;
+
+interface IdempotencyInFlightEntry {
+  sessionId: string;
+  startedAtMs: number;
+}
 
 export interface DelegateTaskParams {
   agent?: string;
@@ -52,6 +63,13 @@ export interface DelegateTaskParams {
    * deliberately absent from the MCP input schemas.
    */
   reviewVerdictRequired?: boolean;
+  /**
+   * Deduplicates dispatches carrying the same key within one (cwd, agent)
+   * scope: while an execution is in flight callers receive an in-flight
+   * reference; after it reaches a terminal state, retries within the tombstone
+   * TTL replay the recorded result instead of re-executing (P1 T1.1).
+   */
+  idempotencyKey?: string;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
 }
@@ -464,6 +482,9 @@ export class MultiAgentRunner {
   private registry: AgentRegistry;
   private sessionManager: SessionManager;
   private readonly defaultTimeoutMs: number;
+  private readonly now: () => number;
+  private readonly idempotencyTtlMs: number;
+  private readonly idempotencyInFlight = new Map<string, IdempotencyInFlightEntry>();
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
@@ -477,6 +498,13 @@ export class MultiAgentRunner {
         ? new SessionManager({ storagePath: options.sessionStoragePath })
         : defaultSessionManager);
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
+    this.now = options.now ?? Date.now;
+    this.idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+  }
+
+  /** Number of idempotent dispatches currently registered as in flight; observable for tests/diagnostics. */
+  public get activeIdempotencyDispatches(): number {
+    return this.idempotencyInFlight.size;
   }
 
   private readonly inFlight = new Map<
@@ -531,6 +559,128 @@ export class MultiAgentRunner {
         settle();
       },
     };
+  }
+
+  /**
+   * P1 T1.1 idempotency branch resolution. Check-and-register is synchronous
+   * (no awaits between lookup and registration) so two concurrent dispatches
+   * with the same key cannot both pass the gate.
+   */
+  private resolveIdempotencyBranch(params: { scopeKey: string; key: string }):
+    | { branch: "execute" }
+    | { branch: "in-flight"; entry: IdempotencyInFlightEntry }
+    | {
+        branch: "replay";
+        tombstone: IdempotencyTombstone;
+      } {
+    const live = this.idempotencyInFlight.get(params.scopeKey);
+    if (live) return { branch: "in-flight", entry: live };
+    const tombstone = this.sessionManager.getIdempotencyTombstone(params.scopeKey, this.now());
+    if (tombstone) return { branch: "replay", tombstone };
+    return { branch: "execute" };
+  }
+
+  /** In-flight duplicate response: a reference to the running execution, not a result. */
+  private formatInFlightReference(params: {
+    key: string;
+    entry: IdempotencyInFlightEntry;
+    agent: AgentName;
+    startTime: number;
+  }): AgentResult {
+    const startedAt = new Date(params.entry.startedAtMs).toISOString();
+    const summary =
+      `Duplicate dispatch suppressed by idempotency key '${params.key}': ` +
+      "an identical execution is already in flight.";
+    const output =
+      `An execution with this idempotency key started at ${startedAt} and is running in ` +
+      `session '${params.entry.sessionId}'. Wait for it to finish, then re-send the SAME key to ` +
+      "receive the replayed terminal result. Use a different key only for an intentionally distinct task.";
+    return {
+      status: "failed",
+      agent: params.agent,
+      sessionId: params.entry.sessionId,
+      summary,
+      output,
+      error: `duplicate_in_flight: an execution with idempotency key '${params.key}' is already running`,
+      durationMs: Date.now() - params.startTime,
+    };
+  }
+
+  /**
+   * Builds the replayed terminal result recorded under a tombstone. Returns
+   * undefined when the referenced turn is no longer retrievable (evicted from
+   * the capped history); the caller then degrades to a normal execution.
+   */
+  private formatReplayedResult(params: {
+    tombstone: IdempotencyTombstone;
+    key: string;
+    fallbackAgent: AgentName;
+    currentFingerprint?: string;
+  }): AgentResult | undefined {
+    const { tombstone } = params;
+    const session = this.sessionManager.getSession(tombstone.sessionId);
+    const turn = session?.history[tombstone.turnNumber - 1];
+    if (!session || !turn) return undefined;
+
+    const warnings: string[] = [];
+    if (
+      tombstone.repositoryFingerprint &&
+      params.currentFingerprint &&
+      tombstone.repositoryFingerprint !== params.currentFingerprint
+    ) {
+      warnings.push(
+        "Freshness STALE: the repository fingerprint changed since the replayed turn completed; " +
+          "its results may refer to outdated evidence. Re-execute with a new idempotency key if current-state output is required.",
+      );
+    }
+    warnings.push(
+      `This result was replayed from the idempotency tombstone of key '${params.key}' ` +
+        "(no new agent execution was started).",
+    );
+
+    return {
+      status: turn.status,
+      agent: session.agent,
+      sessionId: session.id,
+      summary: `[idempotent replay] ${turn.summary}`,
+      output: turn.finalAnswer || turn.summary || "",
+      finalAnswer: turn.finalAnswer,
+      findings: turn.findings ? structuredClone(turn.findings) : undefined,
+      nativeSessionId: turn.nativeSessionId,
+      exitCode: turn.evidence?.exitCode,
+      errorCode: tombstone.errorCode,
+      durationMs: turn.evidence?.durationMs,
+      timedOut: turn.evidence?.timedOut,
+      aborted: turn.evidence?.aborted,
+      transportUsed: turn.evidence?.transportUsed,
+      warning: warnings.join(" "),
+      replayed: true,
+    };
+  }
+
+  /** Records the terminal tombstone for one keyed dispatch (called after the turn is persisted). */
+  private recordIdempotencyTombstone(params: {
+    scopeKey: string;
+    key: string;
+    sessionId: string;
+    turnNumber: number;
+    outcome: "completed" | "failed";
+    repositoryFingerprint?: string;
+    errorCode?: ErrorCode;
+  }): void {
+    const completedAtMs = this.now();
+    this.sessionManager.setIdempotencyTombstone(params.scopeKey, {
+      key: params.key,
+      sessionId: params.sessionId,
+      turnNumber: params.turnNumber,
+      outcome: params.outcome,
+      ...(params.repositoryFingerprint
+        ? { repositoryFingerprint: params.repositoryFingerprint }
+        : {}),
+      ...(params.errorCode ? { errorCode: params.errorCode } : {}),
+      completedAtMs,
+      expiresAtMs: completedAtMs + this.idempotencyTtlMs,
+    });
   }
 
   /**
@@ -745,6 +895,45 @@ export class MultiAgentRunner {
     const effectiveRequestedEffort =
       params.reasoningEffort ?? roleResolution.assignment?.reasoningEffort;
 
+    // P1 T1.1 idempotency gate: check-and-register runs synchronously so
+    // concurrent duplicates cannot slip between lookup and registration. It is
+    // placed after every validation early-return so pre-wire rejections never
+    // register a key ("only accept when the dispatch really goes out").
+    let idempotencyScope: string | undefined;
+    let idempotencyExecutionWarning: string | undefined;
+    if (params.idempotencyKey) {
+      idempotencyScope = idempotencyScopeKey(effectiveCwd, adapter.name, params.idempotencyKey);
+      const branch = this.resolveIdempotencyBranch({
+        scopeKey: idempotencyScope,
+        key: params.idempotencyKey,
+      });
+      if (branch.branch === "in-flight") {
+        return this.formatInFlightReference({
+          key: params.idempotencyKey,
+          entry: branch.entry,
+          agent: adapter.name,
+          startTime,
+        });
+      }
+      if (branch.branch === "replay") {
+        const currentRepository = await captureRepositoryState(effectiveCwd);
+        const replayed = this.formatReplayedResult({
+          tombstone: branch.tombstone,
+          key: params.idempotencyKey,
+          fallbackAgent: adapter.name,
+          currentFingerprint: currentRepository?.fingerprint,
+        });
+        if (replayed) return replayed;
+        idempotencyExecutionWarning =
+          `Idempotency key '${params.idempotencyKey}' holds a tombstone whose recorded turn is no longer ` +
+          "retrievable from the capped session history; executing again and refreshing the tombstone.";
+      }
+      this.idempotencyInFlight.set(idempotencyScope, {
+        sessionId: session.id,
+        startedAtMs: this.now(),
+      });
+    }
+
     const inFlight = this.beginInFlight(params.signal);
 
     // Pre-flight capability check against the transport that will actually be
@@ -828,6 +1017,9 @@ export class MultiAgentRunner {
       if (extraWarnings.length > 0) {
         result.warning = [result.warning, ...extraWarnings].filter(Boolean).join(" ");
       }
+      if (idempotencyExecutionWarning) {
+        result.warning = [result.warning, idempotencyExecutionWarning].filter(Boolean).join(" ");
+      }
 
       this.recordTurn({
         session,
@@ -845,9 +1037,26 @@ export class MultiAgentRunner {
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
       });
 
+      // Terminal boundary of the keyed dispatch: persist the tombstone so
+      // retries within the TTL replay this turn instead of re-executing.
+      if (idempotencyScope && params.idempotencyKey) {
+        const turnNumberAfterAppend =
+          this.sessionManager.getSession(session.id)?.history.length ?? 0;
+        this.recordIdempotencyTombstone({
+          scopeKey: idempotencyScope,
+          key: params.idempotencyKey,
+          sessionId: session.id,
+          turnNumber: turnNumberAfterAppend,
+          outcome: result.status === "success" ? "completed" : "failed",
+          repositoryFingerprint: repositoryAfter?.fingerprint,
+          errorCode: result.errorCode,
+        });
+      }
+
       return result;
     } finally {
       inFlight.finish();
+      if (idempotencyScope) this.idempotencyInFlight.delete(idempotencyScope);
     }
   }
 

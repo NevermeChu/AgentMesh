@@ -181,4 +181,8 @@ export interface SessionManagerOptions {
 export interface RunnerOptions {
   defaultTimeoutMs?: number;
   sessionStoragePath?: string;
+  /** Injectable clock for idempotency TTL/expiry decisions (tests). Default Date.now. */
+  now?: () => number;
+  /** Terminal-result tombstone TTL for idempotency keys. Default 20 minutes. */
+  idempotencyTtlMs?: number;
 }

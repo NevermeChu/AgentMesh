@@ -141,6 +141,14 @@ export const DelegateTaskInputSchema = z.object({
   baseCommit: NonBlankString.optional().describe(
     "Optional git base branch/commit for diff comparison",
   ),
+  idempotencyKey: NonBlankString.max(200)
+    .optional()
+    .describe(
+      "Optional deduplication key within the (cwd, agent) scope. While an identical dispatch is in " +
+        "flight, callers receive an in-flight reference instead of a second execution; after it reaches " +
+        "a terminal state, retries within a 20-minute window replay the recorded result (replayed:true) " +
+        "with a STALE warning when the repository changed since. Use a distinct key per logical task",
+    ),
 });
 
 export const ReviewChangesInputSchema = z.object({
@@ -253,6 +261,7 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             contextSessionId: args.contextSessionId,
             contextSessionIds: args.contextSessionIds,
             baseCommit: args.baseCommit,
+            idempotencyKey: args.idempotencyKey,
             signal: extra.signal,
           }),
         );

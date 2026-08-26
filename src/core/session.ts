@@ -4,7 +4,13 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { ZodError, z } from "zod";
 import type { AgentName, AgentRole } from "../agents/types.js";
-import type { BridgeSession, SessionHistoryEntry, SessionManagerOptions } from "./types.js";
+import type {
+  BridgeSession,
+  IdempotencyTombstone,
+  IdempotencyTombstoneStore,
+  SessionHistoryEntry,
+  SessionManagerOptions,
+} from "./types.js";
 
 const AgentNameSchema = z.enum([
   "codex",
@@ -157,6 +163,12 @@ export class SessionManager {
    * husk behind: a session becomes durable together with its first turn.
    */
   private unsavedSessions = new Set<string>();
+  /**
+   * Terminal-outcome tombstones for idempotency keys (P1 T1.1). Process-local
+   * by design: losing them across a bridge restart degrades to honest
+   * re-execution of the same key (documented boundary, not silent corruption).
+   */
+  private idempotencyTombstones: IdempotencyTombstoneStore = new Map();
 
   constructor(options: SessionManagerOptions = {}) {
     this.persist = options.persist ?? true;
@@ -516,6 +528,29 @@ export class SessionManager {
       // Audit artifacts are best-effort: losing one must not fail the turn.
       return undefined;
     }
+  }
+
+  /**
+   * Looks up the live tombstone for an idempotency scope key. Expired
+   * tombstones are treated as absent and dropped eagerly (lazy expiry is the
+   * authoritative TTL check; `nowMs` is injectable for tests).
+   */
+  public getIdempotencyTombstone(
+    scopeKey: string,
+    nowMs: number = Date.now(),
+  ): IdempotencyTombstone | undefined {
+    const tombstone = this.idempotencyTombstones.get(scopeKey);
+    if (!tombstone) return undefined;
+    if (nowMs >= tombstone.expiresAtMs) {
+      this.idempotencyTombstones.delete(scopeKey);
+      return undefined;
+    }
+    return structuredClone(tombstone);
+  }
+
+  /** Records (or overwrites) the terminal tombstone for an idempotency scope key. */
+  public setIdempotencyTombstone(scopeKey: string, tombstone: IdempotencyTombstone): void {
+    this.idempotencyTombstones.set(scopeKey, structuredClone(tombstone));
   }
 
   /**

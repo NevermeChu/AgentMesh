@@ -286,5 +286,40 @@ describe("cli/config validate", () => {
         logSpy.mockRestore();
       }
     });
+
+    it("keeps exit-worthy result positive when only warnings are present", () => {
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      try {
+        renderConfigValidationReport({
+          issues: [
+            {
+              severity: "warning",
+              field: "agents.codex-strong",
+              message: "'codex-strong' is not a registered agent name or alias.",
+              fix: "Provision the matching profile file.",
+            },
+          ],
+          summary: { errors: 0, warnings: 1 },
+        });
+        const output = logSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+        expect(output).toContain("[WARN]  agents.codex-strong");
+        expect(output).not.toContain("[ERROR]");
+        expect(output).toContain("Result: valid, with warnings.");
+      } finally {
+        logSpy.mockRestore();
+      }
+    });
+
+    it("treats alias-resolving candidates as valid chain terminators", () => {
+      const issues = collectConfigSemanticIssues(
+        {
+          version: 1,
+          roles: {},
+          agents: { zcode: { tier: "weak", candidates: ["codex"] } },
+        },
+        resolver,
+      );
+      expect(issues).toEqual([]);
+    });
   });
 });

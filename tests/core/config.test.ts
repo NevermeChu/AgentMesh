@@ -202,6 +202,51 @@ describe("core/project config agents metadata", () => {
     expect(jsonIssue?.message).toContain("Invalid JSON");
   });
 
+  it("accepts UTF-8 BOM prefixed config text written by Windows editors", () => {
+    const result = parseProjectConfigText(
+      `\uFEFF${JSON.stringify({ version: 1, roles: { worker: "codex" } })}`,
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.config.roles.worker).toEqual({ agent: "codex" });
+  });
+
+  it("accepts a minimal agents entry where every field is optional", () => {
+    const result = parseProjectConfigText(
+      JSON.stringify({
+        version: 1,
+        roles: {},
+        agents: { claude: { notes: "Reviewer of record" } },
+      }),
+    );
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.config.agents).toEqual({ claude: { notes: "Reviewer of record" } });
+  });
+
+  it("enforces documented size bounds on free-text and list fields", () => {
+    const oversizedSpeed = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { codex: { speed: "x".repeat(101) } } }),
+    );
+    expect(oversizedSpeed.success).toBe(false);
+
+    const oversizedNotes = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: { codex: { notes: "x".repeat(2001) } } }),
+    );
+    expect(oversizedNotes.success).toBe(false);
+    if (oversizedNotes.success) return;
+    expect(oversizedNotes.issues.map((issue) => issue.field)).toContain("agents.codex.notes");
+  });
+
+  it("rejects more than 32 agent entries", () => {
+    const entries: Record<string, unknown> = {};
+    for (let i = 0; i < 33; i++) entries[`agent-${i}`] = { tier: "weak" };
+    const result = parseProjectConfigText(
+      JSON.stringify({ version: 1, roles: {}, agents: entries }),
+    );
+    expect(result.success).toBe(false);
+  });
+
   it("still fails loadProjectConfig with the aggregated legacy error format", () => {
     const project = createProject({
       version: 1,

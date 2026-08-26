@@ -145,6 +145,15 @@ export function resolveSessionStoragePath(): string {
   );
 }
 
+/**
+ * Resolves the AgentMesh home directory (parent of sessions.json) exactly like
+ * the storage-path resolution above. Background task artifacts and spill
+ * artifacts share this root so AGENTMESH_SESSIONS_FILE relocates all of it.
+ */
+export function resolveAgentMeshHome(): string {
+  return path.dirname(resolveSessionStoragePath());
+}
+
 function snapshotSession(session: BridgeSession): BridgeSession {
   return structuredClone(session);
 }

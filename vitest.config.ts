@@ -5,6 +5,10 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // Windows dev machines with real-time AV scanning make small-file-heavy
+    // tests (repository fingerprint loops, git fixtures) exceed the 5s
+    // default; 20s removes that flake class without masking real hangs.
+    testTimeout: 20_000,
     coverage: {
       provider: "v8",
       reporter: ["text", "json", "html"],

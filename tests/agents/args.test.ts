@@ -4,8 +4,10 @@ import * as path from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   CodexAdapter,
+  CodexSecurityViolationError,
   parseCodexJsonLines,
   buildCodexMcpToolCall,
+  parseStructuredReviewVerdict,
 } from "../../src/agents/codex.js";
 import {
   ClaudeAdapter,
@@ -95,6 +97,12 @@ describe("agents/args construction", () => {
     expect(reviewerArgs).not.toContain("--session");
     expect(reviewerArgs).not.toContain("thread_abc123");
     expect(reviewerArgs).toContain('sandbox_mode="read-only"');
+    // Security baseline (T3.1) + official extraction/contract channels (T1.5).
+    expect(reviewerArgs).toContain("--strict-config");
+    expect(reviewerArgs).toContain('approval_policy="never"');
+    expect(reviewerArgs).toContain("sandbox_workspace_write.network_access=false");
+    expect(reviewerArgs).toContain("--output-schema");
+    expect(reviewerArgs).toContain("--output-last-message");
 
     const uncommittedArgs = adapter.buildCliArgs({
       task: "Review uncommitted",
@@ -116,6 +124,15 @@ describe("agents/args construction", () => {
     expect(workerArgs).not.toContain("resume");
     expect(workerArgs).toContain("--json");
     expect(workerArgs).toContain('sandbox_mode="workspace-write"');
+    // Security baseline locks land after caller args so they win last-wins.
+    expect(workerArgs).toContain("--strict-config");
+    expect(workerArgs).toContain('approval_policy="never"');
+    expect(workerArgs).toContain("sandbox_workspace_write.network_access=false");
+    // Official final-answer extraction channel (T1.5).
+    expect(workerArgs).toContain("--output-last-message");
+    expect(
+      workerArgs.findIndex((argument) => argument.startsWith("approval_policy")),
+    ).toBeGreaterThan(workerArgs.indexOf("--json"));
 
     const resumeArgs = adapter.buildCliArgs({
       task: "Fix review comments",
@@ -128,6 +145,83 @@ describe("agents/args construction", () => {
     expect(resumeArgs).not.toContain("--resume");
     expect(resumeArgs).toContain("--json");
     expect(resumeArgs).toContain('sandbox_mode="workspace-write"');
+    expect(resumeArgs).toContain("--output-last-message");
+  });
+
+  it("physically rejects bypass flags before any codex spawn", () => {
+    const adapter = new CodexAdapter();
+    for (const forbidden of [
+      ["--yolo"],
+      ["--dangerously-bypass-approvals-and-sandbox"],
+      ["-c", 'sandbox_mode="danger-full-access"'],
+    ]) {
+      try {
+        adapter.buildCliArgs({ task: "Escape sandbox", role: "worker", extraArgs: [...forbidden] });
+        throw new Error(`expected violation for ${forbidden.join(" ")}`);
+      } catch (error) {
+        expect(error).toBeInstanceOf(CodexSecurityViolationError);
+        expect((error as CodexSecurityViolationError).message).toContain(forbidden.at(-1) ?? "");
+      }
+    }
+  });
+
+  it("extracts thread-cumulative usage from turn.completed events", () => {
+    const parsed = parseCodexJsonLines(
+      [
+        JSON.stringify({ type: "thread.started", thread_id: "thread-usage-1" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { type: "agent_message", text: "Done." },
+        }),
+        JSON.stringify({
+          type: "turn.completed",
+          usage: {
+            input_tokens: 120,
+            cached_input_tokens: 40,
+            cache_write_input_tokens: 8,
+            output_tokens: 55,
+            reasoning_output_tokens: 17,
+          },
+        }),
+      ].join("\n"),
+    );
+    expect(parsed.sessionId).toBe("thread-usage-1");
+    expect(parsed.usage).toEqual({
+      inputTokens: 120,
+      cachedInputTokens: 40,
+      cacheWriteInputTokens: 8,
+      outputTokens: 55,
+      reasoningOutputTokens: 17,
+      totalTokens: undefined,
+    });
+    expect(parseCodexJsonLines("no json at all").usage).toBeUndefined();
+  });
+
+  it("parses the structured reviewer verdict contract", () => {
+    const pass = parseStructuredReviewVerdict(JSON.stringify({ verdict: "PASS", findings: [] }));
+    expect(pass).toEqual({ outcome: "PASS", findings: [] });
+
+    const fail = parseStructuredReviewVerdict(
+      JSON.stringify({
+        verdict: "FAIL",
+        findings: [
+          {
+            severity: "high",
+            file: "src/auth.ts",
+            line: 42,
+            issue: "SQL injection",
+            suggestion: "Parameterize the query",
+          },
+        ],
+      }),
+    );
+    expect(fail?.outcome).toBe("FAIL");
+    expect(fail?.findings).toHaveLength(1);
+    expect(fail?.findings[0]).toMatchObject({ file: "src/auth.ts", issue: "SQL injection" });
+
+    expect(parseStructuredReviewVerdict("PASS\nAll good.")).toBeUndefined();
+    expect(parseStructuredReviewVerdict('{"verdict":"MAYBE"}')).toBeUndefined();
+    expect(parseStructuredReviewVerdict(undefined)).toBeUndefined();
   });
 
   it("separates Claude reviewer tools from worker permissions", () => {

@@ -7,6 +7,7 @@ import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
 import { BackgroundTaskNotFoundError, BackgroundTaskRegistry } from "../core/background.js";
 import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
+import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
 import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
@@ -16,10 +17,17 @@ const PROGRESS_INTERVAL_MS = 15_000;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z.string().trim().min(1);
 
-/** Exported for protocol tests: renders one normalized result as MCP detail lines. */
-export function formatNormalizedResult(result: AgentResult): string[] {
+/** One normalized section already spilled to an artifact and replaced by a pointer block. */
+interface SpilledSection {
+  source: "finalAnswer" | "rawOutput";
+  previewBlock: string;
+}
+
+function buildNormalizedLines(result: AgentResult, spilled: SpilledSection | undefined): string[] {
   const details = [`Summary: ${result.summary}`];
-  if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
+  if (spilled?.source === "finalAnswer") {
+    details.push(spilled.previewBlock);
+  } else if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
     details.push(
       `Final Answer:\n${truncateText(result.finalAnswer.trim(), MAX_FINAL_ANSWER_CHARS)}`,
     );
@@ -27,7 +35,9 @@ export function formatNormalizedResult(result: AgentResult): string[] {
   // Vendor logs and stderr stay diagnosable over MCP instead of being dropped
   // by normalization; without them, remote failures carry no actionable detail.
   const rawOutput = result.output?.trim();
-  if (
+  if (spilled?.source === "rawOutput") {
+    details.push(spilled.previewBlock);
+  } else if (
     rawOutput &&
     rawOutput !== result.finalAnswer?.trim() &&
     rawOutput !== result.summary.trim()
@@ -50,6 +60,83 @@ export function formatNormalizedResult(result: AgentResult): string[] {
     details.push(`Reviewer Safety:\n${JSON.stringify(result.reviewerSafety, null, 2)}`);
   }
   return details;
+}
+
+/**
+ * Sync legacy renderer without artifact spill. Sections over the spill
+ * threshold degrade to the historical hard truncation here; production MCP
+ * handlers use formatNormalizedResultDetailed so oversized sections are
+ * persisted verbatim and referenced by path instead.
+ */
+export function formatNormalizedResult(result: AgentResult): string[] {
+  return buildNormalizedLines(result, undefined);
+}
+
+export interface NormalizedResultFormatOptions {
+  /** Bridge session owning the turn; required for artifact persistence. */
+  sessionId?: string;
+  /** 1-based turn number naming the artifact file and audit record. */
+  turnNumber?: number;
+  /**
+   * Overrides the AgentMesh home root for artifact files (test isolation);
+   * production leaves this unset so resolveAgentMeshHome() applies.
+   */
+  artifactHomeDir?: string;
+  /**
+   * Registers the spill pointer into the session sidecar audit trail; wired to
+   * MultiAgentRunner.registerArtifactAudit by the MCP handlers.
+   */
+  registerAudit?: (record: {
+    source: string;
+    chars: number;
+    sha256: string;
+    artifactPath: string;
+  }) => { file: string } | undefined;
+}
+
+/**
+ * Async renderer with T2.2 artifact spill ([CC] toolResultStorage): a
+ * finalAnswer/rawOutput over ARTIFACT_SPILL_THRESHOLD_CHARS is persisted
+ * verbatim to <agentmeshHome>/artifacts/<sessionId>/turn-<n>.txt and replaced
+ * by a bounded newline-boundary preview plus the absolute artifact path and a
+ * [hasMore] marker 鈥?no information is truncated away.
+ */
+export async function formatNormalizedResultDetailed(
+  result: AgentResult,
+  options: NormalizedResultFormatOptions = {},
+): Promise<string[]> {
+  const decision = selectArtifactSpill(result.finalAnswer, result.output);
+  let spilled: SpilledSection | undefined;
+  if (decision && options.sessionId && options.turnNumber !== undefined) {
+    const artifact = await persistArtifact(
+      options.sessionId,
+      options.turnNumber,
+      decision.content,
+      {
+        homeDir: options.artifactHomeDir,
+      },
+    );
+    options.registerAudit?.({
+      source: decision.source,
+      chars: artifact.chars,
+      sha256: artifact.sha256,
+      artifactPath: artifact.path,
+    });
+    const { preview, truncated } = buildPreview(decision.content);
+    const label = decision.source === "finalAnswer" ? "Final Answer" : "Raw Output";
+    spilled = {
+      source: decision.source,
+      previewBlock: [
+        `${label} Spilled To Artifact (full output preserved on disk, ${artifact.chars} chars):`,
+        `Artifact Path: ${artifact.path}`,
+        `sha256: ${artifact.sha256}`,
+        "Preview:",
+        preview,
+        `[hasMore: ${truncated}]`,
+      ].join("\n"),
+    };
+  }
+  return buildNormalizedLines(result, spilled);
 }
 
 async function sendProgress(
@@ -85,7 +172,7 @@ export interface BackgroundLaunchParams {
 /**
  * Owns in-process background dispatches (T1.4). Each launch registers its
  * promise for graceful shutdown and writes the terminal outcome into the
- * task registry so poll_task can report completed/failed states — including
+ * task registry so poll_task can report completed/failed states 鈥?including
  * after the MCP response that started the work has long returned.
  */
 export class BackgroundDispatchService {
@@ -346,6 +433,29 @@ export const GetRoleConfigInputSchema = z.object({
   ),
 });
 
+/**
+ * Renders one normalized result for MCP output with T2.2 artifact spill
+ * enabled. The turn number is the just-recorded history length because the
+ * runner persists its turn before the handler formats the response.
+ */
+async function formatResultForMcp(
+  runner: MultiAgentRunner,
+  result: AgentResult,
+): Promise<string[]> {
+  const turnNumber = result.sessionId
+    ? (runner.getSession(result.sessionId)?.history.length ?? 0)
+    : undefined;
+  return formatNormalizedResultDetailed(result, {
+    sessionId: result.sessionId,
+    turnNumber,
+    registerAudit:
+      result.sessionId && turnNumber !== undefined
+        ? (record) =>
+            runner.registerArtifactAudit(result.sessionId!, turnNumber, record) ?? undefined
+        : undefined,
+  });
+}
+
 export function registerMcpTools(
   server: McpServer,
   runner: MultiAgentRunner,
@@ -432,7 +542,7 @@ export function registerMcpTools(
 
         const formattedText = [
           `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()}${result.reviewOutcome ? ` | Review Outcome: ${result.reviewOutcome}` : ""} | Session: ${result.sessionId || "none"}]`,
-          ...formatNormalizedResult(result),
+          ...(await formatResultForMcp(runner, result)),
           `Duration: ${result.durationMs ?? 0}ms`,
         ].join("\n");
 
@@ -569,7 +679,7 @@ export function registerMcpTools(
 
         const formattedText = [
           `[Reviewer: ${result.agent} | Review Outcome: ${result.reviewOutcome || "UNKNOWN"} | Status: ${result.status.toUpperCase()}${findingsHeader} | Session: ${result.sessionId || "none"}]`,
-          ...formatNormalizedResult(result),
+          ...(await formatResultForMcp(runner, result)),
           `Duration: ${result.durationMs ?? 0}ms`,
         ].join("\n");
 
@@ -619,7 +729,7 @@ export function registerMcpTools(
 
         const formattedText = [
           `[Agent: ${result.agent} | Status: ${result.status.toUpperCase()}${result.reviewOutcome ? ` | Review Outcome: ${result.reviewOutcome}` : ""} | Session: ${result.sessionId}]`,
-          ...formatNormalizedResult(result),
+          ...(await formatResultForMcp(runner, result)),
           `Duration: ${result.durationMs ?? 0}ms`,
         ].join("\n");
 

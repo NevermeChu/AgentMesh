@@ -188,20 +188,24 @@ agentmesh capabilities show
 
 1. **`delegate_task`**
    - 让显式 Agent 或项目中分配给指定角色的 Agent 执行任务。
-   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选)。
-2. **`review_changes`**
+   - 参数：`task` (必填), `agent` (可选，省略时读取项目角色映射), `cwd` (可选), `role` (可选: `worker` | `reviewer` | `tester`), `mode` (可选: `auto` | `mcp` | `cli`), `timeoutMs` (可选，最大 3600000), `sessionId` (可选), `contextSessionIds` (可选，最多 4 个，按给定顺序一手注入多个 Bridge Session 的规范化历史), `contextSessionId` (可选，单源兼容形式), `baseCommit` (可选), `idempotencyKey` (可选), `background` (可选布尔值)。
+   - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
+2. **`poll_task`**
+   - 观察一个后台 delegate_task：返回 `status` (`running` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore` 以及终态时的 `result`。
+   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取)。单次调用内部以 100ms 间隔轮询、最长阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
+3. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
    - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式)。
-3. **`continue_task`**
+4. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
    - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
-4. **`list_agents`**
+5. **`list_agents`**
    - 查询所有支持的 Agent 及其在当前系统中的安装状态。
    - 无参数。
-5. **`get_session`**
+6. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
-6. **`get_role_config`**
+7. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
    - 参数：`cwd` (可选，默认当前目录)。
 
@@ -237,7 +241,9 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 `contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文）。
+
+超长输出不再被硬截断丢弃：工具响应中的 `finalAnswer`/`rawOutput` 超过 **50000 字符**阈值时，全文会原样落盘到 `<agentmeshHome>/artifacts/<sessionId>/turn-<n>.txt`（'wx' 创建写，绝不覆盖已有文件），响应改为「2KB 换行边界预览 + artifact 绝对路径 + sha256 + `[hasMore: true]`」，落盘指针同时登记进 Session 的 sidecar 审计目录（`contexts/<sessionId>/turn-<n>.artifact.json`）。未超限的长输出仍在响应内截断到 12000（finalAnswer）/8000（rawOutput）字符。
 
 Session 持久化有容量上限以防止 `sessions.json` 无界增长：每个会话默认保留最近 50 轮历史（更早轮次按时间丢弃），存储整体默认保留最近更新的 200 个会话（超出按 LRU 逐出）。两个上限均可通过程序化 `SessionManagerOptions` 调整，设为 `0` 表示不限制。
 

@@ -1380,6 +1380,24 @@ export class MultiAgentRunner {
   }
 
   /**
+   * Registers an artifact-spill pointer in the session sidecar audit trail
+   * (T2.2). Returns undefined when persistence is disabled or the write fails;
+   * audit loss must never fail the turn.
+   */
+  public registerArtifactAudit(
+    sessionId: string,
+    turnNumber: number,
+    record: {
+      source: string;
+      chars: number;
+      sha256: string;
+      artifactPath: string;
+    },
+  ): { file: string } | undefined {
+    return this.sessionManager.persistArtifactSidecar(sessionId, turnNumber, record);
+  }
+
+  /**
    * Returns list of supported agents and their availability on this machine.
    */
   public async listAgents() {

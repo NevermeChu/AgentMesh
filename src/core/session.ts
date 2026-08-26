@@ -540,6 +540,41 @@ export class SessionManager {
   }
 
   /**
+   * Records one artifact-spill pointer in the session's sidecar audit area
+   * (the same contexts/<sessionId> directory persistContextArtifact uses).
+   * The artifact body itself lives under <agentmeshHome>/artifacts; this
+   * sidecar keeps the SHA-256 pointer discoverable next to the turn it
+   * belongs to.
+   */
+  public persistArtifactSidecar(
+    sessionId: string,
+    turnNumber: number,
+    record: {
+      source: string;
+      chars: number;
+      sha256: string;
+      artifactPath: string;
+    },
+  ): { file: string } | undefined {
+    if (!this.persist) return undefined;
+    try {
+      const storageDir = path.dirname(this.storagePath);
+      const dir = path.join(storageDir, "contexts", sessionId);
+      fs.mkdirSync(dir, { recursive: true });
+      const fileName = `${String(turnNumber).padStart(3, "0")}.artifact.json`;
+      fs.writeFileSync(
+        path.join(dir, fileName),
+        JSON.stringify({ timestamp: new Date().toISOString(), ...record }, null, 2),
+        "utf-8",
+      );
+      return { file: path.join("contexts", sessionId, fileName) };
+    } catch {
+      // Audit artifacts are best-effort: losing one must not fail the turn.
+      return undefined;
+    }
+  }
+
+  /**
    * Looks up the live tombstone for an idempotency scope key. Expired
    * tombstones are treated as absent and dropped eagerly (lazy expiry is the
    * authoritative TTL check; `nowMs` is injectable for tests).

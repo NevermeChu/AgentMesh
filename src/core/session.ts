@@ -99,7 +99,8 @@ const SessionHistoryEntrySchema = z.object({
   capabilityDiagnostics: z.array(z.string()).optional(),
   sharedContextAudit: SharedContextAuditSchema.optional(),
 });
-const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
+/** Exported for read-only inspection (doctor); mutation stays inside SessionManager. */
+export const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   id: z.string().min(1),
   agent: AgentNameSchema,
   nativeSessionId: z.string().min(1).optional(),
@@ -111,8 +112,19 @@ const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
   metadata: z.record(z.unknown()).optional(),
 });
 
-const DEFAULT_MAX_HISTORY_TURNS_PER_SESSION = 50;
-const DEFAULT_MAX_SESSIONS = 200;
+export const DEFAULT_MAX_HISTORY_TURNS_PER_SESSION = 50;
+export const DEFAULT_MAX_SESSIONS = 200;
+
+/**
+ * Resolves the effective sessions storage path exactly like the SessionManager
+ * constructor, without constructing one. Read-only diagnostics (doctor) use
+ * this to inspect storage without triggering load-time quarantine side effects.
+ */
+export function resolveSessionStoragePath(): string {
+  return (
+    process.env.AGENTMESH_SESSIONS_FILE || path.join(os.homedir(), ".agentmesh", "sessions.json")
+  );
+}
 
 function snapshotSession(session: BridgeSession): BridgeSession {
   return structuredClone(session);
@@ -141,10 +153,7 @@ export class SessionManager {
     this.maxHistoryTurnsPerSession =
       options.maxHistoryTurnsPerSession ?? DEFAULT_MAX_HISTORY_TURNS_PER_SESSION;
     this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
-    this.storagePath =
-      options.storagePath ||
-      process.env.AGENTMESH_SESSIONS_FILE ||
-      path.join(os.homedir(), ".agentmesh", "sessions.json");
+    this.storagePath = options.storagePath || resolveSessionStoragePath();
     this.lockPath = `${this.storagePath}.lock`;
 
     if (this.persist) {

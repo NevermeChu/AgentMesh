@@ -100,9 +100,12 @@ zcode           ZCode                              [MISSING]     CLI         Bin
 agentmesh serve                 # 启动 stdio MCP Server（通常由 Orchestrator 自动执行）
 agentmesh config                # 查看并校验项目角色配置
 agentmesh list                  # 检查本机 Agent CLI 可用性
+agentmesh doctor [cwd]          # 只读聚合诊断（运行时/适配器/配置/能力矩阵/会话存储/仓库）
 agentmesh sessions              # 查看 Bridge Sessions
 agentmesh session <sessionId>   # 查看单个会话
 ```
+
+`doctor` 不执行任何任务、不消耗额度、不修改任何文件，把分散在 `list`、`config`、`sessions` 中的健康信息与交叉检查一次汇总：Node 版本、适配器可用性（被项目角色引用的缺失二进制会升级为 FAIL）、config schema 校验、Reviewer `safety: enforced` 与 `prompt-only` 适配器的矛盾组合、capabilities.json 版本漂移与无效文件、会话存储损坏/残留锁/隔离痕迹/容量水位、以及 cwd 的 Git 仓库状态。发现会在启动时必然失败的组合时以退出码 1 结束；`--json` 输出机器可读报告供 Orchestrator 或 CI 消费。
 
 直接执行仅用于排查 MCP、适配器或 CLI 参数问题：
 

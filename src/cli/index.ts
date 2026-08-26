@@ -4,6 +4,8 @@ import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
 import { VERSION } from "../version.js";
 import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
+import { runDoctorChecks } from "../core/diagnostics.js";
+import type { DoctorCheckStatus, DoctorReport } from "../core/diagnostics.js";
 import type { AgentRole, TransportMode } from "../agents/types.js";
 import {
   parseMode,
@@ -41,6 +43,38 @@ interface ContinueCommandOptions {
   contextSessions?: string[];
   mode: TransportMode;
   timeout?: number;
+}
+
+interface DoctorCommandOptions {
+  json?: boolean;
+}
+
+const DOCTOR_STATUS_LABELS: Record<DoctorCheckStatus, string> = {
+  pass: "[PASS]",
+  warn: "[WARN]",
+  fail: "[FAIL]",
+  info: "[INFO]",
+};
+
+function renderDoctorReport(report: DoctorReport): void {
+  console.log(`\nAgentMesh Doctor v${report.meta.version} — platform: ${report.meta.platform}`);
+  console.log(`cwd: ${report.meta.cwd}\n`);
+  for (const entry of report.checks) {
+    console.log(
+      `${DOCTOR_STATUS_LABELS[entry.status].padEnd(7)} ${entry.id.padEnd(30)} ${entry.detail}`,
+    );
+  }
+  const { summary } = report;
+  console.log(
+    `\nSummary: ${summary.pass} pass / ${summary.warn} warn / ${summary.fail} fail / ${summary.info} info`,
+  );
+  if (summary.fail > 0) {
+    console.log("Result: issues found that will break delegation (see [FAIL] entries).");
+  } else if (summary.warn > 0) {
+    console.log("Result: usable, with warnings.");
+  } else {
+    console.log("Result: healthy.");
+  }
 }
 
 program
@@ -336,6 +370,36 @@ program
       );
     }
     console.log();
+  });
+
+// Command: doctor (read-only aggregate diagnostics)
+program
+  .command("doctor [cwd]")
+  .description(
+    "Run read-only aggregate diagnostics: runtime, adapters, project config, capabilities, session store, repository",
+  )
+  .option("--json", "Emit a machine-readable JSON report", false)
+  .action(async (cwd: string | undefined, options: DoctorCommandOptions) => {
+    try {
+      const targetCwd = cwd || process.cwd();
+      const availability = await defaultRegistry.listAgentAvailability();
+      const report = await runDoctorChecks({
+        cwd: targetCwd,
+        availability,
+        resolveAgentName: (nameOrAlias) => defaultRegistry.resolveName(nameOrAlias),
+      });
+      if (options.json) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        renderDoctorReport(report);
+      }
+      if (report.summary.fail > 0) {
+        process.exitCode = 1;
+      }
+    } catch (err) {
+      console.error("Doctor error:", err instanceof Error ? err.message : String(err));
+      process.exitCode = 1;
+    }
   });
 
 // Command: serve (starts MCP server)

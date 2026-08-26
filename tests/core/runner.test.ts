@@ -1278,4 +1278,75 @@ describe("core/runner", () => {
     expect(sessionManager.getSummary(source.sessionId!)).toBeUndefined();
     expect(runner.listSessions()).toHaveLength(1);
   });
+
+  it("assembles a routing table with metadata, variants, and recent diagnostics (T4.2)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-route-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { worker: "codex" },
+          agents: {
+            codex: {
+              tier: "strong",
+              costLevel: 5,
+              strengths: ["deep review"],
+              notGoodAt: [],
+              notes: "strong lane",
+              candidates: ["codex-medium"],
+            },
+            "codex-medium": { tier: "medium", costLevel: 3 },
+          },
+        }),
+      );
+
+      const bound = sessionManager.createSession({
+        agent: "codex",
+        cwd: projectRoot,
+        role: "worker",
+      });
+      sessionManager.addHistory(bound.id, {
+        role: "worker",
+        task: "diagnostic probe",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        summary: "ok",
+        capabilityDiagnostics: ["Capability diagnostic: model 'x' was requested but ignored"],
+      });
+
+      const table = await runner.getAgentRoutingTable(projectRoot);
+
+      expect(table.source).toBe("configured");
+      const codex = table.entries.find((entry) => entry.name === "codex");
+      expect(codex?.metadata?.tier).toBe("strong");
+      expect(codex?.metadata?.candidates).toEqual(["codex-medium"]);
+      expect(codex?.recentCapabilityDiagnostics).toContain(
+        "Capability diagnostic: model 'x' was requested but ignored",
+      );
+      // A channel with no declared metadata is present but unadorned.
+      const claude = table.entries.find((entry) => entry.name === "claude");
+      expect(claude?.metadata).toBeUndefined();
+      expect(claude).toBeDefined();
+      // Non-binary tier variants are surfaced separately.
+      expect(table.variants.map((variant) => variant.key)).toEqual(["codex-medium"]);
+      expect(table.variants[0]?.metadata.costLevel).toBe(3);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades the routing table to unconfigured without failing (T4.2)", async () => {
+    const plainRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-noroute-"));
+    try {
+      const table = await runner.getAgentRoutingTable(plainRoot);
+      expect(table.source).toBe("unconfigured");
+      expect(table.configWarning).toBeUndefined();
+      expect(table.variants).toHaveLength(0);
+      expect(table.entries.length).toBeGreaterThanOrEqual(6);
+    } finally {
+      fs.rmSync(plainRoot, { recursive: true, force: true });
+    }
+  });
 });

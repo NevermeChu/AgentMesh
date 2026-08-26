@@ -196,8 +196,8 @@ agentmesh capabilities show
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
    - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
 4. **`list_agents`**
-   - 查询所有支持的 Agent 及其在当前系统中的安装状态。
-   - 无参数。
+   - 输出**路由表视图**（T4.2）：每个注册 Agent 一块——名称/别名/**实时可用性**（registry 扫描前置到本次调用）/传输模式/沙箱申报/**路由元数据**（`tier`、`costLevel`、`strengths`、`notGoodAt`、`notes`，来自 `.agentmesh/config.json` 的 `agents` 段；未配置显示 `unmetered` 而非报错）/**candidates 升级链视图**/最近能力诊断；`agents` 段中无法解析为二进制的档位变体（如 codex profile 档）单列展示。主模型读一次即可完成全部任务分配。
+   - 参数：`cwd` (可选，用于定位最近的 `.agentmesh/config.json`，默认当前目录)。
 5. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。

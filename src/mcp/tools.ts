@@ -4,6 +4,7 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
+import type { AgentMetadata } from "../core/config.js";
 import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
@@ -241,6 +242,12 @@ export const GetRoleConfigInputSchema = z.object({
   ),
 });
 
+export const ListAgentsInputSchema = z.object({
+  cwd: NonBlankString.optional().describe(
+    "Project directory used to locate the nearest .agentmesh/config.json agents metadata (defaults to current directory)",
+  ),
+});
+
 export const CompactContextInputSchema = z.object({
   sourceSessionIds: z
     .array(NonBlankString)
@@ -250,6 +257,25 @@ export const CompactContextInputSchema = z.object({
       "Up to 4 Bridge sessions whose normalized history should be condensed into a semantic summary sidecar",
     ),
 });
+
+/** Formats one routing-metadata field group, degrading to "unmetered" (T4.2). */
+function formatRoutingMetadata(metadata: AgentMetadata | undefined): string[] {
+  if (!metadata) {
+    return [
+      "Tier: unmetered | Cost level: unmetered",
+      "Strengths: unmetered | Not good at: unmetered",
+      "Notes: unmetered (no agents metadata declared for this channel in .agentmesh/config.json)",
+    ];
+  }
+  const lines = [
+    `Tier: ${metadata.tier ?? "unmetered"} | Cost level: ${metadata.costLevel ?? "unmetered"}`,
+    `Speed: ${metadata.speed ?? "unmetered"}`,
+    `Strengths: ${metadata.strengths?.length ? metadata.strengths.join(", ") : "unmetered"}`,
+    `Not good at: ${metadata.notGoodAt?.length ? metadata.notGoodAt.join(", ") : "unmetered"}`,
+  ];
+  lines.push(`Notes: ${metadata.notes ?? "unmetered"}`);
+  return lines;
+}
 
 export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
   // delegate_task
@@ -450,21 +476,47 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
     },
   );
 
-  // list_agents
+  // list_agents — T4.2 routing-table view
   server.tool(
     "list_agents",
-    "Lists all supported agent adapters and queries their current availability and binary presence on the host system",
-    {},
-    async () => {
+    "Routing table over all supported agent channels: live availability (eager scan), transport modes, declared sandbox level, self-declared routing metadata (tier / costLevel / strengths / notGoodAt / notes from .agentmesh/config.json), the candidates upgrade chain, and the most recent capability diagnostics. Read this once to plan every delegation; missing metadata is reported as unmetered rather than an error.",
+    ListAgentsInputSchema.shape,
+    async (args: z.infer<typeof ListAgentsInputSchema>) => {
       try {
-        const agents = await runner.listAgents();
+        const table = await runner.getAgentRoutingTable(args.cwd ?? process.cwd());
+        const sections: string[] = [
+          `Agent Routing Table (${table.entries.length} channels, ${table.variants.length} declared variants; metadata source: ${table.source})`,
+          ...(table.configWarning ? [`Config warning: ${table.configWarning}`] : []),
+        ];
+        for (const entry of table.entries) {
+          sections.push(
+            [
+              `== ${entry.name} (${entry.displayName}) ==`,
+              `Availability: ${entry.available ? "available" : "unavailable"}${entry.executablePath ? ` — ${entry.executablePath}` : ""}`,
+              ...(entry.availabilityNote ? [entry.availabilityNote] : []),
+              `Aliases: ${entry.aliases.length ? entry.aliases.join(", ") : "(none)"}`,
+              `Transports: ${entry.supportedTransports.join(", ")} (preferred: ${entry.preferredTransport})`,
+              `Sandbox declared: ${entry.sandboxMechanism}`,
+              ...formatRoutingMetadata(entry.metadata),
+              `Candidates chain: ${entry.metadata?.candidates?.length ? entry.metadata.candidates.join(" -> ") : "(none declared)"}`,
+              `Recent capability diagnostics: ${entry.recentCapabilityDiagnostics.length ? "\n  - " + entry.recentCapabilityDiagnostics.join("\n  - ") : "none recorded"}`,
+            ].join("\n"),
+          );
+        }
+        if (table.variants.length) {
+          sections.push("Declared routing variants (profile-backed tier entries):");
+          for (const variant of table.variants) {
+            sections.push(
+              [
+                `== ${variant.key} (variant) ==`,
+                ...formatRoutingMetadata(variant.metadata),
+                `Candidates chain: ${variant.metadata.candidates?.length ? variant.metadata.candidates.join(" -> ") : "(none declared)"}`,
+              ].join("\n"),
+            );
+          }
+        }
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(agents, null, 2),
-            },
-          ],
+          content: [{ type: "text", text: sections.join("\n\n") }],
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);

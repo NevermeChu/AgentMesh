@@ -72,11 +72,14 @@ export class AgentRegistry {
 
   /**
    * Scans and returns availability status for all registered agents.
+   * The scan is eager: routing-table views (list_agents) front-load it so one
+   * read yields live availability for every channel.
    */
   public async listAgentAvailability(): Promise<
     Array<{
       name: AgentName;
       displayName: string;
+      aliases: string[];
       available: boolean;
       info: AgentExecutableInfo;
     }>
@@ -87,6 +90,7 @@ export class AgentRegistry {
       results.push({
         name: adapter.name,
         displayName: adapter.displayName,
+        aliases: [...(adapter.aliases ?? [])],
         available: info.available,
         info,
       });

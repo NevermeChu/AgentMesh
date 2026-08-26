@@ -8,6 +8,7 @@ import type {
   ReviewerSafetyPolicy,
   ReviewerSafetyReport,
   RunAgentOptions,
+  SandboxMechanism,
   TransportMode,
 } from "../agents/types.js";
 import { defaultRegistry } from "../agents/registry.js";
@@ -16,6 +17,7 @@ import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
+import type { AgentMetadata } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
 import { classifyErrorCode } from "./resilience.js";
 import { buildSummaryPrompt, stripAnalysisDraft } from "./prompts.js";
@@ -565,6 +567,38 @@ export interface CompactContextResult {
 }
 
 const COMPACT_CONTEXT_MAX_SOURCES = 4;
+
+/** One routing-table row for a registered adapter channel (T4.2). */
+export interface AgentRoutingEntry {
+  name: string;
+  displayName: string;
+  aliases: string[];
+  available: boolean;
+  availabilityNote?: string;
+  executablePath?: string;
+  preferredTransport: TransportMode;
+  supportedTransports: TransportMode[];
+  sandboxMechanism: SandboxMechanism;
+  /** Self-declared routing metadata from the config agents section, when present. */
+  metadata?: AgentMetadata;
+  /** Capability diagnostics recorded by this agent's most recent turn, if any. */
+  recentCapabilityDiagnostics: string[];
+}
+
+/** A declared tier/profile variant that is not a standalone binary (T4.2). */
+export interface RoutingVariantEntry {
+  key: string;
+  metadata: AgentMetadata;
+}
+
+export interface AgentRoutingTable {
+  /** Whether any agents metadata section was found for the working directory. */
+  source: "configured" | "unconfigured";
+  entries: AgentRoutingEntry[];
+  variants: RoutingVariantEntry[];
+  /** Present when the project config exists but could not be loaded. */
+  configWarning?: string;
+}
 
 export class MultiAgentRunner {
   private registry: AgentRegistry;
@@ -1607,6 +1641,68 @@ export class MultiAgentRunner {
    */
   public async listAgents() {
     return this.registry.listAgentAvailability();
+  }
+
+  /**
+   * T4.2 routing table: one row per registered channel with live availability
+   * (registry scan front-loaded here), transport and sandbox declarations,
+   * self-declared metadata from the config agents section, the candidates
+   * upgrade chain, and this channel's most recent capability diagnostics.
+   * Declared tier/profile variants that are not standalone binaries are listed
+   * separately. Missing metadata degrades to "unconfigured" instead of error.
+   */
+  public async getAgentRoutingTable(
+    startDirectory: string = process.cwd(),
+  ): Promise<AgentRoutingTable> {
+    const availability = await this.registry.listAgentAvailability();
+
+    let metadataMap: Record<string, AgentMetadata> | undefined;
+    let configWarning: string | undefined;
+    try {
+      const loaded = loadProjectConfig(startDirectory);
+      metadataMap = loaded?.config.agents;
+    } catch (error) {
+      configWarning = error instanceof Error ? error.message : String(error);
+    }
+
+    // Most recent capability diagnostics per agent, scanning newest history
+    // entries first; sessions are returned most-recently-updated first.
+    const recentDiagnostics = new Map<AgentName, string[]>();
+    for (const session of this.sessionManager.listSessions()) {
+      if (recentDiagnostics.has(session.agent)) continue;
+      for (let i = session.history.length - 1; i >= 0; i--) {
+        const diagnostics = session.history[i]?.capabilityDiagnostics;
+        if (diagnostics?.length) {
+          recentDiagnostics.set(session.agent, diagnostics);
+          break;
+        }
+      }
+    }
+
+    const entries: AgentRoutingEntry[] = availability.map((channel) => ({
+      name: channel.name,
+      displayName: channel.displayName,
+      aliases: channel.aliases,
+      available: channel.available,
+      ...(channel.info.notes ? { availabilityNote: channel.info.notes } : {}),
+      ...(channel.info.path ? { executablePath: channel.info.path } : {}),
+      preferredTransport: channel.info.preferredTransport,
+      supportedTransports: channel.info.supportedTransports,
+      sandboxMechanism: channel.info.sandboxMechanism,
+      metadata: metadataMap?.[channel.name],
+      recentCapabilityDiagnostics: recentDiagnostics.get(channel.name) ?? [],
+    }));
+
+    const variants: RoutingVariantEntry[] = Object.entries(metadataMap ?? {})
+      .filter(([key]) => !this.registry.resolveName(key))
+      .map(([key, metadata]) => ({ key, metadata }));
+
+    return {
+      source: metadataMap ? "configured" : "unconfigured",
+      entries,
+      variants,
+      ...(configWarning ? { configWarning } : {}),
+    };
   }
 
   /** Returns the nearest project role configuration, if present. */

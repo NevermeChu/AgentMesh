@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ProgressNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
@@ -383,5 +386,54 @@ describe("mcp/tools protocol integration", () => {
     expect(res.isError).toBe(true);
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("is not configured");
+  });
+
+  it("renders list_agents as a routing table with metadata, variants, and unmetered fallback (T4.2)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-routing-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { worker: "codex" },
+          agents: {
+            codex: {
+              tier: "weak",
+              costLevel: 1,
+              strengths: ["bulk edits"],
+              notGoodAt: ["architecture decisions"],
+              notes: "cheap lane for mechanical work",
+              candidates: ["codex-medium"],
+            },
+            "codex-medium": { tier: "medium", costLevel: 3 },
+          },
+        }),
+      );
+
+      const res = await client.callTool({
+        name: "list_agents",
+        arguments: { cwd: projectRoot },
+      });
+
+      expect(res.isError).toBeFalsy();
+      const content = res.content as Array<{ type: string; text: string }>;
+      const text = content[0]?.text ?? "";
+      expect(text).toContain("Agent Routing Table");
+      expect(text).toContain("metadata source: configured");
+      expect(text).toContain("== codex (Test Codex Adapter) ==");
+      expect(text).toContain("Tier: weak | Cost level: 1");
+      expect(text).toContain("Strengths: bulk edits");
+      expect(text).toContain("Not good at: architecture decisions");
+      expect(text).toContain("Candidates chain: codex-medium");
+      // Channels without declared metadata degrade to unmetered, not errors.
+      expect(text).toContain("Tier: unmetered | Cost level: unmetered");
+      // A non-binary profile variant is listed in its own section.
+      expect(text).toContain("Declared routing variants");
+      expect(text).toContain("== codex-medium (variant) ==");
+      expect(text).toContain("Tier: medium | Cost level: 3");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
   });
 });

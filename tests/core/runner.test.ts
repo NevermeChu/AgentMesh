@@ -669,6 +669,113 @@ describe("core/runner", () => {
     expect(mock.lastRunOptions?.historyContext).toContain("[truncated]");
   });
 
+  it("keeps the environment snapshot intact while upstream conclusions saturate their own budget (T2.4)", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Oversized upstream report",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "big",
+      finalAnswer: "y".repeat(30_000),
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume saturated upstream",
+      contextSessionId: created.id,
+    });
+
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    // Upstream conclusions are capped at their own 12k segment (single source).
+    expect(context).toContain("[truncated]");
+    expect(context.length).toBeLessThan(16_000);
+    // The environment snapshot survives intact regardless of upstream bloat.
+    expect(context).toContain("Current repository: head=");
+    expect(context.match(/Current repository:/g)).toHaveLength(1);
+    expect(context).not.toContain("run git status for full detail");
+  });
+
+  it("caps each shared turn's task-description echo with an explicit marker (T2.4)", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    const oversizedTask = `${"t".repeat(5_900)}TAIL_SENTINEL`;
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: oversizedTask,
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "done",
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume long historical task text",
+      contextSessionId: created.id,
+    });
+
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain("... [truncated]");
+    expect(context).not.toContain("TAIL_SENTINEL");
+    const taskLine = context.split("\n").find((line) => line.startsWith("Task: "));
+    expect(taskLine!.length).toBeLessThanOrEqual("Task: ".length + 4_000);
+  });
+
+  it("truncates an oversized environment snapshot and appends the git-status remediation hint (T2.4)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-envsnap-"));
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: projectRoot });
+      fs.writeFileSync(path.join(projectRoot, "seed.ts"), "export const seed = 1;\n");
+      execFileSync("git", ["add", "seed.ts"], { cwd: projectRoot });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: projectRoot },
+      );
+      // ~45 long untracked paths push the rendered evidence line past 2k chars.
+      for (let i = 0; i < 45; i++) {
+        fs.writeFileSync(
+          path.join(projectRoot, `untracked-${"p".repeat(48)}-${i}.ts`),
+          `export const v${i} = ${i};\n`,
+        );
+      }
+
+      const source = await runner.delegateTask({
+        agent: "codex",
+        task: "Seed source in dirty repo",
+        cwd: projectRoot,
+      });
+      await runner.delegateTask({
+        agent: "codex",
+        task: "Consume from the same dirty repo",
+        cwd: projectRoot,
+        contextSessionId: source.sessionId,
+      });
+
+      const context = mock.lastRunOptions?.historyContext ?? "";
+      expect(context).toContain("... [truncated]");
+      expect(context).toContain("run git status for full detail");
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
   it("honors RunnerOptions timeout and session storage overrides", async () => {
     const sessionStoragePath = path.join(
       os.tmpdir(),

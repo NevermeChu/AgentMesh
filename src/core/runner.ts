@@ -110,11 +110,41 @@ export interface ContinueTaskParams {
 
 const MAX_SHARED_TURNS = 8;
 const MAX_SHARED_ANSWER_CHARS = 4_000;
-const MAX_SHARED_CONTEXT_CHARS = 24_000;
 const MAX_CONTEXT_SOURCES = 4;
+
+/**
+ * T2.4 segmented budgets replace the legacy single 24k pool: every segment has
+ * its own hard cap so one bloated segment can never starve the others (e.g.
+ * saturated upstream conclusions no longer crowd out the environment snapshot).
+ */
+/** Segment 1 — per-turn task-description echo carried inside shared history. */
+export const MAX_SHARED_TASK_DESC_CHARS = 4_000;
+/** Segment 2 — total upstream-conclusions budget, split evenly across sources. */
+export const UPSTREAM_CONCLUSIONS_BUDGET_CHARS = 12_000;
+/** Segment 3 — environment-snapshot cap before the self-service hint kicks in. */
+export const ENVIRONMENT_SNAPSHOT_BUDGET_CHARS = 2_000;
+/**
+ * Legacy overall ceiling, kept as the documented reserve: the three segments
+ * allocate at most 18k of it, leaving ~6k of headroom so the downstream agent
+ * keeps room for its own task framing and response planning.
+ */
+export const MAX_SHARED_CONTEXT_CHARS = 24_000;
 
 function truncateSharedText(value: string, maxChars: number = MAX_SHARED_ANSWER_CHARS): string {
   return truncateText(value, maxChars, "... [truncated]");
+}
+
+/**
+ * Renders the environment-snapshot segment under its own budget. When the
+ * evidence line overflows, the cut is marked explicitly and a self-service
+ * remediation instruction replaces the missing detail instead of silence.
+ */
+function renderEnvironmentSnapshot(evidence: RepositoryStateEvidence | undefined): string {
+  const line = evidence
+    ? `Current repository: ${formatRepositoryState(evidence)}`
+    : "Current repository: unavailable";
+  if (line.length <= ENVIRONMENT_SNAPSHOT_BUDGET_CHARS) return line;
+  return `${truncateSharedText(line, ENVIRONMENT_SNAPSHOT_BUDGET_CHARS)}\n[Environment snapshot truncated; run git status for full detail.]`;
 }
 
 function formatRepositoryState(evidence: RepositoryStateEvidence): string {
@@ -145,7 +175,7 @@ function renderSharedTurn(
 ): { text: string; answerTruncated: boolean } {
   const details = [
     `[Shared Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
-    `Task: ${history.task}`,
+    `Task: ${truncateSharedText(history.task, MAX_SHARED_TASK_DESC_CHARS)}`,
   ];
   let answerTruncated = false;
   if (history.summary) details.push(`Summary: ${history.summary}`);
@@ -226,7 +256,8 @@ function renderSourceBlock(
 /**
  * Renders the normalized history of one or more source sessions as first-hand
  * shared context, replacing orchestrator-side relay through task text. Each
- * source keeps its own freshness verdict and a bounded character budget.
+ * segment (per-turn task echo, upstream conclusions, environment snapshot)
+ * keeps its own bounded character budget per the T2.4 segmented scheme.
  *
  * Returns per-source injection statistics so callers can audit verbatim what
  * downstream agents actually received (see SharedContextAudit).
@@ -237,7 +268,10 @@ export function buildSharedContextDetailed(
 ): SharedContextRender | undefined {
   const usable = sources.filter((session) => session.history.length > 0);
   if (usable.length === 0) return undefined;
-  const perSourceBudget = Math.max(2_000, Math.floor(MAX_SHARED_CONTEXT_CHARS / usable.length));
+  const perSourceBudget = Math.max(
+    2_000,
+    Math.floor(UPSTREAM_CONCLUSIONS_BUDGET_CHARS / usable.length),
+  );
   const header =
     usable.length === 1 ? "## Shared Context" : `## Shared Context (${usable.length} sources)`;
   const blocks = usable.map((session, index) =>
@@ -247,9 +281,7 @@ export function buildSharedContextDetailed(
     text: [
       header,
       "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context.",
-      currentRepositoryState
-        ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
-        : "Current repository: unavailable",
+      renderEnvironmentSnapshot(currentRepositoryState),
       ...blocks.map((block) => block.text),
     ].join("\n\n"),
     sources: usable.map((session, index) => ({

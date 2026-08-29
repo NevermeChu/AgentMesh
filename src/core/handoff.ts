@@ -75,7 +75,11 @@ function cleanItemLine(line: string): string {
         (_match, text: string, url: string) => text.trim() || url,
       )
       .replace(/`/g, "")
-      .replace(/\*{1,2}|_{1,2}/g, "")
+      // Strip paired emphasis only (**bold**, __bold__). Bare `*` must survive:
+      // it is a literal in cron expressions, globs, and shell wildcards, and the
+      // earlier blanket strip mangled handoff commands (R15 real-test finding).
+      .replace(/\*\*([^*]+)\*\*/g, "$1")
+      .replace(/__([^_]+)__/g, "$1")
       .trim(),
     MAX_ITEM_CHARS,
   );

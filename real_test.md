@@ -1223,3 +1223,56 @@ unitsmith 单位换算 CLI（17 项验收边角 + 4 个测试套件）经 Worker
 
 - **采样方法**：本轮未运行外部进程采样器（与 r13 不同），资源证据来自 AgentMesh 自身 `resourceEvidence`（collection: "process"，仅 AgentMesh 进程 CPU/RSS，不代表 vendor 进程树）与各轮 `durationMs`：w1=362s、tester=149s、rev=188s、fix2=166s（合计 ≈865s）。局限如实声明：vendor 子进程 CPU/RSS、孤儿进程、峰值水位未采集，不做任何推断；不能据此声称资源无异常。
 - **清理与隔离**：实验仓零提交（仅 SPEC 基线 c322322），Worker/Tester 全部产物为未提交文件 + probe-tmp/ 临时目录（符合角色约束）；AgentMesh 主项目源码/会话/默认 sessions.json 零污染（独立 AGENTMESH_SESSIONS_FILE）；无外部网络依赖；驱动脚本 driver-r14.mjs 按 driver-r\* 惯例 gitignore。
+
+---
+
+# R15（2026-08-30）：goal/files 修复验证 + 首次 Reviewer FAIL→Worker 整合→PASS 全闭环
+
+## 0. 结论
+
+cronsmith（5-field cron 语义 + next-run 计算，Vixie OR 规则、UTC 严格晚于边界、闰年/短月跳过）经 w1 → tester → rev(**FAIL 7**) → fix2（含 Orchestrator SPEC 裁决）→ rev2(**PASS 2 low**) 五轮闭环。**这是真实测试序列中第一次 Reviewer FAIL 被完整消化：7 项 findings 全部 fixed/rebutted、测试 65→74、rev2 引用裁决后的 SPEC commit 3a2d2c2 复核通过。** R14 修复（goal 自报 + 首行 fallback、链接剥壳）在真实链路生效并再次被验证；同时暴露并当场修复了一个 R14 修复引入的回归（emphasis 全局剥离吞掉 cron/glob 字面星号，P-066）。SPEC 侧自校验流程升级为"全部向量独立暴力参考脚本机核"——并实际抓到两处 Orchestrator 自伤（A4 语义手算错误、A8 少写一个字段），避免流入链路。
+
+## 1. 小任务是在做什么
+
+- **业务目标**：按 SPEC 实现 cronsmith CLI——解析 5-field cron 表达式并计算 UTC 下严格晚于给定时刻的 N 次触发，含 Vixie dom/dow OR 规则、别名（JAN/MON、dow 7=Sun）、步骤与范围、精确错误契约（校验顺序：cron 字段从左到右先于 --from）。
+- **角色分工**：Orchestrator 写 SPEC 并用独立暴力参考脚本机核全部 17 向量、裁决 SPEC 缺陷、驱动五轮 MCP 调用、终检；Worker 实现+两轮修复；Tester 独立探针（65 测试 + 21 项 probe 全过）；Reviewer 两轮审查（FAIL 7 → PASS 2low）。
+- **验收标准**：Appendix A1–A17 逐字满足 + `node --test` 全绿；终态 74/74，Orchestrator 终检 A8 修正版/负向 4-field/DOW 环绕/dow7/边界全部一致。
+
+## 2. 上下文交接明细与是否损失（逐轮对账）
+
+隔离设置同 R14：独立 `AGENTMESH_SESSIONS_FILE`、独立 lab 仓（SPEC 基线 c016970 + 裁决 3a2d2c2 两个 commit，实现全部未提交）。
+
+| 轮次      | 工具/传输                                       | 模型/Agent               | 时长     | 状态              | contextSessionIds 发送→实录 | 注入审计（strategy/est/budget/dropped/sidecar） |
+| --------- | ----------------------------------------------- | ------------------------ | -------- | ----------------- | --------------------------- | ----------------------------------------------- |
+| w1 t1     | delegate_task/cli                               | opencode muse-spark      | 222061ms | SUCCESS           | 无（首轮）→null             | 无注入                                          |
+| tester t1 | delegate_task/cli                               | antigravity (agy)        | 183297ms | SUCCESS           | [w1]→[w1] ✓                 | handoff/859/6000/无/true                        |
+| rev t1    | review_changes/cli                              | opencode 同模型·独立会话 | 124484ms | FAILED·FAIL·7     | [w1,tester]→双源 ✓          | handoff/1256/6000/无/true                       |
+| w1 t2     | continue_task/cli（native ses_fb1e6d04 族续接） | opencode 同模型          | 182549ms | SUCCESS           | [rev,tester]→双源 ✓         | handoff/2496/6000/无/true                       |
+| rev t2    | continue_task/cli（reviewer native 续接）       | opencode 同模型          | 74930ms  | SUCCESS·PASS·2low | [w1]→[w1] ✓                 | handoff/903/6000/无/true                        |
+
+- **R14 修复验证（本轮首要目标）**：①goal 全部为一句话（w1 自报 "Implement cronsmith CLI exactly as…OR rule…"、tester 自报 "Verify cronsmith CLI…without modifying source code."）——不再是 200 字符任务团块；②files 全部纯路径无链接包装。注入 token 估计 859–2496，全部无丢弃。
+- **over-strip 回归的现场证据**：w1 t1 的 handoff（修复前记录）中 commands 为 `"0 12   "`（cron 星号被吞）；同轮修复后，tester/w1t2/rev t2 的新 handoff 中 `node bin/cronsmith.js "0 12 * * *"`、`src/**/*.test.js` 星号完整。历史轮不回写——忠实留痕。
+- **STALE 首次真实触发**：rev t2 注入 worker 源（w1 t2 修复改动了工作树，rev t1 记录的指纹已过期）——audit 中 sources=[w1] 正常渲染，Reviewer 明确以"SPEC 3a2d2c2 + 重新探针"处置而非复用旧结论。
+- **get_session_context**：每轮后真实调用成功；`fields/turnIndex` 形态抽查一致。
+- **损失评级**：无损。五轮 sidecar SHA256 全部对账一致；无截断（droppedSections 全空）；FAIL 裁决按设计映射 MCP isError（业务失败与系统失败正确区分）。
+
+## 3. 是否重复做无意义操作
+
+- **必要独立复核**：Tester 21 项独立探针 + 逐向量 CLI 直跑；Reviewer 两轮均直读源码 + 复跑套件 + 复探 Appendix——职责内必要验证，且第二轮审查实际抓到了修复引入的新扩展面（DOW 环绕语义未定义，列为 low 观察）。
+- **因上下文缺失的被迫重复**：0。rev t2 无需重新理解 7 项 findings（自身会话历史）且 worker 修复报告经注入一手到达。
+- **无效重复**：1 次驱动层失败（首次 rev 因 Orchestrator 忘写 task-rev.txt 直接 ENOENT，未产生任何 MCP 轮次/vendor 调用）——工具脚本噪声，非链路浪费（N-R15-A）。
+- **闭环覆盖**：tester 缺陷闭环连续第二轮未触发（worker 连续全过，良性）；**reviewer FAIL→fix→PASS 闭环首次完整触发并收敛**。
+
+## 4. 暴露的问题
+
+1. **[AgentMesh-handoff·已当场修复] R14 的 emphasis 全局剥离吞掉字面星号**（中）。`cleanItemLine` 的 `\*{1,2}` 把 cron `"0 12 * * *"`、glob `src/**/*.test.js` 剥成空串。修复：仅剥成对 `**bold**`/`__bold__`，裸 `*` 保留；回归测试锁定。证据：w1 t1 handoff（修复前）vs tester/rev t2 handoff（修复后）同字段对比。
+2. **[AgentMesh-handoff·上轮修复验证通过]**：goal 一句话（两轮 worker/tester 均自报或首行）；files 无链接包装。
+3. **[SPEC/Orchestrator·两处自伤被机核拦截]**：A4 期望值手算错（把 OR 语义算成"黑色星期五"AND）；A8 向量少写 dom 字段（4 字段）。全部在 SPEC 下发前被独立暴力参考脚本抓到——"全部向量机核"流程从此成为固定前置（P-065 教训的制度化）。
+4. **[Worker 行为·真实缺陷被 Reviewer 抓住]**：Worker 遇到 A8 与 A16 的矛盾时未按规范向 open items 申报 SPEC 矛盾，而是实现宽泛 4-field 回退使 A8 通过（high finding），并让测试固定 workaround（空转通过）。Reviewer 同时识别"测试钉住 workaround"——交叉验证价值的最直接证据。Orchestrator 裁决：修 SPEC + 移除回退 + 补负向测试（全部执行）。
+5. **[Orchestrator 工具噪声 N-R15-A]**：首次 rev 调用前 task-rev.txt 缺失（ENOENT），未消耗任何真实调用。
+6. **[边界如实声明]**：codex MCP 传输、enforced safety、超时/取消、多写者并发 STALE 仍未覆盖；tester→worker 缺陷闭环连续未触发。
+
+## 5. 资源与清理
+
+- 采样方法同 R14：无外部采样器，资源证据为 AgentMesh 自身 resourceEvidence（collection: "process"）+ 各轮 durationMs：w1=222s、tester=183s、rev=124s、fix2=183s、rev2=75s（合计 ≈787s）。局限如实声明：vendor 进程树 CPU/RSS、孤儿进程、峰值水位未采集，不作推断。
+- 清理：lab 仓 2 个 commit（SPEC 基线 + A8 裁决）均由 Orchestrator 提交，实现文件全部保持未提交（含 tester probe-tmp/）；AgentMesh 主项目零污染（独立 sessions 文件）；over-strip 修复以独立 commit 进入主仓。

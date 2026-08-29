@@ -143,6 +143,22 @@ describe("core/handoff parseHandoffReport", () => {
       "lib/units.js (created)",
     ]);
   });
+
+  it("preserves literal asterisks (cron/glob) while stripping paired emphasis", () => {
+    // Regression (real-test R15): the blanket emphasis strip mangled cron
+    // expressions and globs inside Commands items.
+    const answer = [
+      "## Commands",
+      '- **run** `node bin/cronsmith.js "* * * * *" --from 2026-01-01T00:00:00Z --count 3`',
+      "- glob check: src/**/*.test.js",
+    ].join("\n");
+    const handoff = parseHandoffReport(answer, "Task", "success");
+
+    expect(handoff!.artifacts.commands).toEqual([
+      'run node bin/cronsmith.js "* * * * *" --from 2026-01-01T00:00:00Z --count 3',
+      "glob check: src/**/*.test.js",
+    ]);
+  });
 });
 
 describe("core/text token estimation", () => {

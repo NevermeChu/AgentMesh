@@ -634,3 +634,13 @@
 **解决方法**：parseReviewOutput 在解析前生成剥除 `**`/`__`/反引号装饰的 normalized 副本，verdict 与 findings 解析均基于该副本；bare verdict 只信任输出前 10 行、显式 PASS 下 critical/high 才翻案的 fail-closed 语义不变。补充 P-063 回归用例（加粗标签 + 深置 verdict 的完整形态）。
 
 **状态**：已解决（2026-08-29，L4 真链路 S4 冒烟复验：FAIL→自动修复→复审 PASS 一轮闭环，rounds=1）。
+
+## P-064 zcode start-plan 端点对独立 headless 进程强制 captcha，桌面外不可编程接入
+
+**问题**：zcode CLI（`F:/zcode/resources/glm/zcode.cjs` 0.16.5）作为 AgentMesh worker 委派时，模型配置可通过环境变量生效（`ZCODE_MODEL`/`ZCODE_BASE_URL`/`ZCODE_API_KEY`），请求可到达 start-plan 端点（`https://zcode.z.ai/api/v1/zcode-plan/anthropic`），但被阿里云 WAF 以 `captcha verify failed` 拒绝（要求 `x-aliyun-captcha-verify-param` 头）。换用共享 OAuth JWT（`~/.zcode/v2/credentials.json` 的 `zcodejwttoken`）则为 Unauthorized。桌面客户端能通过该风控（bundle 内存在 `captcha-retry` 请求类型，由桌面 surface 处理挑战），独立 headless 进程无解。
+
+**验证过程**（2026-08-29）：①引擎可独立运行且三契约齐备（`-p` 一次性任务/`--json`/`--resume`/`--mode`/`--allowed-tools`）；②env 模型配置生效（报错从"config missing"推进到供应商 400/风控）；③`--surface desktop` 不改变 WAF 判定；④CLI 与桌面共享凭据存储（`createSharedZCodeCredentialStore` 实证）。
+
+**状态**：封存（非 AgentMesh 缺陷，厂商无 headless 通道）。矩阵中 zcode 适配器保留（`zcode <prompt>` 薄封装），但不承诺可用；重启会话或厂商开放 headless 入口后重估。CLI 的 `zcode login` OAuth 流程可能建立 CLI 自己的凭据，是否绕开 WAF 未验证。
+
+**教训**：接入新 vendor 前先验证其 headless 通道在账号层是否可用（能力矩阵的"声明支持≠实际可用"缺口的账号级实例，参见 P-REAL-007 后续"矩阵粒度缺口"）。

@@ -122,7 +122,8 @@ describe("core/diagnostics", () => {
 
     const configCheck = findCheck(report.checks, "config.file");
     expect(configCheck?.status).toBe("fail");
-    expect(configCheck?.detail).toContain("Failed to read AgentMesh project config");
+    expect(configCheck?.detail).toContain("Invalid AgentMesh project config");
+    expect(configCheck?.detail).toContain("Invalid JSON");
   });
 
   it("fails on a schema-violating project config", async () => {

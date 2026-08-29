@@ -10,13 +10,13 @@
 
 ## 已知不稳定用例（Known Flaky Set）
 
-| 测试文件 | 用例 | 观察到的现象 | 初步归因 |
-|---|---|---|---|
-| tests/core/repository.test.ts | keeps untracked fingerprints deterministic beyond the content-hash cap | `Test timed out in 5000ms`（505 文件写入+哈希循环），随后 ENOTEMPTY 级联清理失败 | 本机小文件 I/O 慢，5s 默认超时过紧 |
-| tests/core/diagnostics.test.ts | fails on an unparseable project config / fails on a schema-violating project config / enforced reviewer fail-closed / best-effort reviewer warn 等（每次运行子集不同） | 断言失败 `expected 'fail' to be 'pass'`、`expected 1 to be +0` | 待查；疑似环境相关或负载下超时引发的级联 |
-| tests/core/runner.test.ts | returns failure when continuing/delegating to a missing session | 偶发 | 待查 |
-| tests/mcp/tools.test.ts | （名称随运行变化） | 偶发 | 待查 |
-| tests/agents/args.test.ts | returns a structured failure for a missing binary | 偶发 | 待查 |
+| 测试文件                       | 用例                                                                                                                                                                   | 观察到的现象                                                                     | 初步归因                                 |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------- |
+| tests/core/repository.test.ts  | keeps untracked fingerprints deterministic beyond the content-hash cap                                                                                                 | `Test timed out in 5000ms`（505 文件写入+哈希循环），随后 ENOTEMPTY 级联清理失败 | 本机小文件 I/O 慢，5s 默认超时过紧       |
+| tests/core/diagnostics.test.ts | fails on an unparseable project config / fails on a schema-violating project config / enforced reviewer fail-closed / best-effort reviewer warn 等（每次运行子集不同） | 断言失败 `expected 'fail' to be 'pass'`、`expected 1 to be +0`                   | 待查；疑似环境相关或负载下超时引发的级联 |
+| tests/core/runner.test.ts      | returns failure when continuing/delegating to a missing session                                                                                                        | 偶发                                                                             | 待查                                     |
+| tests/mcp/tools.test.ts        | （名称随运行变化）                                                                                                                                                     | 偶发                                                                             | 待查                                     |
+| tests/agents/args.test.ts      | returns a structured failure for a missing binary                                                                                                                      | 偶发                                                                             | 待查                                     |
 
 ## 对各升级窗口的约束
 

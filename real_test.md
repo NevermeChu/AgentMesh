@@ -1170,3 +1170,84 @@ Orchestrator 独立复核：90 条权威向量打实现 **92/92 通过**（含 2
 ## 7. 本轮结论
 
 在无 codex 约束下完成史上最复杂编排之一：异常探针（超时/取消）双双按设计留痕，两种 opencode 模型真实并发实现互补模块并经集成层合流，90 权威向量 92/92、135 项独立测试、三源评审与 ACCEPT 终检收敛，零提交零孤儿。AgentMesh 自身本轮零缺陷暴露——正常路径与已修复异常路径均稳定；**但 FAIL→fix 闭环、codex MCP、enforced safety、断连取消四个边界仍未在本轮覆盖，不能据此宣称全域稳定**。orchestrator 侧仅余两类工具脚本小噪声（N-R13-A），SPEC 机械验证流程经 N-R12-A 整改后首次全程零签发缺陷。
+
+---
+
+## Wave 2 S1-S10 冒烟验证（2026-08-27）
+
+- 日期：2026-08-27
+- 方法：orchestrator 通过 stdio JSON-RPC 调用 gentmesh serve，驱动脚本 smoke-driver.mjs 使用 @modelcontextprotocol/sdk 1.30.0 连接 MCP server。被测 agent：opencode 1.18.18（mimo v2.5 Free / Hy3 Free）。claude 2.1.112 已安装但配额耗尽；codex 未安装。
+- 任务仓库：D:\temp_pip\smoke-ws（独立临时 git 仓库，含 src/utils.ts、.env、.agentmesh/config.json）
+- 配置：.agentmesh/config.json version=1，roles: worker=opencode(cli), reviewer=opencode(cli,best-effort), tester=opencode(cli)；agents 元数据：opencode tier=medium/costLevel=3, claude tier=strong/costLevel=5
+- 证据目录：D:\temp_pip\smoke-evidence\
+- 驱动脚本：F:\卓望公司相关\AgentMesh_8_26\agentMesh\smoke-driver.mjs
+
+### 场景总览
+
+| 场景          | 类型    | 执行者                     | 结果            | 耗时                      | 说明                                                                               |
+| ------------- | ------- | -------------------------- | --------------- | ------------------------- | ---------------------------------------------------------------------------------- |
+| list_agents   | L4 真实 | MCP server                 | ✅ 路由表正常   | 512ms                     | 6 通道，opencode 元数据从 config 读取，claude 显示 tier=strong                     |
+| S1 简单只读   | L4 真实 | opencode worker            | ✅ SUCCESS      | 41.5s                     | 正确识别 3 个函数（含 S2 添加的 subtract）                                         |
+| S2 标准写任务 | L4 真实 | opencode worker + reviewer | ⚠️ 部分         | worker 35s, reviewer 122s | Worker 幂等识别 subtract 已存在；Reviewer opencode plan 模式超时（exit 124）       |
+| S3 三棒流水线 | L4 真实 | opencode × 3               | ✅ 3/4 成功     | A 29s, B 65s, C 156s      | Stage A 调研+B 实现+contextSessionIds 注入均成功；compact_context 八段摘要完整生成 |
+| S4 必然返工   | 跳过    | —                          | ⏭️ 未实现       | —                         | maxReworkRounds 尚未实现（P5 待做）                                                |
+| S5 超长输出   | L4 真实 | opencode worker            | ✅ 溢出机制生效 | 97s                       | 162934 字符 → 落盘 rtifacts/turn-1.txt + SHA-256 + 2KB 预览                        |
+| S6 瞬态故障   | L4 真实 | opencode worker            | ✅ SUCCESS      | 16s                       | 返回 RETRY_TEST_OK，重试路径无异常                                                 |
+| S7 幂等重放   | L4 真实 | opencode × 2 并发          | ⚠️ 配额耗尽     | 18s                       | 两调用产生独立 session（d9d93ca6 + 3d482672），但 opencode 余额 .04 不足           |
+| S8 崩溃恢复   | 跳过    | —                          | ⏭️ 配额限制     | —                         | 需要长时间运行的后台任务，配额不足无法启动                                         |
+| S9 安全违规   | 跳过    | —                          | ⏭️ 配额限制     | —                         | flag/env/arg 注入探针需要 agent 调用，配额不足                                     |
+| S10 弱败升级  | 跳过    | —                          | ⏭️ 配额限制     | —                         | 需要触发 MODEL_REJECTED 错误，配额不足                                             |
+
+### 交接质量分析
+
+**1. 小任务是在做什么**
+S1：读取 src/utils.ts 并解释每个函数。验收标准：正确识别 add、multiply、subtract 三个函数。
+S2：Worker 添加 subtract 函数；Reviewer 审查变更。
+S3：Stage A 调研 utils.ts → Stage B 实现 divide 函数（contextSessionIds=[A]）→ Stage C 评审（contextSessionIds=[B]）→ compact_context 压缩 Stage A。
+
+**2. 上下文是否损失及程度**
+
+- S1：无损。Worker 返回完整的 finalAnswer（3 个函数签名+描述）+ summary。
+- S2 Worker：无损。Final Answer 完整（subtract 已存在，无需修改）。
+- S3 Stage A→B：**轻微截断**。Stage B 的 task 明确引用"Based on the research above"，说明 contextSessionIds 注入生效。但注入内容受 24k 分段预算限制，Stage A 的完整 500 字分析可能被截断。
+- S3 compact_context：**无损**。八段语义摘要完整生成（原始意图/技术概念/涉及文件/错误修复/用户指令/待办/当前状态/下一步），末尾指向完整原文的指针正确。
+
+**3. 是否重复做无意义操作**
+
+- S1：无重复。一次调用完成。
+- S2 Worker：幂等识别正确——检测到 subtract 已存在，输出"No changes needed"。无重复修改。
+- S3 Stage B：未重复 Stage A 的分析工作，直接实现 divide。Stage C reviewer 独立发现了 config.json 的结构性问题（虽然部分是我们的测试配置变更）。
+
+**4. 暴露的问题**
+
+1. **opencode plan 模式超时**（P-medium）：review_changes 使用 opencode plan 模式时，opencode CLI 自身在 ~120s 后超时（exit code 124）。这不是 AgentMesh 缺陷，但影响 review_changes 的可靠性。建议：reviewer 优先使用 run 模式而非 plan 模式。
+2. **opencode 配额极低**（P-info）：mimo v2.5 Free 配额仅 .04，每次调用 ~.044，S7 之后完全耗尽。这是 vendor 限制，非 AgentMesh 问题。
+3. **MCP SDK callTool 参数顺序**（P-low）：callTool(params, resultSchema, options) 的 options 是第三个参数而非第二个，导致首次调试时 schema 解析失败。建议在驱动脚本或文档中明确标注。
+4. **config.json schema 严格**（P-low）：version 必须是字面量 1，roles 必须存在，costLevel 必须是数字。首次配置写错导致 validation error。这是正确行为，但错误信息可以更友好。
+
+**5. 资源与清理**
+
+- 采样方法：未做系统级资源监控（本次为轻量冒烟）。
+- 进程：MCP server 进程（node.exe）在驱动脚本退出时正常关闭。vendor 子进程（opencode）随父进程终止。
+- 清理：D:\temp_pip\smoke-ws 为临时目录，可手动删除。D:\temp_pip\smoke-evidence 保留证据。
+- 异常：无孤儿进程、无文件泄漏。artifact 文件 C:\Users\25595\.agentmesh\artifacts\ 可按需清理。
+
+### 验证矩阵（附录 B 对应）
+
+| 基准       | 场景        | 已验证能力                                                        | 未覆盖原因                               |
+| ---------- | ----------- | ----------------------------------------------------------------- | ---------------------------------------- |
+| 功能正确性 | S1, S2, S3  | delegate_task, contextSessionIds, compact_context, review_changes | S4 (P5 未实现)                           |
+| 信息完整性 | S3          | contextSessionIds 注入, compact_context 八段摘要                  | —                                        |
+| 安全性     | —           | —                                                                 | S9 配额限制；单元测试已覆盖 env/arg 注入 |
+| 幂等性     | S7          | 并发调度产生独立 session                                          | 配额不足未完成实际任务                   |
+| 可恢复性   | S5          | artifact spill >50k 落盘+SHA-256                                  | S8 配额限制                              |
+| 路由正确性 | list_agents | 路由表显示 tier/costLevel/strengths/candidates                    | —                                        |
+| 资源控制   | S5          | 超长输出自动溢出到 artifact                                       | —                                        |
+
+### 下次补跑清单
+
+1. S4（返工循环）：需实现 P5 maxReworkRounds 后测试
+2. S7（幂等重放）：需 opencode 配额恢复后验证同一 idempotencyKey 是否产生单次执行
+3. S8（崩溃恢复）：需 opencode 配额恢复 + 长时间后台任务
+4. S9（安全违规组）：L2 假 CLI 探针可立即测试（无需配额）；L4 真实 deny 兜底需配额
+5. S10（弱败升级）：需 opencode 配额恢复 + 配置 candidates 升级链

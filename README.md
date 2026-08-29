@@ -201,7 +201,10 @@ agentmesh capabilities show
 5. **`get_session`**
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
-6. **`get_role_config`**
+6. **`get_session_context`**
+   - 按轮读取一个 Bridge Session 的记录内容：默认返回该轮的结构化 handoff（goal/decisions/artifacts/open items），也可按 `fields` 取回完整 `finalAnswer`、`findings` 或执行证据，并附当前工作树下的 `MATCHED`/`STALE`/`UNKNOWN` 新鲜度。这是 handoff 优先注入的按需取回通道：下游需要上游细节时调用本工具，而不是要求 AgentMesh 把全文灌进每个 prompt。
+   - 参数：`sessionId` (必填), `turnIndex` (可选，1-based，缺省为最后一轮), `fields` (可选，`handoff` | `finalAnswer` | `findings` | `evidence` 的数组，缺省 `["handoff"]`)。
+7. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
    - 参数：`cwd` (可选，默认当前目录)。
 
@@ -235,9 +238,13 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
-`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的规范化历史**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。注入内容有全局字符预算（24k，按源均分），超限会先丢弃较旧轮次并显式标注 `[truncated]` / `[N older turn(s) omitted]`；该轮实际注入了哪些来源会记录在历史条目的 `contextSources` 字段中，便于复盘。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的交接上下文**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度（置于块尾）——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）。
+注入采用 **handoff 优先**策略并以 token（估算值，非字符数）为预算（默认总预算 6000 token，按源均分、单源下限 1200）：每个来源**完整内联最近一轮的结构化 handoff**（goal、关键决定、产物文件/命令、未决事项），更早轮次只保留一行索引（`[Turn N | role | status] goal`）；历史条目没有 handoff 时（旧会话或 vendor 未遵循报告契约）回退为精简的 legacy 轮次回放（`Final answer` 截断到 1200 字符）。超预算时按"先丢复现细节、后丢结论"的固定顺序丢弃（Tests → Open Items → Commands → Files → Decisions → Findings → 证据 → 最终硬截断），实际丢弃的章节记录在该轮 `sharedContextAudit.droppedSections` 中，审计还记录 `strategy`（`handoff` | `legacy`）、`estimatedTokens` 与 `injectedOwnHistory`；被裁剪的信息不会丢失——下游可用 `get_session_context` 取回全文。该轮实际注入了哪些来源仍记录在 `contextSources` 字段中。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+
+**Handoff 契约（写端）**：`delegate_task`/`continue_task` 的 worker 与 tester prompt 末尾会附加固定的 Handoff Report 契约（Reviewer 除外，其输出由严格的 PASS/FAIL findings 契约约束），要求 vendor Agent 在最终回答结尾以固定小节（`## Decisions` / `## Files` / `## Commands` / `## Tests` / `## Open Items`）收尾并保持简洁；runner 由此解析出每轮的 `handoff` 结构存入会话历史（解析失败时该轮无 `handoff`，注入自动回退 legacy 渲染）。长度约束在源头生效，接收端不再依赖大字符截断。
+
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）或 `get_session_context(fields=["finalAnswer"])`（截断到 24000 字符）。
 
 Session 持久化有容量上限以防止 `sessions.json` 无界增长：每个会话默认保留最近 50 轮历史（更早轮次按时间丢弃），存储整体默认保留最近更新的 200 个会话（超出按 LRU 逐出）。两个上限均可通过程序化 `SessionManagerOptions` 调整，设为 `0` 表示不限制。
 

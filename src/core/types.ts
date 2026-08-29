@@ -44,6 +44,26 @@ export interface SessionExecutionEvidence {
   transportFallback?: TransportFallbackEvidence;
 }
 
+/**
+ * Structured handoff extracted from one turn's final answer. Downstream
+ * injections render this instead of replaying the full answer body.
+ */
+export interface HandoffSummary {
+  /** One-line restatement of what this turn set out to do. */
+  goal: string;
+  outcome: "success" | "failed";
+  /** Conclusions the next agent should not re-derive. */
+  keyDecisions: string[];
+  /** Reusable outputs: files touched, commands to reproduce, test outcome. */
+  artifacts: {
+    files?: string[];
+    commands?: string[];
+    tests?: string;
+  };
+  /** Unfinished work, known risks, or open questions for the receiver. */
+  openItems: string[];
+}
+
 /** Verbatim-audit record for the shared context injected into one turn's prompt. */
 export interface SharedContextAudit {
   /** Sidecar file holding the exact rendered block (relative to the sessions storage directory). */
@@ -52,6 +72,14 @@ export interface SharedContextAudit {
   sha256: string;
   totalChars: number;
   sources: Array<{ sessionId: string; chars: number; truncated: boolean }>;
+  /** Injection strategy that rendered the block ("legacy" = pre-handoff replay). */
+  strategy?: "handoff" | "legacy";
+  /** Estimated model tokens of the rendered block. */
+  estimatedTokens?: number;
+  /** Sections dropped or truncated to fit the injection budget. */
+  droppedSections?: string[];
+  /** Whether the receiving session's own history was part of the injected block. */
+  injectedOwnHistory?: boolean;
 }
 
 export interface SessionHistoryEntry {
@@ -61,6 +89,8 @@ export interface SessionHistoryEntry {
   status: "success" | "failed";
   summary?: string;
   finalAnswer?: string;
+  /** Structured handoff parsed from the final answer; absent when parsing failed. */
+  handoff?: HandoffSummary;
   findings?: ReviewFinding[];
   nativeSessionId?: string;
   evidence?: SessionExecutionEvidence;

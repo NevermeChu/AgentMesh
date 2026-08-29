@@ -5,6 +5,7 @@ import type {
   AgentResult,
   AgentRole,
   ReasoningEffort,
+  ReviewFinding,
   ReviewerSafetyPolicy,
   ReviewerSafetyReport,
   RunAgentOptions,
@@ -16,9 +17,11 @@ import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
-import { truncateText } from "./text.js";
+import { parseHandoffReport } from "./handoff.js";
+import { estimateTokens, truncateText, truncateTextToTokenBudget } from "./text.js";
 import type {
   BridgeSession,
+  HandoffSummary,
   RepositoryStateEvidence,
   RunnerOptions,
   SessionExecutionEvidence,
@@ -89,12 +92,38 @@ export interface ContinueTaskParams {
   signal?: AbortSignal;
 }
 
-const MAX_SHARED_TURNS = 8;
-const MAX_SHARED_ANSWER_CHARS = 4_000;
-const MAX_SHARED_CONTEXT_CHARS = 24_000;
-const MAX_CONTEXT_SOURCES = 4;
+export type SessionTurnContextField = "handoff" | "finalAnswer" | "findings" | "evidence";
 
-function truncateSharedText(value: string, maxChars: number = MAX_SHARED_ANSWER_CHARS): string {
+/** One recorded turn as returned by the get_session_context retrieval tool. */
+export interface SessionTurnContext {
+  sessionId: string;
+  turnIndex: number;
+  totalTurns: number;
+  agent: AgentName;
+  role: AgentRole;
+  status: "success" | "failed";
+  timestamp: string;
+  task: string;
+  summary?: string;
+  freshness: ContextFreshness;
+  handoff?: HandoffSummary;
+  finalAnswer?: string;
+  findings?: ReviewFinding[];
+  evidence?: SessionExecutionEvidence;
+  reviewerSafety?: ReviewerSafetyReport;
+}
+
+const MAX_CONTEXT_SOURCES = 4;
+const MAX_SHARED_CONTEXT_TOKENS = 6_000;
+const MIN_PER_SOURCE_TOKENS = 1_200;
+/** Turns without a structured handoff replay a shortened answer slice. */
+const LEGACY_ANSWER_CHARS = 1_200;
+/** Full-answer retrieval cap for the get_session_context tool. */
+const MAX_CONTEXT_TOOL_ANSWER_CHARS = 24_000;
+
+export type ContextFreshness = "MATCHED" | "STALE" | "UNKNOWN";
+
+function truncateSharedText(value: string, maxChars: number): string {
   return truncateText(value, maxChars, "... [truncated]");
 }
 
@@ -105,51 +134,192 @@ function formatRepositoryState(evidence: RepositoryStateEvidence): string {
   return `head=${evidence.head || "unborn"}; dirty=${evidence.dirty}; fingerprint=${evidence.fingerprint}${changed}`;
 }
 
-function formatFreshness(
+/**
+ * Compares the current working tree against the source session's last recorded
+ * repository fingerprint. MATCHED lets downstream agents reuse prior results
+ * directly; STALE demands revalidation of affected evidence.
+ */
+export function computeSessionFreshness(
   session: BridgeSession,
   current: RepositoryStateEvidence | undefined,
-): string {
+): ContextFreshness {
   const previous = session.history.at(-1)?.evidence?.repositoryAfter;
   if (previous && current) {
     return previous.repositoryRoot === current.repositoryRoot &&
       previous.fingerprint === current.fingerprint
-      ? "MATCHED: the current working tree matches the last recorded handoff state."
-      : "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence.";
+      ? "MATCHED"
+      : "STALE";
   }
-  return "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.";
+  return "UNKNOWN";
 }
 
-function renderSharedTurn(
-  history: SessionHistoryEntry,
+const FRESHNESS_LABELS: Record<ContextFreshness, string> = {
+  MATCHED: "MATCHED: the current working tree matches the last recorded handoff state.",
+  STALE:
+    "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence.",
+  UNKNOWN: "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.",
+};
+
+/**
+ * One droppable piece of a turn rendering. `dropPriority` orders budget-driven
+ * removal: reproducibility detail goes first, conclusions last.
+ */
+interface TurnSection {
+  name: string;
+  dropPriority: number;
+  text: string;
+}
+
+interface TurnRender {
+  heading: string;
+  /** Anchor line (goal or task) that survives every budget stage; empty joins are filtered. */
+  coreLine: string;
+  sections: TurnSection[];
+  /** Set when a legacy answer slice was shortened (reported via `truncated`). */
+  answerTruncated?: boolean;
+}
+
+function executionEvidenceLine(entry: SessionHistoryEntry): string | undefined {
+  if (!entry.evidence) return undefined;
+  return `Execution evidence: transport=${entry.evidence.transportUsed || "unknown"}; exitCode=${entry.evidence.exitCode ?? "unknown"}; durationMs=${entry.evidence.durationMs ?? "unknown"}`;
+}
+
+function turnHeading(
   session: BridgeSession,
+  entry: SessionHistoryEntry,
   turnNumber: number,
-): { text: string; answerTruncated: boolean } {
-  const details = [
-    `[Shared Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${history.role.toUpperCase()} | Status: ${history.status.toUpperCase()}]`,
-    `Task: ${history.task}`,
-  ];
+): string {
+  return `[Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${entry.role.toUpperCase()} | Status: ${entry.status.toUpperCase()}]`;
+}
+
+function renderHandoffTurn(
+  session: BridgeSession,
+  entry: SessionHistoryEntry,
+  turnNumber: number,
+): TurnRender {
+  const handoff = entry.handoff!;
+  const sections: TurnSection[] = [];
+  if (handoff.artifacts.tests) {
+    sections.push({ name: "Tests", dropPriority: 0, text: `Tests: ${handoff.artifacts.tests}` });
+  }
+  if (handoff.openItems.length > 0) {
+    sections.push({
+      name: "Open Items",
+      dropPriority: 1,
+      text: ["Open Items:", ...handoff.openItems.map((item) => `- ${item}`)].join("\n"),
+    });
+  }
+  if (handoff.artifacts.commands?.length) {
+    sections.push({
+      name: "Commands",
+      dropPriority: 2,
+      text: `Commands: ${handoff.artifacts.commands.join("; ")}`,
+    });
+  }
+  if (handoff.artifacts.files?.length) {
+    sections.push({
+      name: "Files",
+      dropPriority: 3,
+      text: `Files: ${handoff.artifacts.files.join(", ")}`,
+    });
+  }
+  if (handoff.keyDecisions.length > 0) {
+    sections.push({
+      name: "Decisions",
+      dropPriority: 4,
+      text: ["Decisions:", ...handoff.keyDecisions.map((item) => `- ${item}`)].join("\n"),
+    });
+  }
+  if (entry.findings?.length) {
+    sections.push({
+      name: "Findings",
+      dropPriority: 5,
+      text: `Findings: ${JSON.stringify(entry.findings)}`,
+    });
+  }
+  const evidenceLine = executionEvidenceLine(entry);
+  if (evidenceLine) {
+    sections.push({ name: "Execution evidence", dropPriority: 6, text: evidenceLine });
+  }
+  if (entry.reviewerSafety) {
+    sections.push({
+      name: "Reviewer safety",
+      dropPriority: 7,
+      text: `Reviewer safety: ${JSON.stringify(entry.reviewerSafety)}`,
+    });
+  }
+  return {
+    heading: turnHeading(session, entry, turnNumber),
+    coreLine: `Goal: ${handoff.goal}`,
+    sections,
+  };
+}
+
+function renderLegacyTurn(
+  session: BridgeSession,
+  entry: SessionHistoryEntry,
+  turnNumber: number,
+): TurnRender {
+  const sections: TurnSection[] = [];
+  const details: string[] = [turnHeading(session, entry, turnNumber), `Task: ${entry.task}`];
   let answerTruncated = false;
-  if (history.summary) details.push(`Summary: ${history.summary}`);
-  if (history.finalAnswer) {
-    answerTruncated = history.finalAnswer.length > MAX_SHARED_ANSWER_CHARS;
-    details.push(`Final answer: ${truncateSharedText(history.finalAnswer)}`);
+  if (entry.summary) details.push(`Summary: ${entry.summary}`);
+  if (entry.finalAnswer) {
+    answerTruncated = entry.finalAnswer.length > LEGACY_ANSWER_CHARS;
+    sections.push({
+      name: "Final answer",
+      dropPriority: 0,
+      text: `Final answer: ${truncateSharedText(entry.finalAnswer, LEGACY_ANSWER_CHARS)}`,
+    });
   }
-  if (history.findings?.length) details.push(`Findings: ${JSON.stringify(history.findings)}`);
-  if (history.evidence?.repositoryBefore) {
-    details.push(`Repository before: ${formatRepositoryState(history.evidence.repositoryBefore)}`);
+  if (entry.findings?.length) {
+    sections.push({
+      name: "Findings",
+      dropPriority: 1,
+      text: `Findings: ${JSON.stringify(entry.findings)}`,
+    });
   }
-  if (history.evidence?.repositoryAfter) {
-    details.push(`Repository after: ${formatRepositoryState(history.evidence.repositoryAfter)}`);
-  }
-  if (history.evidence) {
-    details.push(
-      `Execution evidence: transport=${history.evidence.transportUsed || "unknown"}; exitCode=${history.evidence.exitCode ?? "unknown"}; durationMs=${history.evidence.durationMs ?? "unknown"}`,
+  const repositoryLines: string[] = [];
+  if (entry.evidence?.repositoryBefore) {
+    repositoryLines.push(
+      `Repository before: ${formatRepositoryState(entry.evidence.repositoryBefore)}`,
     );
   }
-  if (history.reviewerSafety) {
-    details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
+  if (entry.evidence?.repositoryAfter) {
+    repositoryLines.push(
+      `Repository after: ${formatRepositoryState(entry.evidence.repositoryAfter)}`,
+    );
   }
-  return { text: details.join("\n"), answerTruncated };
+  if (repositoryLines.length > 0) {
+    sections.push({
+      name: "Repository evidence",
+      dropPriority: 2,
+      text: repositoryLines.join("\n"),
+    });
+  }
+  const evidenceLine = executionEvidenceLine(entry);
+  if (evidenceLine) {
+    sections.push({ name: "Execution evidence", dropPriority: 3, text: evidenceLine });
+  }
+  if (entry.reviewerSafety) {
+    sections.push({
+      name: "Reviewer safety",
+      dropPriority: 4,
+      text: `Reviewer safety: ${JSON.stringify(entry.reviewerSafety)}`,
+    });
+  }
+  return {
+    heading: details.join("\n"),
+    coreLine: "",
+    sections,
+    ...(answerTruncated ? { answerTruncated } : {}),
+  };
+}
+
+/** One-line index of an older turn; handoff goals when available, else the task. */
+function renderTurnIndexLine(entry: SessionHistoryEntry, turnNumber: number): string {
+  const label = entry.handoff?.goal ?? truncateText(entry.task.replace(/\s+/g, " "), 80);
+  return `[Turn ${turnNumber} | ${entry.role} | ${entry.status}] ${label}`;
 }
 
 interface SourceRenderStats {
@@ -161,53 +331,94 @@ interface SourceRenderStats {
 interface SharedContextRender {
   text: string;
   sources: SourceRenderStats[];
+  strategy: "handoff" | "legacy";
+  estimatedTokens: number;
+  droppedSections: string[];
 }
 
+/**
+ * Renders one source session: the latest turn in full (structured handoff, or
+ * a shortened legacy replay), one-line indexes of older turns, and the
+ * freshness verdict at the block tail. Budget stages drop reproducibility
+ * detail before conclusions so the most recent handoff state survives.
+ */
 function renderSourceBlock(
   session: BridgeSession,
   index: number,
   total: number,
-  budget: number,
+  budgetTokens: number,
   current: RepositoryStateEvidence | undefined,
-): { text: string; truncated: boolean } {
-  const header = [
-    `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`,
-    `Context freshness: ${formatFreshness(session, current)}`,
-  ].join("\n");
+): { text: string; truncated: boolean; dropped: string[]; hasHandoff: boolean } {
+  const header = `### Source ${index + 1} of ${total} [Session: ${session.id} | Agent: ${session.agent.toUpperCase()} | Turns: ${session.history.length}]`;
+  const history = session.history;
+  const latest = history.at(-1)!;
+  const latestRender = latest.handoff
+    ? renderHandoffTurn(session, latest, history.length)
+    : renderLegacyTurn(session, latest, history.length);
+  let indexLines = history
+    .slice(0, -1)
+    .map((entry, offset) => renderTurnIndexLine(entry, offset + 1));
+  const dropped: string[] = [];
 
-  let turns = session.history.slice(-MAX_SHARED_TURNS);
-  let omittedTurns = session.history.length - turns.length;
-  const render = () =>
-    turns.map((history, offset) =>
-      renderSharedTurn(history, session, session.history.length - turns.length + offset + 1),
+  const renderBlock = (): string => {
+    const latestText = [
+      latestRender.heading,
+      latestRender.coreLine,
+      ...latestRender.sections.map((section) => section.text),
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const omittedCount = history.length - 1 - indexLines.length;
+    return [
+      latestText,
+      indexLines.length > 0 ? indexLines.join("\n") : undefined,
+      omittedCount > 0
+        ? `[${omittedCount} older turn(s) omitted within the context budget]`
+        : undefined,
+      `Context freshness: ${FRESHNESS_LABELS[computeSessionFreshness(session, current)]}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  let block = renderBlock();
+  if (estimateTokens(block) > budgetTokens && indexLines.length > 0) {
+    dropped.push("older turn indexes");
+  }
+  while (estimateTokens(block) > budgetTokens && indexLines.length > 0) {
+    indexLines = indexLines.slice(1);
+    block = renderBlock();
+  }
+  while (estimateTokens(block) > budgetTokens && latestRender.sections.length > 0) {
+    const victim = latestRender.sections.reduce((min, section) =>
+      section.dropPriority < min.dropPriority ? section : min,
     );
-
-  let rendered = render();
-  // Oldest turns are dropped first so the most recent handoff state survives.
-  while (rendered.map((turn) => turn.text).join("\n\n").length > budget && turns.length > 1) {
-    turns = turns.slice(1);
-    omittedTurns += 1;
-    rendered = render();
+    latestRender.sections = latestRender.sections.filter((section) => section !== victim);
+    dropped.push(`turn ${history.length} ${victim.name}`);
+    block = renderBlock();
   }
-  let body = rendered.map((turn) => turn.text).join("\n\n");
-  let clamped = false;
-  if (body.length > budget) {
-    body = truncateSharedText(body, budget);
-    clamped = true;
+  if (estimateTokens(block) > budgetTokens) {
+    block = truncateTextToTokenBudget(block, budgetTokens);
+    dropped.push("hard truncated");
   }
-  const omissionNote =
-    omittedTurns > 0 ? `[${omittedTurns} older turn(s) omitted within the context budget]` : "";
-  const text = [header, body, omissionNote].filter(Boolean).join("\n\n");
   return {
-    text,
-    truncated: clamped || omittedTurns > 0 || rendered.some((turn) => turn.answerTruncated),
+    text: [header, block].join("\n"),
+    truncated: dropped.length > 0 || Boolean(latestRender.answerTruncated),
+    dropped,
+    hasHandoff: Boolean(latest.handoff),
   };
 }
+
+const SHARED_CONTEXT_INSTRUCTION =
+  "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context. Each source inlines its latest turn as a structured handoff, with older turns as one-line indexes; for upstream detail that is not inlined here (full final answers, findings, evidence), call the `get_session_context` tool with that session ID instead of re-deriving the work.";
 
 /**
  * Renders the normalized history of one or more source sessions as first-hand
  * shared context, replacing orchestrator-side relay through task text. Each
- * source keeps its own freshness verdict and a bounded character budget.
+ * source inlines its latest turn's structured handoff (legacy turns replay a
+ * shortened answer), keeps one-line indexes of older turns, and carries its
+ * own freshness verdict; the block is bounded by a token budget rather than a
+ * character count.
  *
  * Returns per-source injection statistics so callers can audit verbatim what
  * downstream agents actually received (see SharedContextAudit).
@@ -215,29 +426,41 @@ function renderSourceBlock(
 export function buildSharedContextDetailed(
   sources: BridgeSession[],
   currentRepositoryState?: RepositoryStateEvidence,
+  options?: { budgetTokens?: number },
 ): SharedContextRender | undefined {
   const usable = sources.filter((session) => session.history.length > 0);
   if (usable.length === 0) return undefined;
-  const perSourceBudget = Math.max(2_000, Math.floor(MAX_SHARED_CONTEXT_CHARS / usable.length));
   const header =
     usable.length === 1 ? "## Shared Context" : `## Shared Context (${usable.length} sources)`;
+  const prefix = [
+    header,
+    SHARED_CONTEXT_INSTRUCTION,
+    currentRepositoryState
+      ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
+      : "Current repository: unavailable",
+  ].join("\n\n");
+  const totalBudget = Math.max(
+    options?.budgetTokens ?? MAX_SHARED_CONTEXT_TOKENS,
+    MIN_PER_SOURCE_TOKENS,
+  );
+  const perSourceBudget = Math.max(
+    MIN_PER_SOURCE_TOKENS,
+    Math.floor((totalBudget - estimateTokens(prefix)) / usable.length),
+  );
   const blocks = usable.map((session, index) =>
     renderSourceBlock(session, index, usable.length, perSourceBudget, currentRepositoryState),
   );
+  const text = [prefix, ...blocks.map((block) => block.text)].join("\n\n");
   return {
-    text: [
-      header,
-      "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context.",
-      currentRepositoryState
-        ? `Current repository: ${formatRepositoryState(currentRepositoryState)}`
-        : "Current repository: unavailable",
-      ...blocks.map((block) => block.text),
-    ].join("\n\n"),
+    text,
     sources: usable.map((session, index) => ({
       sessionId: session.id,
       chars: blocks[index]!.text.length,
       truncated: blocks[index]!.truncated,
     })),
+    strategy: blocks.some((block) => block.hasHandoff) ? "handoff" : "legacy",
+    estimatedTokens: estimateTokens(text),
+    droppedSections: blocks.flatMap((block) => block.dropped),
   };
 }
 
@@ -840,8 +1063,7 @@ export class MultiAgentRunner {
         requestedModel: params.model,
         requestedReasoningEffort: params.reasoningEffort,
         capabilityDiagnostics: diagnostics,
-        sharedContextText: sharedContext?.text,
-        sharedContextSources: sharedContext?.sources,
+        sharedContext,
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
       });
 
@@ -1063,8 +1285,7 @@ export class MultiAgentRunner {
         requestedModel: params.model,
         requestedReasoningEffort: params.reasoningEffort,
         capabilityDiagnostics: diagnostics,
-        sharedContextText: sharedContext?.text,
-        sharedContextSources: sharedContext?.sources,
+        sharedContext,
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
       });
 
@@ -1089,8 +1310,7 @@ export class MultiAgentRunner {
     requestedModel?: string;
     requestedReasoningEffort?: ReasoningEffort;
     capabilityDiagnostics?: string[];
-    sharedContextText?: string;
-    sharedContextSources?: SourceRenderStats[];
+    sharedContext?: SharedContextRender;
     /** Overrides the derived cancel reason (e.g. server-shutdown disconnects). */
     cancelReason?: SessionExecutionEvidence["cancelReason"];
   }): void {
@@ -1105,8 +1325,8 @@ export class MultiAgentRunner {
     // attach digest/size/truncation metadata to the turn so orchestrators can
     // verify what downstream agents actually saw.
     let sharedContextAudit: SharedContextAudit | undefined;
-    if (options.sharedContextText && options.sharedContextSources?.length) {
-      const text = options.sharedContextText;
+    if (options.sharedContext?.text && options.sharedContext.sources.length) {
+      const text = options.sharedContext.text;
       const artifact = this.sessionManager.persistContextArtifact(
         session.id,
         session.history.length + 1,
@@ -1117,9 +1337,20 @@ export class MultiAgentRunner {
         bytes: artifact?.bytes ?? Buffer.byteLength(text, "utf-8"),
         sha256: createHash("sha256").update(text, "utf-8").digest("hex"),
         totalChars: text.length,
-        sources: options.sharedContextSources.map((source) => ({ ...source })),
+        sources: options.sharedContext.sources.map((source) => ({ ...source })),
+        strategy: options.sharedContext.strategy,
+        estimatedTokens: options.sharedContext.estimatedTokens,
+        ...(options.sharedContext.droppedSections.length
+          ? { droppedSections: options.sharedContext.droppedSections }
+          : {}),
+        injectedOwnHistory: options.injectionSources.some((source) => source.id === session.id),
       };
     }
+
+    // Structured handoff from the final answer; absent when the vendor did
+    // not follow the report contract, in which case injections fall back to
+    // the legacy replay rendering for this turn.
+    const handoff = parseHandoffReport(result.finalAnswer, options.task, result.status);
 
     this.sessionManager.addHistory(session.id, {
       role: options.role,
@@ -1128,6 +1359,7 @@ export class MultiAgentRunner {
       status: result.status,
       summary: result.summary,
       finalAnswer: result.finalAnswer,
+      ...(handoff ? { handoff } : {}),
       findings: result.findings,
       nativeSessionId: result.nativeSessionId,
       evidence: {
@@ -1176,6 +1408,65 @@ export class MultiAgentRunner {
    */
   public getSession(sessionId: string): BridgeSession | undefined {
     return this.sessionManager.getSession(sessionId);
+  }
+
+  /**
+   * Read-only retrieval of one recorded turn, the lazy-loading counterpart of
+   * the handoff-first injection: downstream agents fetch the full final
+   * answer, findings, or evidence instead of AgentMesh replaying them into
+   * every prompt. Returns `{ error }` for unknown sessions and bad indexes.
+   */
+  public async getSessionTurnContext(params: {
+    sessionId: string;
+    turnIndex?: number;
+    fields?: SessionTurnContextField[];
+  }): Promise<SessionTurnContext | { error: string }> {
+    const session = this.sessionManager.getSession(params.sessionId);
+    if (!session) {
+      return { error: `Session '${params.sessionId}' not found.` };
+    }
+    const totalTurns = session.history.length;
+    if (totalTurns === 0) {
+      return { error: `Session '${params.sessionId}' has no recorded turns.` };
+    }
+    const turnIndex = params.turnIndex ?? totalTurns;
+    if (!Number.isInteger(turnIndex) || turnIndex < 1 || turnIndex > totalTurns) {
+      return {
+        error: `Session '${params.sessionId}' has ${totalTurns} turn(s); turnIndex must be between 1 and ${totalTurns}.`,
+      };
+    }
+    const entry = session.history[turnIndex - 1]!;
+    const fields = new Set(params.fields ?? ["handoff"]);
+    const currentRepositoryState = await captureRepositoryState(session.cwd);
+    return {
+      sessionId: session.id,
+      turnIndex,
+      totalTurns,
+      agent: session.agent,
+      role: entry.role,
+      status: entry.status,
+      timestamp: entry.timestamp,
+      task: entry.task,
+      ...(entry.summary ? { summary: entry.summary } : {}),
+      freshness: computeSessionFreshness(session, currentRepositoryState),
+      ...(fields.has("handoff") && entry.handoff ? { handoff: entry.handoff } : {}),
+      ...(fields.has("finalAnswer") && entry.finalAnswer
+        ? {
+            finalAnswer: truncateText(
+              entry.finalAnswer,
+              MAX_CONTEXT_TOOL_ANSWER_CHARS,
+              "... [truncated — the session store retains the full text]",
+            ),
+          }
+        : {}),
+      ...(fields.has("findings") && entry.findings?.length ? { findings: entry.findings } : {}),
+      ...(fields.has("evidence") && (entry.evidence || entry.reviewerSafety)
+        ? {
+            ...(entry.evidence ? { evidence: entry.evidence } : {}),
+            ...(entry.reviewerSafety ? { reviewerSafety: entry.reviewerSafety } : {}),
+          }
+        : {}),
+    };
   }
 
   /**

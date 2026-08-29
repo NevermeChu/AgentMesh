@@ -81,6 +81,10 @@ const SharedContextAuditSchema = z.object({
       truncated: z.boolean(),
     }),
   ),
+  strategy: z.enum(["handoff", "legacy"]).optional(),
+  estimatedTokens: z.number().int().nonnegative().optional(),
+  droppedSections: z.array(z.string()).optional(),
+  injectedOwnHistory: z.boolean().optional(),
 });
 const SessionHistoryEntrySchema = z.object({
   role: AgentRoleSchema,
@@ -89,6 +93,19 @@ const SessionHistoryEntrySchema = z.object({
   status: z.enum(["success", "failed"]),
   summary: z.string().optional(),
   finalAnswer: z.string().optional(),
+  handoff: z
+    .object({
+      goal: z.string().min(1),
+      outcome: z.enum(["success", "failed"]),
+      keyDecisions: z.array(z.string()),
+      artifacts: z.object({
+        files: z.array(z.string()).optional(),
+        commands: z.array(z.string()).optional(),
+        tests: z.string().optional(),
+      }),
+      openItems: z.array(z.string()),
+    })
+    .optional(),
   findings: z.array(ReviewFindingSchema).optional(),
   nativeSessionId: z.string().min(1).optional(),
   evidence: SessionExecutionEvidenceSchema.optional(),

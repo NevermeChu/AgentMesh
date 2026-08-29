@@ -11,6 +11,11 @@ export default tseslint.config(
       ".codegraph/**",
       ".tmp-*/**",
       ".husky/_/**",
+      // Local experiment drivers (gitignored via driver-r*).
+      "driver-r*.mjs",
+      // Vendored external harness sources used as reading material; they ship
+      // their own toolchain configs and must not be linted or config-discovered.
+      "reference/**",
     ],
   },
   eslint.configs.recommended,

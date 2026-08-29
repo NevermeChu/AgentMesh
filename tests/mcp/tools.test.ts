@@ -287,7 +287,55 @@ describe("mcp/tools protocol integration", () => {
 
     expect(res.isError).toBeFalsy();
     expect(adapter.lastRunOptions?.historyContext).toContain(sourceRun.sessionId!);
-    expect(adapter.lastRunOptions?.historyContext).toContain("Shared Turn 1");
+    expect(adapter.lastRunOptions?.historyContext).toContain("[Turn 1 | Agent: CODEX");
+  });
+
+  it("serves recorded turns through get_session_context", async () => {
+    const sourceRun = await runner.delegateTask({ agent: "codex", task: "Source turn" });
+
+    const res = await client.callTool({
+      name: "get_session_context",
+      arguments: {
+        sessionId: sourceRun.sessionId!,
+        fields: ["handoff", "finalAnswer"],
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text) as {
+      sessionId: string;
+      turnIndex: number;
+      totalTurns: number;
+      freshness: string;
+      finalAnswer?: string;
+      handoff?: unknown;
+    };
+    expect(parsed.sessionId).toBe(sourceRun.sessionId);
+    expect(parsed.turnIndex).toBe(1);
+    expect(parsed.totalTurns).toBe(1);
+    expect(parsed.freshness).toBe("MATCHED");
+    expect(parsed.finalAnswer).toContain("Source turn");
+  });
+
+  it("rejects out-of-range turn indexes and unknown sessions in get_session_context", async () => {
+    const sourceRun = await runner.delegateTask({ agent: "codex", task: "Only turn" });
+
+    const outOfRange = await client.callTool({
+      name: "get_session_context",
+      arguments: { sessionId: sourceRun.sessionId!, turnIndex: 5 },
+    });
+    expect(outOfRange.isError).toBe(true);
+    const outContent = outOfRange.content as Array<{ type: string; text: string }>;
+    expect(outContent[0]?.text).toContain("turnIndex must be between 1 and 1");
+
+    const missing = await client.callTool({
+      name: "get_session_context",
+      arguments: { sessionId: "bridge-sess_missing" },
+    });
+    expect(missing.isError).toBe(true);
+    const missingContent = missing.content as Array<{ type: string; text: string }>;
+    expect(missingContent[0]?.text).toContain("not found");
   });
 
   it("rejects invalid task and timeout inputs at the MCP boundary", async () => {

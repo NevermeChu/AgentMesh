@@ -8,6 +8,7 @@ import {
   DEFAULT_RUN_TIMEOUT_MS,
   modelRejectionDiagnostic,
   sandboxSpawnHint,
+  buildSharedContextDetailed,
 } from "../../src/core/runner.js";
 import { AgentRegistry } from "../../src/agents/registry.js";
 import { SessionManager } from "../../src/core/session.js";
@@ -667,6 +668,190 @@ describe("core/runner", () => {
     });
 
     expect(mock.lastRunOptions?.historyContext).toContain("[truncated]");
+  });
+
+  it("renders a structured handoff for the latest turn with one-line indexes for older turns", async () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "First setup turn",
+      timestamp: new Date().toISOString(),
+      status: "success",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Implement login fix",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      finalAnswer: "SECRET_LONG_BODY_SHOULD_NOT_BE_REPLAYED",
+      handoff: {
+        goal: "Fix the login redirect loop",
+        outcome: "success",
+        keyDecisions: ["Parameterize the auth lookup"],
+        artifacts: { files: ["src/auth/login.ts"], commands: ["npm test -- auth"] },
+        openItems: ["Rate limiting still in-memory"],
+      },
+    });
+
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Consume handoff",
+      contextSessionId: created.id,
+    });
+
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain("## Shared Context");
+    expect(context).toContain("Goal: Fix the login redirect loop");
+    expect(context).toContain("Decisions:");
+    expect(context).toContain("- Parameterize the auth lookup");
+    expect(context).toContain("Files: src/auth/login.ts");
+    expect(context).toContain("Commands: npm test -- auth");
+    expect(context).toContain("Open Items:");
+    expect(context).not.toContain("SECRET_LONG_BODY_SHOULD_NOT_BE_REPLAYED");
+    expect(context).toContain("[Turn 1 | worker | success] First setup turn");
+    expect(context).toContain("get_session_context");
+  });
+
+  it("records a structured handoff parsed from a contract-style final answer", async () => {
+    class ReportingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        const result = await super.runViaCli(options);
+        return {
+          ...result,
+          finalAnswer: [
+            "Implemented the feature.",
+            "## Decisions",
+            "- Event-driven update path",
+            "## Files",
+            "- src/feature.ts",
+            "## Commands",
+            "- npm test",
+            "## Tests",
+            "5 passed",
+            "## Open Items",
+            "- Docs pending",
+          ].join("\n"),
+        };
+      }
+    }
+    registry.register(new ReportingAdapter());
+
+    const result = await runner.delegateTask({ agent: "codex", task: "Build feature" });
+
+    const entry = runner.getSession(result.sessionId!)?.history[0];
+    expect(entry?.handoff).toMatchObject({
+      goal: "Build feature",
+      outcome: "success",
+      keyDecisions: ["Event-driven update path"],
+      artifacts: { files: ["src/feature.ts"], commands: ["npm test"], tests: "5 passed" },
+      openItems: ["Docs pending"],
+    });
+  });
+
+  it("records the handoff injection strategy and audit metadata", async () => {
+    const handoffSource = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(handoffSource.id, {
+      role: "worker",
+      task: "With handoff",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      handoff: {
+        goal: "Deliver the fix",
+        outcome: "success",
+        keyDecisions: [],
+        artifacts: {},
+        openItems: [],
+      },
+    });
+    const legacySource = sessionManager.createSession({
+      agent: "claude",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(legacySource.id, {
+      role: "worker",
+      task: "Legacy turn",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      summary: "legacy",
+    });
+
+    const mixed = await runner.delegateTask({
+      agent: "codex",
+      task: "Consume both",
+      contextSessionIds: [handoffSource.id, legacySource.id],
+    });
+    const mixedAudit = runner.getSession(mixed.sessionId!)?.history.at(-1)?.sharedContextAudit;
+    expect(mixedAudit?.strategy).toBe("handoff");
+    expect(mixedAudit?.estimatedTokens).toBeGreaterThan(0);
+    expect(mixedAudit?.injectedOwnHistory).toBe(false);
+    expect(mixedAudit?.sources).toHaveLength(2);
+
+    const legacyOnly = await runner.delegateTask({
+      agent: "codex",
+      task: "Consume legacy",
+      contextSessionIds: [legacySource.id],
+    });
+    const legacyAudit = runner
+      .getSession(legacyOnly.sessionId!)
+      ?.history.at(-1)?.sharedContextAudit;
+    expect(legacyAudit?.strategy).toBe("legacy");
+    expect(legacyAudit?.estimatedTokens).toBeGreaterThan(0);
+    expect(legacyAudit?.droppedSections).toBeUndefined();
+  });
+
+  it("drops handoff sections by priority under a tight token budget", () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    const filler = (label: string): string[] =>
+      Array.from({ length: 10 }, (_, i) => `${label} item ${i + 1}: ${"detail".repeat(60)}`);
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Migrate the storage layer",
+      timestamp: new Date().toISOString(),
+      status: "success",
+      handoff: {
+        goal: "Ship the migration",
+        outcome: "success",
+        keyDecisions: filler("decision"),
+        artifacts: {
+          files: filler("file"),
+          commands: filler("command"),
+          tests: "10 passed",
+        },
+        openItems: filler("open"),
+      },
+    });
+    const session = sessionManager.getSession(created.id)!;
+
+    const render = buildSharedContextDetailed([session], undefined, { budgetTokens: 1_400 });
+
+    expect(render).toBeDefined();
+    expect(render!.strategy).toBe("handoff");
+    // Reproducibility detail goes before conclusions: Tests first, Decisions kept.
+    const dropped = render!.droppedSections;
+    expect(dropped).toEqual([
+      "turn 1 Tests",
+      "turn 1 Open Items",
+      "turn 1 Commands",
+      "turn 1 Files",
+    ]);
+    expect(render!.text).toContain("Goal: Ship the migration");
+    expect(render!.text).toContain("Decisions:");
+    expect(render!.text).toContain("decision item 1");
+    expect(render!.text).not.toContain("Tests: 10 passed");
+    expect(render!.text).toContain("Context freshness: UNKNOWN");
   });
 
   it("honors RunnerOptions timeout and session storage overrides", async () => {

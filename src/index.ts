@@ -18,6 +18,8 @@ export type {
   SessionHistoryEntry,
   RepositoryStateEvidence,
   SessionExecutionEvidence,
+  SharedContextAudit,
+  HandoffSummary,
   SessionManagerOptions,
   RunnerOptions,
 } from "./core/types.js";
@@ -62,16 +64,18 @@ export {
   buildReviewerPrompt,
   buildTesterPrompt,
   buildContinuationPrompt,
+  buildHandoffContract,
   stripAnsi,
   extractSummary,
   parseReviewOutput,
 } from "./core/prompts.js";
 export type { ParsedReviewOutput } from "./core/prompts.js";
+export { parseHandoffReport } from "./core/handoff.js";
 export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
 export { captureRepositoryState } from "./core/repository.js";
-export { truncateText } from "./core/text.js";
+export { truncateText, estimateTokens, truncateTextToTokenBudget } from "./core/text.js";
 export { findProjectConfigPath, loadProjectConfig, resolveRoleAssignment } from "./core/config.js";
 export type {
   AgentMeshProjectConfig,
@@ -86,8 +90,17 @@ export {
   defaultRunner,
   DEFAULT_RUN_TIMEOUT_MS,
   buildSharedContext,
+  buildSharedContextDetailed,
+  computeSessionFreshness,
 } from "./core/runner.js";
-export type { DelegateTaskParams, ReviewChangesParams, ContinueTaskParams } from "./core/runner.js";
+export type {
+  DelegateTaskParams,
+  ReviewChangesParams,
+  ContinueTaskParams,
+  ContextFreshness,
+  SessionTurnContext,
+  SessionTurnContextField,
+} from "./core/runner.js";
 
 // MCP Server
 export { createMcpServer, startMcpServer } from "./mcp/server.js";

@@ -34,6 +34,20 @@ describe("core/prompts", () => {
     expect(prompt).toContain("## Current Task\nFix the bug");
   });
 
+  it("appends the handoff contract to worker and tester prompts but not reviewer prompts", () => {
+    const workerPrompt = buildRolePrompt("Implement the feature", "worker");
+    expect(workerPrompt).toContain("# Handoff Report (required)");
+    expect(workerPrompt).toContain("## Decisions");
+    expect(workerPrompt).toContain("## Open Items");
+    expect(workerPrompt).toContain("Implement the feature");
+
+    const testerPrompt = buildRolePrompt("Run the test suites", "tester");
+    expect(testerPrompt).toContain("# Handoff Report (required)");
+
+    const reviewerPrompt = buildRolePrompt("Review the changes", "reviewer");
+    expect(reviewerPrompt).not.toContain("Handoff Report");
+  });
+
   it("builds structured continuation context", () => {
     const prompt = buildContinuationPrompt(
       "Fix reported null pointer exception",

@@ -607,3 +607,13 @@
 **解决方法**：心跳路径改经 `executeCommand` 的任务级环境变量（`AGENTMESH_HEARTBEAT_FILE`）传入子进程，脚本内引用 `process.env`，彻底消除对生成脚本的内插值注入；不再依赖路径不含空格/特殊字符的隐含假设。
 
 **状态**：已解决（2026-08-26）；教训：POSIX-only 测试在 Windows 开发机上不可见，依赖 CI 才能执行，生成 shell 脚本时禁止向引号定界符内部插值含引号的值。
+
+## P-062 ESLint 10 递归发现 vendored 参考源码的 eslint 配置导致 `npm run lint` 崩溃
+
+**问题**：在项目 `reference/` 下引入 Codex 与 Claude Code 的外部源码做阅读参考后，`npm run lint`（`eslint .`）不再输出 lint 结果，而是直接抛 `ERR_MODULE_NOT_FOUND: Cannot find package 'eslint-plugin-node-import' imported from reference\...\sdk\typescript\eslint.config.js`，整个质量门无法运行。
+
+**根因**：ESLint 10 对 flat config 启用了按文件的逐级配置发现（config file discovery）：即使根目录存在 `eslint.config.js`，ESLint 在 lint 子目录文件时也会向上查找到 vendored 仓库自带的 `eslint.config.js` 并加载它，而该配置依赖的插件在外部仓库里并未安装。此外被 gitignore 的本地实验脚本 `driver-r*.mjs` 也不受 ESLint 忽略约束，其内既有错误同样会挡住门禁。
+
+**解决方法**：在根 `eslint.config.js` 的 `ignores` 中显式加入 `reference/**` 与 `driver-r*.mjs`。`reference/**` 注明 vendored 外部源码自带工具链配置、不得参与 lint 或配置发现；本地实验脚本按仓库既有约定（commit 8ca373b）排除在 lint 之外。
+
+**状态**：已解决（2026-08-29）。教训：向工作区引入任何自带工程配置的外部仓库时，必须同步检查 ESLint 10 的逐级配置发现、Prettier 与 tsc 的扫描范围，vendored 目录应第一时间加入所有工具的 ignore 名单。

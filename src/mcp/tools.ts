@@ -225,6 +225,23 @@ export const GetSessionInputSchema = z.object({
   sessionId: NonBlankString.describe("The Bridge session ID to inspect"),
 });
 
+export const GetSessionContextInputSchema = z.object({
+  sessionId: NonBlankString.describe("The Bridge session ID to read a recorded turn from"),
+  turnIndex: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe("1-based turn number; defaults to the latest turn"),
+  fields: z
+    .array(z.enum(["handoff", "finalAnswer", "findings", "evidence"]))
+    .min(1)
+    .optional()
+    .describe(
+      "Which parts of the turn to return; defaults to the structured handoff. Use finalAnswer for the full upstream answer",
+    ),
+});
+
 export const GetRoleConfigInputSchema = z.object({
   cwd: NonBlankString.optional().describe(
     "Project directory used to locate the nearest .agentmesh/config.json",
@@ -486,6 +503,41 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           },
         ],
       };
+    },
+  );
+
+  // get_session_context
+  server.tool(
+    "get_session_context",
+    "Reads one recorded turn from a Bridge Session (structured handoff by default, optionally the full final answer, findings, or evidence) so downstream agents can fetch upstream detail instead of re-deriving it",
+    GetSessionContextInputSchema.shape,
+    async (args: z.infer<typeof GetSessionContextInputSchema>) => {
+      try {
+        const context = await runner.getSessionTurnContext({
+          sessionId: args.sessionId,
+          turnIndex: args.turnIndex,
+          fields: args.fields,
+        });
+        if ("error" in context) {
+          return {
+            content: [{ type: "text", text: context.error }],
+            isError: true,
+          };
+        }
+        const text =
+          context.handoff || context.finalAnswer
+            ? JSON.stringify(context, null, 2)
+            : `${JSON.stringify(context, null, 2)}\n\nNo structured handoff was recorded for this turn (it predates the handoff contract or the agent did not follow it). Call again with fields=["finalAnswer"] to read the full answer.`;
+        return {
+          content: [{ type: "text", text }],
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error reading session context: ${errorMsg}` }],
+          isError: true,
+        };
+      }
     },
   );
 }

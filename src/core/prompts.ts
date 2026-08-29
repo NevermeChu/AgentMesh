@@ -17,13 +17,41 @@ export function buildRolePrompt(
 
   switch (role) {
     case "reviewer":
+      // Reviewer output is governed by the strict verdict/findings contract;
+      // a handoff report could displace the PASS/FAIL verdict, so it is not
+      // requested here.
       return buildReviewerPrompt(basePrompt, context);
     case "tester":
-      return buildTesterPrompt(basePrompt);
+      return `${buildTesterPrompt(basePrompt)}\n${buildHandoffContract()}`;
     case "worker":
     default:
-      return basePrompt;
+      return `${basePrompt}\n${buildHandoffContract()}`;
   }
+}
+
+/**
+ * Fixed contract appended to worker/tester prompts: the vendor agent ends its
+ * final answer with structured sections that parseHandoffReport converts into
+ * a per-turn HandoffSummary. Constraining the report at the source lets
+ * injections stay small instead of replaying (and truncating) full answers.
+ */
+export function buildHandoffContract(): string {
+  return [
+    "---",
+    "# Handoff Report (required)",
+    "End your final answer with exactly the following sections so downstream agents can reuse your work without re-deriving it. Keep the report concise; omit a section only if it has nothing to report.",
+    "",
+    "## Decisions",
+    "- <key conclusions or decisions the next agent should not have to re-derive>",
+    "## Files",
+    "- <files created, modified, or decisive to read>",
+    "## Commands",
+    "- <commands that reproduce or verify the work>",
+    "## Tests",
+    "<one line: test outcome summary>",
+    "## Open Items",
+    "- <unfinished work, known risks, or open questions>",
+  ].join("\n");
 }
 
 /**

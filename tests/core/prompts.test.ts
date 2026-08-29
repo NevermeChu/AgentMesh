@@ -195,6 +195,16 @@ Here are the review findings:
     const verdictPass = parseReviewOutput("# Code Review\nVerdict: PASS\nAll good!");
     expect(verdictPass.reviewOutcome).toBe("PASS");
     expect(verdictPass.summary).toContain("Review PASSED");
+    // P-063 regression: bold-wrapped labels deep in the output (real opencode
+    // reviewer output) must still parse as verdict + findings.
+    const boldWrapped = parseReviewOutput(
+      "Finding text.\n- **severity:** critical  \n- **file:** `src/calc.ts`  \n- **line:** 1-2  \n- **issue:** Division by zero is not handled  \n- **suggestion:** Throw on b === 0\n\n**Verdict: FAIL**",
+    );
+    expect(boldWrapped.reviewOutcome).toBe("FAIL");
+    expect(boldWrapped.findings).toHaveLength(1);
+    expect(boldWrapped.findings[0]?.severity).toBe("critical");
+    expect(boldWrapped.findings[0]?.file).toBe("src/calc.ts");
+
     const boldFail = parseReviewOutput(
       "**FAIL**\n- severity: high\n  file: src/api.ts\n  issue: Broken endpoint",
     );

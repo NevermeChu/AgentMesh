@@ -624,3 +624,13 @@
 **解决方法**：fixtures 注入键全部改用白名单预留的 `AGENTMESH_` 前缀（`AGENTMESH_FAKE_CAPTURE_PATH` 等）——该前缀本就声明为"可信内部代码与本地测试 harness 专用"，不改任何安全语义；`AGENTMESH_FAKE_EXIT_CODE` 走 falsy 解析保持 `0` 默认。修复后 integ 5/5 通过。
 
 **状态**：已解决（2026-08-29）。
+
+## P-063 评审输出被 Markdown 加粗包裹时 verdict 与 findings 双双漏判（真链路 S4 暴露）
+
+**问题**：opencode reviewer 真实输出采用 `**Verdict: FAIL**`、`**severity:** critical`、反引号包裹文件路径的 Markdown 加粗格式。parseReviewOutput 的 labeled verdict 正则要求行首紧跟关键词（`**Verdict` 不匹配），finding 分块正则也要求 `severity:` 裸露（`**severity:**` 不匹配），导致 verdict=UNKNOWN、findings=[]；review_changes 声明严格契约后整轮被判 FAILED，maxReworkRounds 返工循环因 verdict 非 FAIL 而未触发。
+
+**根因**：解析器对 verdict 的加粗处理只覆盖了「裸词加粗」与「值加粗」两种形态（`**FAIL**`、`Verdict: **PASS**`），未覆盖「标签整体加粗」；finding 分块同样只认裸标签。单元测试的构造输出恰好避开了真实模型的这一习惯。
+
+**解决方法**：parseReviewOutput 在解析前生成剥除 `**`/`__`/反引号装饰的 normalized 副本，verdict 与 findings 解析均基于该副本；bare verdict 只信任输出前 10 行、显式 PASS 下 critical/high 才翻案的 fail-closed 语义不变。补充 P-063 回归用例（加粗标签 + 深置 verdict 的完整形态）。
+
+**状态**：已解决（2026-08-29，L4 真链路 S4 冒烟复验：FAIL→自动修复→复审 PASS 一轮闭环，rounds=1）。

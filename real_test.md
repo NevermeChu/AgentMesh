@@ -1251,3 +1251,27 @@ S3：Stage A 调研 utils.ts → Stage B 实现 divide 函数（contextSessionId
 3. S8（崩溃恢复）：需 opencode 配额恢复 + 长时间后台任务
 4. S9（安全违规组）：L2 假 CLI 探针可立即测试（无需配额）；L4 真实 deny 兜底需配额
 5. S10（弱败升级）：需 opencode 配额恢复 + 配置 candidates 升级链
+
+---
+
+## P5 真链路冒烟验收（2026-08-29，Node 22.23.2）
+
+- 方法：MCP stdio 驱动 smoke-p5.mjs 连接 `agentmesh serve`（dist 构建），临时工作区 D:/temp_pip/smoke-ws-p5（独立 git 仓库），证据目录 D:/temp_pip/smoke-evidence-p5/。
+- 模型：opencode zen 免费档 `opencode/nemotron-3.5-lightning-free`（worker 与 reviewer 同模型，config 元数据 tier=weak/costLevel=1）；未动用本地默认模型配置，model 经 roles 显式声明并透传 `--model`。
+- 验证链：npm run check 首次全绿（Node 22：353/353 单测 + 5/5 integ + build + 包冒烟）；此前 Node 20 下 3 个 doctor 环境检查失败随版本切换消除。
+
+| 场景                                   | 结果                        | 耗时   | 说明                                                                                                                                                                           |
+| -------------------------------------- | --------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| list_agents                            | ✅                          | 241ms  | 路由表含 opencode 行与元数据                                                                                                                                                   |
+| S1 中文只读                            | ✅ SUCCESS                  | 16.9s  | finalAnswer 中文正常，无乱码                                                                                                                                                   |
+| S4 worker 实现 divide（仅 happy path） | ✅ SUCCESS                  | 25.4s  | 会话 bridge-sess_65dc016c4a43                                                                                                                                                  |
+| S4 review_changes maxReworkRounds=2    | ✅ PASS（Rework Rounds: 1） | 310.4s | 全自动闭环：reviewer FAIL（critical：除零未处理）→ findings 注入原 worker 会话 → 修复落盘（`if (b === 0) throw`）→ 复审 PASS 附 2 个 P2 非阻塞观察；Rework Evidence 证据链完整 |
+
+### 交接质量与问题
+
+1. 上下文损失：无结构性损失；findings 以机器解析结构注入 worker（fix prompt 含 file:line/issue/suggestion）。
+2. 重复操作：无；复用源会话 native resume。
+3. 暴露问题：
+   - **P-063（本轮发现并修复）**：Markdown 加粗标签导致 verdict/findings 漏判、返工循环不触发；修复后同场景复验通过。第一轮冒烟 1228 字节证据（UNKNOWN/FAILED）保留于 S4-rework-loop.log 历史版本。
+   - opencode reviewer 走 plan 模式时单轮耗时 55-145s（免费档较慢），属 vendor 行为，不影响正确性。
+4. 资源与清理：零孤儿进程、零凭据泄漏；临时工作区与证据保留备查。

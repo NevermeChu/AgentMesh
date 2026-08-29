@@ -312,6 +312,13 @@ function matchVerdict(line: string, allowBarePrefix: boolean): "PASS" | "FAIL" |
 
 /**
  * Parses structured PASS / FAIL review findings from output.
+ *
+ * Vendor models frequently wrap labels in Markdown decorations
+ * (`**Verdict: FAIL**`, `**severity:** critical`, backticked file paths).
+ * Verdict and finding parsing therefore runs on a decoration-stripped copy
+ * (bold/italic/code markers removed); the fail-closed semantics — bare
+ * verdicts trusted only near the top, blocking findings under an explicit
+ * PASS — are unchanged.
  */
 export function parseReviewOutput(output: string): ParsedReviewOutput {
   if (!output || !output.trim()) {
@@ -319,7 +326,8 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
   }
 
   const cleanOutput = stripAnsi(output).trim();
-  const lines = cleanOutput
+  const normalized = cleanOutput.replace(/\*\*|__|`/g, "");
+  const lines = normalized
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
@@ -346,7 +354,7 @@ export function parseReviewOutput(output: string): ParsedReviewOutput {
 
   const findings: ReviewFinding[] = [];
   let hasUnparsedSeverity = false;
-  const findingBlocks = cleanOutput.split(/(?:^|\n)(?:[-*]\s*)?severity\s*:\s*/i);
+  const findingBlocks = normalized.split(/(?:^|\n)(?:[-*]\s*)?severity\s*:\s*/i);
 
   for (let i = 1; i < findingBlocks.length; i++) {
     const block = findingBlocks[i]!;

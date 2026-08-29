@@ -33,10 +33,10 @@ describe("agents/codex-channel wiring", () => {
 
   it("prefers the official --output-last-message channel over JSONL scraping", async () => {
     const { capturePath } = installFakeCodex();
-    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv("AGENTMESH_FAKE_CAPTURE_PATH", capturePath);
     setFakeEnv("FAKE_LAST_MESSAGE_CONTENT", "OFFICIAL final answer.");
     setFakeEnv(
-      "FAKE_STDOUT",
+      "AGENTMESH_FAKE_STDOUT",
       [
         JSON.stringify({ type: "thread.started", thread_id: "thread-official-1" }),
         JSON.stringify({
@@ -61,9 +61,9 @@ describe("agents/codex-channel wiring", () => {
 
   it("falls back to JSONL parsing with a warning when the official file is empty", async () => {
     const { capturePath } = installFakeCodex();
-    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv("AGENTMESH_FAKE_CAPTURE_PATH", capturePath);
     setFakeEnv(
-      "FAKE_STDOUT",
+      "AGENTMESH_FAKE_STDOUT",
       JSON.stringify({
         type: "item.completed",
         item: { type: "agent_message", text: "Recovered from JSONL." },
@@ -86,7 +86,7 @@ describe("agents/codex-channel wiring", () => {
     installFakeCodex();
     setFakeEnv("FAKE_LAST_MESSAGE_CONTENT", "Done.");
     setFakeEnv(
-      "FAKE_STDOUT",
+      "AGENTMESH_FAKE_STDOUT",
       [
         JSON.stringify({ type: "thread.started", thread_id: "thread-usage-9" }),
         JSON.stringify({
@@ -126,13 +126,13 @@ describe("agents/codex-channel wiring", () => {
     setFakeEnv("FAKE_ROLLOUT_SESSION_ID", SALVAGE_THREAD_ID);
     setFakeEnv("FAKE_ROLLOUT_ANSWER", "Salvaged final answer.");
     setFakeEnv(
-      "FAKE_STDOUT",
+      "AGENTMESH_FAKE_STDOUT",
       JSON.stringify({
         type: "thread.started",
         thread_id: SALVAGE_THREAD_ID,
       }),
     );
-    setFakeEnv("FAKE_EXIT_CODE", "137");
+    setFakeEnv("AGENTMESH_FAKE_EXIT_CODE", "137");
     const result = await new CodexAdapter().run({
       task: "Long running task",
       cwd: temporaryDirectory,
@@ -169,7 +169,7 @@ describe("agents/codex-channel wiring", () => {
 
   it("enforces the reviewer output-schema contract and machine-readable verdicts", async () => {
     const { capturePath } = installFakeCodex();
-    setFakeEnv("FAKE_CAPTURE_PATH", capturePath);
+    setFakeEnv("AGENTMESH_FAKE_CAPTURE_PATH", capturePath);
     setFakeEnv(
       "FAKE_LAST_MESSAGE_CONTENT",
       JSON.stringify({
@@ -177,7 +177,7 @@ describe("agents/codex-channel wiring", () => {
         findings: [],
       }),
     );
-    setFakeEnv("FAKE_STDOUT", "review finished");
+    setFakeEnv("AGENTMESH_FAKE_STDOUT", "review finished");
     const result = await new CodexAdapter().run({
       task: "Review changes",
       cwd: temporaryDirectory,
@@ -218,7 +218,7 @@ describe("agents/codex-channel wiring", () => {
       [
         'import fs from "node:fs";',
         "const args = process.argv.slice(2);",
-        "if (process.env.FAKE_CAPTURE_PATH) {",
+        "if (process.env.AGENTMESH_FAKE_CAPTURE_PATH) {",
         '  const schemaIndex = args.indexOf("--output-schema");',
         "  const schemaPath = schemaIndex !== -1 ? args[schemaIndex + 1] : undefined;",
         "  let schemaFileExisted = null;",
@@ -230,7 +230,7 @@ describe("agents/codex-channel wiring", () => {
         "    }",
         "    catch (e) { schemaFileExisted = false; schemaReadError = String(e && e.message); }",
         "  }",
-        "  fs.writeFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify({ argv: args, schemaFileExisted, schemaReadError }));",
+        "  fs.writeFileSync(process.env.AGENTMESH_FAKE_CAPTURE_PATH, JSON.stringify({ argv: args, schemaFileExisted, schemaReadError }));",
         "}",
         "if (process.env.FAKE_LAST_MESSAGE_CONTENT) {",
         '  const index = args.indexOf("--output-last-message");',
@@ -249,9 +249,9 @@ describe("agents/codex-channel wiring", () => {
         "  ];",
         '  fs.writeFileSync(`${dayDir}/rollout-2026-08-26T10-00-00-${id}.jsonl`, lines.join("\\n"));',
         "}",
-        'process.stdout.write(process.env.FAKE_STDOUT || "");',
-        'process.stderr.write(process.env.FAKE_STDERR || "");',
-        'process.exit(Number(process.env.FAKE_EXIT_CODE || "0"));',
+        'process.stdout.write(process.env.AGENTMESH_FAKE_STDOUT || "");',
+        'process.stderr.write(process.env.AGENTMESH_FAKE_STDERR || "");',
+        'process.exit(Number(process.env.AGENTMESH_FAKE_EXIT_CODE || "0"));',
       ].join("\n"),
       "utf8",
     );

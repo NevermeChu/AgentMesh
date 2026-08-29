@@ -614,3 +614,13 @@
 **根因**：当前 Node 运行时（本仓库目标版本）没有原生 zstd 解码 API；引入第三方 zstd 依赖需要改动 package.json 依赖面，超出该窗口边界，按"证据如实"原则选择结构化报错而不是伪造内容。
 **解决方法**：core/codexRollout.ts 对 .jsonl.zst 返回结构化不支持错误并如实标注；未压缩文件正常解析。待 Node 提供稳定原生 zstd 解码后自动解锁，或由后续决策显式引入依赖。
 **状态**：已缓解（如实降级）。影响面：仅"任务中断超过 7 天后才尝试抢救"的场景，正常无人值守闭环（分钟级重试/续跑）不受影响。
+
+## P-062 T3.3 env 白名单合入后集成测试 fixtures 未同步，fake-CLI integ 全线失败
+
+**问题**：`tests/agents/adapters.integ.ts` 与 `tests/agents/codex-channel.test.ts` 通过 `env` 参数向 fake CLI 注入 `FAKE_CAPTURE_PATH`/`FAKE_STDOUT`/`FAKE_STDERR`/`FAKE_EXIT_CODE`。T3.3 env 白名单（f8a365d）合入后这些自定义键全部被 `filterEnvOverrides` 丢弃，子进程读不到注入指令：capture 文件 ENOENT、stdout 为空导致 5 个 integ 用例在本地与 CI 持续失败，`npm run check` 门禁形同虚设。
+
+**根因**：安全策略变更（越键丢弃并计 `envOverrideRejected`）与测试基建之间缺一次同步评审；integ 测试不在默认 `npm test` 里，回归被静默吞掉。
+
+**解决方法**：fixtures 注入键全部改用白名单预留的 `AGENTMESH_` 前缀（`AGENTMESH_FAKE_CAPTURE_PATH` 等）——该前缀本就声明为"可信内部代码与本地测试 harness 专用"，不改任何安全语义；`AGENTMESH_FAKE_EXIT_CODE` 走 falsy 解析保持 `0` 默认。修复后 integ 5/5 通过。
+
+**状态**：已解决（2026-08-29）。

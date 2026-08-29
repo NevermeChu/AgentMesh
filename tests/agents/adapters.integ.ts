@@ -38,8 +38,8 @@ describe("CLI adapter process integration", () => {
       role: "worker",
       mode: "cli",
       env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: [
+        AGENTMESH_FAKE_CAPTURE_PATH: capturePath,
+        AGENTMESH_FAKE_STDOUT: [
           JSON.stringify({ type: "thread.started", thread_id: "native-codex-integ" }),
           JSON.stringify({
             type: "item.completed",
@@ -74,8 +74,8 @@ describe("CLI adapter process integration", () => {
       role: "reviewer",
       mode: "cli",
       env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: JSON.stringify({
+        AGENTMESH_FAKE_CAPTURE_PATH: capturePath,
+        AGENTMESH_FAKE_STDOUT: JSON.stringify({
           status: "SUCCESS",
           response: "PASS\nNo findings.",
           conversation_id: "native-antigravity-integ",
@@ -111,13 +111,13 @@ describe("CLI adapter process integration", () => {
       role: "reviewer",
       mode: "cli",
       env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: JSON.stringify({
+        AGENTMESH_FAKE_CAPTURE_PATH: capturePath,
+        AGENTMESH_FAKE_STDOUT: JSON.stringify({
           session_id: "claude-integ-12345678",
           is_error: false,
           result: "PASS\nReview completed cleanly.",
         }),
-        FAKE_STDERR:
+        AGENTMESH_FAKE_STDERR:
           '[claude-code:unrecognized_model] {"model":"proxy-model","query_source":"generate_session_title"}',
       },
     });
@@ -140,8 +140,8 @@ describe("CLI adapter process integration", () => {
       role: "worker",
       mode: "cli",
       env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: [
+        AGENTMESH_FAKE_CAPTURE_PATH: capturePath,
+        AGENTMESH_FAKE_STDOUT: [
           JSON.stringify({ type: "error", error: "context canceled" }),
           JSON.stringify({
             type: "item.completed",
@@ -169,8 +169,8 @@ describe("CLI adapter process integration", () => {
       role: "worker",
       mode: "cli",
       env: {
-        FAKE_CAPTURE_PATH: capturePath,
-        FAKE_STDOUT: JSON.stringify({ type: "error", error: "quota exceeded" }),
+        AGENTMESH_FAKE_CAPTURE_PATH: capturePath,
+        AGENTMESH_FAKE_STDOUT: JSON.stringify({ type: "error", error: "quota exceeded" }),
       },
     });
 
@@ -190,10 +190,10 @@ async function createFakeExecutable(directory: string): Promise<string> {
     scriptPath,
     [
       'import fs from "node:fs";',
-      "fs.writeFileSync(process.env.FAKE_CAPTURE_PATH, JSON.stringify(process.argv.slice(2)));",
-      'process.stdout.write(process.env.FAKE_STDOUT || "");',
-      'process.stderr.write(process.env.FAKE_STDERR || "");',
-      'process.exit(Number(process.env.FAKE_EXIT_CODE || "0"));',
+      "fs.writeFileSync(process.env.AGENTMESH_FAKE_CAPTURE_PATH, JSON.stringify(process.argv.slice(2)));",
+      'process.stdout.write(process.env.AGENTMESH_FAKE_STDOUT || "");',
+      'process.stderr.write(process.env.AGENTMESH_FAKE_STDERR || "");',
+      'process.exit(Number(process.env.AGENTMESH_FAKE_EXIT_CODE || "0"));',
     ].join("\n"),
     "utf8",
   );

@@ -1,7 +1,8 @@
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import { defaultRunner } from "../core/runner.js";
 import { defaultRegistry } from "../agents/registry.js";
 import { startMcpServer } from "../mcp/server.js";
+import { startUiServer } from "../ui/server.js";
 import { VERSION } from "../version.js";
 import { generateCapabilities, readCapabilities } from "../core/capabilities.js";
 import { runDoctorChecks } from "../core/diagnostics.js";
@@ -430,6 +431,38 @@ program
     } catch (err) {
       console.error("Doctor error:", err instanceof Error ? err.message : String(err));
       process.exitCode = 1;
+    }
+  });
+
+interface UiCommandOptions {
+  port: number;
+}
+
+function parsePort(value: string): number {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    throw new InvalidArgumentError("Port must be an integer between 1 and 65535.");
+  }
+  return parsed;
+}
+
+// Command: ui (read-only visualization panel)
+program
+  .command("ui")
+  .description(
+    "Start a local read-only web panel to visualize bridge sessions, background tasks and token usage",
+  )
+  .option("-p, --port <port>", "Preferred port (occupied ports are probed upward)", parsePort, 7788)
+  .action(async (options: UiCommandOptions) => {
+    try {
+      const server = await startUiServer({ port: options.port });
+      console.log(`\nAgentMesh UI (read-only) is running.`);
+      console.log(`  URL:        ${server.url}`);
+      console.log(`  Data home:  (resolved from AGENTMESH_SESSIONS_FILE or ~/.agentmesh)`);
+      console.log(`\nOpen the URL above in a browser. Press Ctrl+C to stop.\n`);
+    } catch (err) {
+      console.error("Failed to start UI server:", err instanceof Error ? err.message : String(err));
+      process.exit(1);
     }
   });
 

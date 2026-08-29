@@ -94,6 +94,55 @@ describe("core/handoff parseHandoffReport", () => {
     expect(handoff!.goal.length).toBeLessThanOrEqual(200);
     expect(handoff!.goal.startsWith("Very long task:")).toBe(true);
   });
+
+  it("prefers the report's own Goal section over the task-derived goal", () => {
+    const answer = [
+      "Work done.",
+      "## Goal",
+      "- Convert units between measurement scales per SPEC",
+      "## Files",
+      "- src/x.ts",
+    ].join("\n");
+    const handoff = parseHandoffReport(answer, "Some long instruction blob", "success");
+
+    expect(handoff!.goal).toBe("Convert units between measurement scales per SPEC");
+  });
+
+  it("falls back to the first task line instead of a 200-char task blob", () => {
+    // Regression (real-test R14): long multi-section tasks used to produce a
+    // 200-character instruction prefix as the goal.
+    const task = [
+      "Implement the unitsmith CLI exactly as specified in SPEC.md (read it first - it is the authority).",
+      "",
+      "Scope and ownership:",
+      "- You own everything in this repository except SPEC.md.",
+    ].join("\n");
+    const handoff = parseHandoffReport(finalAnswerWithReport(), task, "success");
+
+    expect(handoff!.goal).toBe(
+      "Implement the unitsmith CLI exactly as specified in SPEC.md (read it first - it is the authority).",
+    );
+    expect(handoff!.goal).not.toContain("Scope and ownership");
+  });
+
+  it("strips markdown link wrappers and backticks from handoff items", () => {
+    const answer = [
+      "## Goal",
+      "- [Convert units](https://example.spec) correctly",
+      "## Files",
+      "- [src/auth.ts](file:///C:/repo/src/auth.ts)",
+      "- [](file:///C:/repo/only-url.ts)",
+      "- `lib/units.js` (created)",
+    ].join("\n");
+    const handoff = parseHandoffReport(answer, "Task", "success");
+
+    expect(handoff!.goal).toBe("Convert units correctly");
+    expect(handoff!.artifacts.files).toEqual([
+      "src/auth.ts",
+      "file:///C:/repo/only-url.ts",
+      "lib/units.js (created)",
+    ]);
+  });
 });
 
 describe("core/text token estimation", () => {

@@ -617,3 +617,33 @@
 **解决方法**：在根 `eslint.config.js` 的 `ignores` 中显式加入 `reference/**` 与 `driver-r*.mjs`。`reference/**` 注明 vendored 外部源码自带工具链配置、不得参与 lint 或配置发现；本地实验脚本按仓库既有约定（commit 8ca373b）排除在 lint 之外。
 
 **状态**：已解决（2026-08-29）。教训：向工作区引入任何自带工程配置的外部仓库时，必须同步检查 ESLint 10 的逐级配置发现、Prettier 与 tsc 的扫描范围，vendored 目录应第一时间加入所有工具的 ignore 名单。
+
+## P-063 真实链路暴露 handoff goal 退化为任务文本前 200 字符（R14）
+
+**问题**：R14 真实测试（unitsmith 四阶段链路）中，注入块的 `Goal:` 行是任务指令文本的前 200 字符（"Implement the unitsmith CLI exactly as specified in SPEC.md (read it first — it is the authority). Scope and ownership: - You own everything…"），不是一句话目标。长任务下注入信噪比明显下降，worker 与 tester 轮同病。
+
+**根因**：`parseHandoffReport` 的 goal 推导取 `task.trim().replace(/\s+/g," ").slice(0,200)`——把"推导 fallback"当成了唯一来源，而 Handoff Report 契约本身没有要求 agent 自报目标；多段任务文本的前 200 字符是指令性段落而非目标句。
+
+**解决方法**：①契约（`buildHandoffContract`）新增 `## Goal` 小节，由 agent 自报一句话目标，解析优先生效；②fallback 改为取任务首个非空行（`deriveGoalFromTask`），多段任务不再产生 200 字符指令团块；`deriveReviewHandoff` 同步使用。回归测试覆盖"Goal 小节优先"与"首行 fallback"两个路径。
+
+**状态**：已解决（2026-08-29）。教训：契约字段缺失时不要让 fallback 承担主要质量责任——本轮在 M1 设计时只验证了单行任务的推导效果，多段任务形态直到真实链路才出现。
+
+## P-064 真实链路暴露 handoff files 条目混入 Markdown 链接与反引号包装（R14）
+
+**问题**：R14 中 opencode 与 antigravity 产出的 handoff `Files` 条目形如 `[bin/unitsmith.js](file:///C:/Users/.../bin/unitsmith.js)`、`` `lib/units.js` (created) ``，注入块被长 URL 和包装符占据，浪费注入 token 且可读性差。
+
+**根因**：`cleanItemLine` 只剥离 emphasis（`*`/`_`）与列表标记，未处理 vendor 模型惯用的 Markdown 链接包装（含 file:/// 绝对链接）与行内代码反引号。
+
+**解决方法**：`cleanItemLine` 增加 `[text](url)` 剥壳（保留 text，text 为空时保留 url）与反引号移除。回归测试覆盖三类形态：有 text 的链接、空 text 链接、反引号路径。
+
+**状态**：已解决（2026-08-29）。教训：解析 lenient 格式时，剥离规则要按 vendor 实际输出形态回归——真实测试一轮暴露的输出形态比单测想象的多。
+
+## P-065 SPEC 把平台相关验证命令写成跨平台必须项，穿透 Worker/Tester/Reviewer 三层未被列为正式 finding（R14）
+
+**问题**：R14 的 SPEC.md 验证命令 `node --test tests/`（目录+尾斜杠）在 Windows Node v24 抛 MODULE_NOT_FOUND，与 SPEC "must exit 0" 的文字冲突。Worker 以 auto-discovery 规避并在 openItems 申报，Tester 独立复核时按"Appendix 外项"未判缺陷，Reviewer 也未列 finding——三层都没有把它升级为正式 defect，SPEC 缺陷以 open item 形态存活到终态。
+
+**根因**：Orchestrator 编写 SPEC 时把 POSIX 行为的命令写成了无条件必须项，且验收条目（Appendix A）与验证命令章节的严格性不对齐；下游角色对"SPEC 自身错误"缺乏升级路径（它们按契约正确地只判实现缺陷）。
+
+**解决方法**：SPEC 编写规范：①验证命令必须平台中性（`node --test` 自动发现），平台特例显式标注适用平台；②Appendix 验收行与验证命令一一对应，避免"文字必须但无验收行"的盲区；③给下游角色加一条通用指引——"发现 SPEC 自身矛盾时在 open items 申报并按最严格平台解释执行"（本轮 worker 的 open items 行为实际就是正确示范）。
+
+**状态**：已解决（规避，无代码修复，2026-08-29）。教训：多 Agent 流水线无法修复上游权威文档的缺陷，只会把它放大成三个角色的处置分歧；SPEC 是契约，平台假设要在源头消除。

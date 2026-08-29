@@ -15,9 +15,10 @@ const MAX_GOAL_CHARS = 200;
 const MAX_ITEM_CHARS = 400;
 const MAX_TESTS_CHARS = 300;
 
-type SectionKey = "decisions" | "files" | "commands" | "tests" | "openItems";
+type SectionKey = "goal" | "decisions" | "files" | "commands" | "tests" | "openItems";
 
 const SECTION_ALIASES: ReadonlyArray<readonly [SectionKey, string[]]> = [
+  ["goal", ["goal", "objective"]],
   ["decisions", ["decisions", "key decisions"]],
   ["files", ["files", "key files", "files changed", "changed files"]],
   ["commands", ["commands", "commands run"]],
@@ -67,10 +68,32 @@ function cleanItemLine(line: string): string {
   return truncateText(
     line
       .replace(/^\s*(?:[-*]|\d+[.)])\s+/, "")
+      // Vendor agents love wrapping file paths in Markdown links and backticks;
+      // keep the link text (or the URL when the text is empty) and drop the wrappers.
+      .replace(
+        /\[([^\]]*)\]\(([^)]+)\)/g,
+        (_match, text: string, url: string) => text.trim() || url,
+      )
+      .replace(/`/g, "")
       .replace(/\*{1,2}|_{1,2}/g, "")
       .trim(),
     MAX_ITEM_CHARS,
   );
+}
+
+/**
+ * Fallback goal when the report carries no `## Goal` section: the first
+ * non-blank task line is the closest thing to a one-sentence goal. Collapsing
+ * the whole task (the pre-R14 behavior) turned long multi-section tasks into
+ * a 200-character instruction blob instead of a goal.
+ */
+function deriveGoalFromTask(task: string): string {
+  const firstLine = task
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  const collapsed = (firstLine ?? task).replace(/\s+/g, " ");
+  return truncateText(collapsed, MAX_GOAL_CHARS);
 }
 
 export function parseHandoffReport(
@@ -124,8 +147,11 @@ export function parseHandoffReport(
     ...(testsLines.length ? { tests: truncateText(testsLines.join("; "), MAX_TESTS_CHARS) } : {}),
   };
 
+  // The report's own one-sentence goal wins; the task's first line is the fallback.
+  const reportGoal = list("goal")?.[0];
+
   return {
-    goal: truncateText(task.trim().replace(/\s+/g, " "), MAX_GOAL_CHARS),
+    goal: reportGoal ? truncateText(reportGoal, MAX_GOAL_CHARS) : deriveGoalFromTask(task),
     outcome: status === "success" ? "success" : "failed",
     keyDecisions: list("decisions") ?? [],
     artifacts,
@@ -171,7 +197,7 @@ export function deriveReviewHandoff(params: {
     );
 
   return {
-    goal: truncateText(task.trim().replace(/\s+/g, " "), MAX_GOAL_CHARS),
+    goal: deriveGoalFromTask(task),
     outcome,
     keyDecisions: verdictDecision ? [truncateText(verdictDecision, MAX_ITEM_CHARS)] : [],
     artifacts: files.length > 0 ? { files: [...new Set(files)] } : {},

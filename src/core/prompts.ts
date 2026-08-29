@@ -41,6 +41,8 @@ export function buildHandoffContract(): string {
     "# Handoff Report (required)",
     "End your final answer with exactly the following sections so downstream agents can reuse your work without re-deriving it. Keep the report concise; omit a section only if it has nothing to report.",
     "",
+    "## Goal",
+    "<one sentence: what this turn was asked to accomplish>",
     "## Decisions",
     "- <key conclusions or decisions the next agent should not have to re-derive>",
     "## Files",

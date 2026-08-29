@@ -37,6 +37,7 @@ describe("core/prompts", () => {
   it("appends the handoff contract to worker and tester prompts but not reviewer prompts", () => {
     const workerPrompt = buildRolePrompt("Implement the feature", "worker");
     expect(workerPrompt).toContain("# Handoff Report (required)");
+    expect(workerPrompt).toContain("## Goal");
     expect(workerPrompt).toContain("## Decisions");
     expect(workerPrompt).toContain("## Open Items");
     expect(workerPrompt).toContain("Implement the feature");

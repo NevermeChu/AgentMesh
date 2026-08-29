@@ -16,6 +16,12 @@ export interface RoleAssignment {
   timeoutMs?: number;
   model?: string;
   reasoningEffort?: ReasoningEffort;
+  /**
+   * Optional override of the shared-context injection budget (estimated
+   * tokens) for turns running under this role. Unset uses the built-in
+   * default (6000, minimum 1200 per source).
+   */
+  contextBudgetTokens?: number;
   safety?: ReviewerSafetyPolicy;
 }
 
@@ -38,6 +44,7 @@ const AssignmentObjectSchema = z
     timeoutMs: z.number().int().positive().max(3_600_000).optional(),
     model: NonBlankString.max(200).optional(),
     reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
+    contextBudgetTokens: z.number().int().positive().max(1_000_000).optional(),
   })
   .strict();
 const RoleAssignmentSchema = z.union([NonBlankString, AssignmentObjectSchema]);

@@ -17,7 +17,7 @@ import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
-import { parseHandoffReport } from "./handoff.js";
+import { deriveReviewHandoff, parseHandoffReport } from "./handoff.js";
 import { estimateTokens, truncateText, truncateTextToTokenBudget } from "./text.js";
 import type {
   BridgeSession,
@@ -333,6 +333,8 @@ interface SharedContextRender {
   sources: SourceRenderStats[];
   strategy: "handoff" | "legacy";
   estimatedTokens: number;
+  /** Total injection budget (estimated tokens) that governed this render. */
+  budgetTokens: number;
   droppedSections: string[];
 }
 
@@ -460,6 +462,7 @@ export function buildSharedContextDetailed(
     })),
     strategy: blocks.some((block) => block.hasHandoff) ? "handoff" : "legacy",
     estimatedTokens: estimateTokens(text),
+    budgetTokens: totalBudget,
     droppedSections: blocks.flatMap((block) => block.dropped),
   };
 }
@@ -962,7 +965,9 @@ export class MultiAgentRunner {
     // context sources always inject so cross-session facts arrive first-hand.
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
     const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
-    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore);
+    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore, {
+      budgetTokens: roleResolution.assignment?.contextBudgetTokens,
+    });
 
     const effectiveRequestedModel = params.model ?? roleResolution.assignment?.model;
     const effectiveRequestedEffort =
@@ -1182,7 +1187,13 @@ export class MultiAgentRunner {
     const repositoryBefore = await captureRepositoryState(session.cwd);
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
     const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
-    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore);
+    // Continuations never re-resolve the role assignment for execution, but the
+    // role's context budget is a pure injection setting, so read it best-effort.
+    const contextBudgetTokens = safeResolveRoleAssignment(session.cwd, session.role).resolution
+      ?.assignment?.contextBudgetTokens;
+    const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore, {
+      budgetTokens: contextBudgetTokens,
+    });
 
     const inFlight = this.beginInFlight(params.signal);
     const preflightDiagnostics = evaluateModelOptionSupport({
@@ -1340,6 +1351,7 @@ export class MultiAgentRunner {
         sources: options.sharedContext.sources.map((source) => ({ ...source })),
         strategy: options.sharedContext.strategy,
         estimatedTokens: options.sharedContext.estimatedTokens,
+        budgetTokens: options.sharedContext.budgetTokens,
         ...(options.sharedContext.droppedSections.length
           ? { droppedSections: options.sharedContext.droppedSections }
           : {}),
@@ -1347,10 +1359,19 @@ export class MultiAgentRunner {
       };
     }
 
-    // Structured handoff from the final answer; absent when the vendor did
-    // not follow the report contract, in which case injections fall back to
-    // the legacy replay rendering for this turn.
-    const handoff = parseHandoffReport(result.finalAnswer, options.task, result.status);
+    // Structured handoff: parsed from the report contract when the vendor
+    // followed it, otherwise derived deterministically from a review verdict
+    // and findings. Absent when neither applies — injections then fall back
+    // to the legacy replay rendering for this turn.
+    const handoff =
+      parseHandoffReport(result.finalAnswer, options.task, result.status) ??
+      deriveReviewHandoff({
+        task: options.task,
+        status: result.status,
+        reviewOutcome: result.reviewOutcome,
+        summary: result.summary,
+        findings: result.findings,
+      });
 
     this.sessionManager.addHistory(session.id, {
       role: options.role,

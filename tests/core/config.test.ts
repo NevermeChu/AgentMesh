@@ -59,6 +59,32 @@ describe("core/project config", () => {
     expect(resolveRoleAssignment(project.nested, "tester").assignment?.agent).toBe("claude");
   });
 
+  it("parses the role-level context budget override", () => {
+    const project = createProject({
+      version: 1,
+      roles: {
+        worker: { agent: "codex", contextBudgetTokens: 2500 },
+        tester: "codex",
+      },
+    });
+
+    const loaded = loadProjectConfig(project.root)!;
+    expect(loaded.config.roles.worker).toEqual({
+      agent: "codex",
+      contextBudgetTokens: 2500,
+    });
+    expect(loaded.config.roles.tester).toEqual({ agent: "codex" });
+  });
+
+  it("rejects non-positive or non-integer context budgets", () => {
+    const project = createProject({
+      version: 1,
+      roles: { worker: { agent: "codex", contextBudgetTokens: 0 } },
+    });
+
+    expect(() => loadProjectConfig(project.root)).toThrowError(/contextBudgetTokens/);
+  });
+
   it("fails with a precise error for invalid project config", () => {
     const project = createProject({ version: 1, roles: { reviewer: { agent: "" } } });
     expect(() => loadProjectConfig(project.root)).toThrow("Invalid AgentMesh project config");

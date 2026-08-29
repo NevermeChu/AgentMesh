@@ -1,3 +1,4 @@
+import type { ReviewFinding } from "../agents/types.js";
 import type { HandoffSummary } from "./types.js";
 import { truncateText } from "./text.js";
 
@@ -129,5 +130,51 @@ export function parseHandoffReport(
     keyDecisions: list("decisions") ?? [],
     artifacts,
     openItems: list("openItems") ?? [],
+  };
+}
+
+const MAX_REVIEW_OPEN_ITEMS = 8;
+
+/**
+ * Derives a structured handoff for review turns without a report contract.
+ * The Reviewer's output format is already governed by the strict PASS/FAIL
+ * findings contract, so the handoff is assembled deterministically from the
+ * parsed verdict, summary, and findings instead of asking the vendor for
+ * another report format that could displace the verdict.
+ */
+export function deriveReviewHandoff(params: {
+  task: string;
+  status: "success" | "failed";
+  reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
+  summary?: string;
+  findings?: ReviewFinding[];
+}): HandoffSummary | undefined {
+  const { task, status, reviewOutcome, summary, findings } = params;
+  if (!reviewOutcome && !(findings && findings.length > 0)) return undefined;
+
+  const outcome =
+    reviewOutcome === "PASS" ? "success" : reviewOutcome === "FAIL" ? "failed" : status;
+
+  const verdictDecision =
+    summary ?? (reviewOutcome ? `Review verdict: ${reviewOutcome}` : undefined);
+
+  const files = (findings ?? [])
+    .map((finding) => finding.file)
+    .filter((file) => file && file !== "unknown");
+  const openItems = (findings ?? [])
+    .slice(0, MAX_REVIEW_OPEN_ITEMS)
+    .map((finding) =>
+      truncateText(
+        `${finding.severity}: ${finding.file}${finding.line ? `:${finding.line}` : ""} — ${finding.issue}`,
+        MAX_ITEM_CHARS,
+      ),
+    );
+
+  return {
+    goal: truncateText(task.trim().replace(/\s+/g, " "), MAX_GOAL_CHARS),
+    outcome,
+    keyDecisions: verdictDecision ? [truncateText(verdictDecision, MAX_ITEM_CHARS)] : [],
+    artifacts: files.length > 0 ? { files: [...new Set(files)] } : {},
+    openItems,
   };
 }

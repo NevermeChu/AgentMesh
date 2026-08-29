@@ -83,6 +83,7 @@ const SharedContextAuditSchema = z.object({
   ),
   strategy: z.enum(["handoff", "legacy"]).optional(),
   estimatedTokens: z.number().int().nonnegative().optional(),
+  budgetTokens: z.number().int().nonnegative().optional(),
   droppedSections: z.array(z.string()).optional(),
   injectedOwnHistory: z.boolean().optional(),
 });

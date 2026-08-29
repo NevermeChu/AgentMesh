@@ -854,6 +854,146 @@ describe("core/runner", () => {
     expect(render!.text).toContain("Context freshness: UNKNOWN");
   });
 
+  it("applies the role-level context budget override from the project config", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-budget-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".git"));
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { worker: { agent: "codex", contextBudgetTokens: 1_300 } },
+        }),
+      );
+
+      const created = sessionManager.createSession({
+        agent: "codex",
+        cwd: projectRoot,
+        role: "worker",
+      });
+      const filler = (label: string): string[] =>
+        Array.from({ length: 10 }, (_, i) => `${label} item ${i + 1}: ${"detail".repeat(60)}`);
+      sessionManager.addHistory(created.id, {
+        role: "worker",
+        task: "Big handoff",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        handoff: {
+          goal: "Ship the migration",
+          outcome: "success",
+          keyDecisions: filler("decision"),
+          artifacts: { files: filler("file"), commands: filler("command") },
+          openItems: filler("open"),
+        },
+      });
+
+      const result = await runner.delegateTask({
+        agent: "codex",
+        task: "Consume budgeted context",
+        cwd: projectRoot,
+        contextSessionId: created.id,
+      });
+
+      const audit = runner.getSession(result.sessionId!)?.history.at(-1)?.sharedContextAudit;
+      expect(audit?.budgetTokens).toBe(1_300);
+      expect(audit?.droppedSections?.length ?? 0).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("applies the role-level budget on continuations from the session's project config", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-budget-cont-"));
+    try {
+      fs.mkdirSync(path.join(projectRoot, ".git"));
+      fs.mkdirSync(path.join(projectRoot, ".agentmesh"));
+      fs.writeFileSync(
+        path.join(projectRoot, ".agentmesh", "config.json"),
+        JSON.stringify({
+          version: 1,
+          roles: { tester: { agent: "codex", contextBudgetTokens: 1_300 } },
+        }),
+      );
+
+      const created = sessionManager.createSession({
+        agent: "codex",
+        cwd: projectRoot,
+        role: "tester",
+      });
+      const filler = (label: string): string[] =>
+        Array.from({ length: 10 }, (_, i) => `${label} item ${i + 1}: ${"detail".repeat(60)}`);
+      sessionManager.addHistory(created.id, {
+        role: "tester",
+        task: "Big tester handoff",
+        timestamp: new Date().toISOString(),
+        status: "success",
+        handoff: {
+          goal: "Verify the release build",
+          outcome: "success",
+          keyDecisions: filler("decision"),
+          artifacts: { files: filler("file"), commands: filler("command") },
+          openItems: filler("open"),
+        },
+      });
+
+      await runner.continueTask({ sessionId: created.id, task: "Keep testing" });
+
+      const audit = runner.getSession(created.id)?.history.at(-1)?.sharedContextAudit;
+      expect(audit?.budgetTokens).toBe(1_300);
+      expect(audit?.injectedOwnHistory).toBe(true);
+      expect(audit?.droppedSections?.length ?? 0).toBeGreaterThan(0);
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("derives a reviewer handoff from the verdict and injects it downstream", async () => {
+    class FailingReviewerAdapter extends MockAdapter {
+      override readonly name: AgentName = "claude";
+
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        this.lastRunOptions = options;
+        return this.formatSuccessResult(
+          [
+            "FAIL",
+            "- severity: high",
+            "  file: src/auth.ts",
+            "  line: 42",
+            "  issue: SQL injection in login lookup",
+            "  suggestion: Use parameterized queries",
+          ].join("\n"),
+          Date.now(),
+          { nativeSessionId: "native_rev_fail_derived", exitCode: 0, role: "reviewer" },
+        );
+      }
+    }
+    registry.register(new FailingReviewerAdapter());
+
+    const review = await runner.reviewChanges({
+      agent: "claude",
+      cwd: process.cwd(),
+      task: "Review login changes",
+    });
+    const entry = runner.getSession(review.sessionId!)?.history[0];
+    expect(entry?.handoff).toMatchObject({ outcome: "failed" });
+    expect(entry?.handoff?.keyDecisions).toEqual(["Review FAILED: 1 issue(s) detected."]);
+    expect(entry?.handoff?.artifacts.files).toEqual(["src/auth.ts"]);
+    expect(entry?.handoff?.openItems[0]).toContain("high: src/auth.ts:42");
+
+    // The downstream injection renders the derived handoff, not the review body.
+    await runner.delegateTask({
+      agent: "codex",
+      task: "Fix the findings",
+      cwd: process.cwd(),
+      contextSessionId: review.sessionId,
+    });
+    const context = mock.lastRunOptions?.historyContext ?? "";
+    expect(context).toContain("Goal: Review login changes");
+    expect(context).toContain("high: src/auth.ts:42");
+    expect(context).not.toContain("suggestion: Use parameterized queries");
+  });
+
   it("honors RunnerOptions timeout and session storage overrides", async () => {
     const sessionStoragePath = path.join(
       os.tmpdir(),

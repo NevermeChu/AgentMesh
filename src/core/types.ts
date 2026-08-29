@@ -76,6 +76,8 @@ export interface SharedContextAudit {
   strategy?: "handoff" | "legacy";
   /** Estimated model tokens of the rendered block. */
   estimatedTokens?: number;
+  /** Total token budget that governed the render (role override or built-in default). */
+  budgetTokens?: number;
   /** Sections dropped or truncated to fit the injection budget. */
   droppedSections?: string[];
   /** Whether the receiving session's own history was part of the injected block. */

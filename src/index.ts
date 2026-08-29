@@ -70,7 +70,7 @@ export {
   parseReviewOutput,
 } from "./core/prompts.js";
 export type { ParsedReviewOutput } from "./core/prompts.js";
-export { parseHandoffReport } from "./core/handoff.js";
+export { deriveReviewHandoff, parseHandoffReport } from "./core/handoff.js";
 export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { parseHandoffReport } from "../../src/core/handoff.js";
+import { deriveReviewHandoff, parseHandoffReport } from "../../src/core/handoff.js";
 import { estimateTokens, truncateTextToTokenBudget } from "../../src/core/text.js";
+import type { ReviewFinding } from "../../src/agents/types.js";
 
 function finalAnswerWithReport(): string {
   return [
@@ -113,5 +114,75 @@ describe("core/text token estimation", () => {
     expect(trimmed.endsWith("... [truncated]")).toBe(true);
     expect(estimateTokens(trimmed)).toBeLessThanOrEqual(50);
     expect(truncateTextToTokenBudget("short", 50)).toBe("short");
+  });
+});
+
+describe("core/handoff deriveReviewHandoff", () => {
+  const findings: ReviewFinding[] = [
+    {
+      severity: "high",
+      file: "src/auth.ts",
+      line: "42",
+      issue: "SQL injection in the login lookup",
+      suggestion: "Use parameterized queries",
+    },
+    {
+      severity: "medium",
+      file: "src/auth.ts",
+      issue: "Missing rate limiting",
+    },
+  ];
+
+  it("derives a failed handoff from a FAIL verdict and findings", () => {
+    const handoff = deriveReviewHandoff({
+      task: "Review login changes",
+      status: "success",
+      reviewOutcome: "FAIL",
+      summary: "Review FAILED: 2 issue(s) detected.",
+      findings,
+    });
+
+    expect(handoff).toBeDefined();
+    expect(handoff!.goal).toBe("Review login changes");
+    expect(handoff!.outcome).toBe("failed");
+    expect(handoff!.keyDecisions).toEqual(["Review FAILED: 2 issue(s) detected."]);
+    expect(handoff!.artifacts.files).toEqual(["src/auth.ts"]);
+    expect(handoff!.openItems).toEqual([
+      "high: src/auth.ts:42 — SQL injection in the login lookup",
+      "medium: src/auth.ts — Missing rate limiting",
+    ]);
+  });
+
+  it("derives a passed handoff with verdict-only decisions when there are no findings", () => {
+    const handoff = deriveReviewHandoff({
+      task: "Review clean changes",
+      status: "success",
+      reviewOutcome: "PASS",
+      summary: "Review PASSED: Changes are clean and verified.",
+    });
+
+    expect(handoff).toBeDefined();
+    expect(handoff!.outcome).toBe("success");
+    expect(handoff!.keyDecisions).toEqual(["Review PASSED: Changes are clean and verified."]);
+    expect(handoff!.artifacts.files).toBeUndefined();
+    expect(handoff!.openItems).toEqual([]);
+  });
+
+  it("returns undefined without a verdict or findings", () => {
+    expect(deriveReviewHandoff({ task: "Worker task", status: "success" })).toBeUndefined();
+    expect(
+      deriveReviewHandoff({ task: "Worker task", status: "failed", summary: "Execution failed" }),
+    ).toBeUndefined();
+  });
+
+  it("falls back to the execution status when the verdict is UNKNOWN", () => {
+    const handoff = deriveReviewHandoff({
+      task: "Review without verdict",
+      status: "failed",
+      reviewOutcome: "UNKNOWN",
+    });
+    expect(handoff).toBeDefined();
+    expect(handoff!.outcome).toBe("failed");
+    expect(handoff!.keyDecisions).toEqual(["Review verdict: UNKNOWN"]);
   });
 });

@@ -64,6 +64,7 @@ const ErrorCodeSchema = z.enum([
   "CANCELLED",
   "CIRCUIT_OPEN",
   "BUDGET_EXHAUSTED",
+  "VENDOR_QUOTA",
 ]);
 const SessionExecutionEvidenceSchema = z.object({
   repositoryBefore: RepositoryStateEvidenceSchema.optional(),
@@ -79,6 +80,7 @@ const SessionExecutionEvidenceSchema = z.object({
   cleanupSucceeded: z.boolean().optional(),
   resourceEvidence: ResourceEvidenceSchema.optional(),
   transportFallback: TransportFallbackEvidenceSchema.optional(),
+  testFilesModified: z.array(z.string()).optional(),
 });
 const ReviewerSafetyReportSchema = z.object({
   requested: z.enum(["best-effort", "enforced"]),
@@ -101,6 +103,14 @@ const SharedContextAuditSchema = z.object({
     }),
   ),
 });
+const UsageInfoSchema = z.object({
+  inputTokens: z.number().nonnegative().optional(),
+  cachedInputTokens: z.number().nonnegative().optional(),
+  cacheWriteInputTokens: z.number().nonnegative().optional(),
+  outputTokens: z.number().nonnegative().optional(),
+  reasoningOutputTokens: z.number().nonnegative().optional(),
+  totalTokens: z.number().nonnegative().optional(),
+});
 const SessionHistoryEntrySchema = z.object({
   role: AgentRoleSchema,
   task: z.string(),
@@ -117,6 +127,9 @@ const SessionHistoryEntrySchema = z.object({
   requestedReasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh"]).optional(),
   capabilityDiagnostics: z.array(z.string()).optional(),
   sharedContextAudit: SharedContextAuditSchema.optional(),
+  // P-R14-2b: without this field, zod silently stripped usage on every disk
+  // reload and the T5.4 budget gate went blind across process/restart edges.
+  usage: UsageInfoSchema.optional(),
 });
 /** Exported for read-only inspection (doctor); mutation stays inside SessionManager. */
 export const BridgeSessionSchema: z.ZodType<BridgeSession> = z.object({
@@ -261,6 +274,10 @@ export class SessionManager {
         this.unsavedSessions.delete(id);
       }
     }
+    // P-R14-2: preserved unsaved sessions re-enter after the load-time cap, so
+    // enforce once more; LRU ordering evicts oldest first and leaves the
+    // preserved (newest) sessions for last.
+    this.enforceSessionCap();
   }
 
   /** Marks a session as durably stored after a successful flush. */
@@ -291,6 +308,10 @@ export class SessionManager {
         for (const session of parsed) {
           this.sessions.set(session.id, session);
         }
+        // P-R14-2: the disk file may exceed the cap (deferred-create means
+        // evictions are not always persisted); enforce on every load or the
+        // in-memory map — and therefore the next flush — grows without bound.
+        this.enforceSessionCap();
         return;
       } catch (err) {
         lastErr = err;

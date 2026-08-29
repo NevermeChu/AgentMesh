@@ -157,3 +157,130 @@ export async function captureRepositoryState(
     return undefined;
   }
 }
+
+/** Pre-worker working-tree snapshot used by rollback_task (T4b). */
+export interface RollbackAnchor {
+  repositoryRoot: string;
+  /** HEAD at capture time; absent on an unborn branch. */
+  headSha?: string;
+  /**
+   * Dangling stash commit capturing tracked modifications at capture time
+   * (`git stash create` — does not touch the working tree or the index).
+   * Absent when the tracked working tree was clean. Untracked files are NOT
+   * covered and cannot be restored.
+   */
+  stashSha?: string;
+  fingerprint?: string;
+  capturedAt: string;
+}
+
+export interface RollbackRestoreOutcome {
+  restoredVia: "stash" | "head";
+  preRollbackStashSha?: string;
+  fingerprintAfter?: string;
+  /** Working-tree changes still present after the restore (e.g. files created after the anchor). */
+  remainingChangedPaths: string[];
+}
+
+/**
+ * Captures the pre-worker rollback anchor. Requires an existing git repository
+ * (repositoryBefore evidence); callers treat undefined as "rollback unavailable".
+ */
+export async function captureRollbackAnchor(
+  _cwd: string,
+  repositoryBefore: RepositoryStateEvidence | undefined,
+): Promise<RollbackAnchor | undefined> {
+  if (!repositoryBefore?.repositoryRoot) return undefined;
+  const root = repositoryBefore.repositoryRoot;
+  const anchor: RollbackAnchor = {
+    repositoryRoot: root,
+    fingerprint: repositoryBefore.fingerprint,
+    capturedAt: new Date().toISOString(),
+  };
+  const head = await executeCommand("git", ["rev-parse", "HEAD"], { cwd: root }).catch(
+    () => undefined,
+  );
+  if (head && head.exitCode === 0 && head.stdout.trim()) {
+    anchor.headSha = head.stdout.trim();
+  }
+  const stash = await executeCommand("git", ["stash", "create"], { cwd: root }).catch(
+    () => undefined,
+  );
+  if (stash && stash.exitCode === 0 && stash.stdout.trim()) {
+    anchor.stashSha = stash.stdout.trim();
+  }
+  return anchor;
+}
+
+function changedPathsNow(evidence: RepositoryStateEvidence | undefined): string[] {
+  return evidence?.changedPaths?.length ? evidence.changedPaths : [];
+}
+
+/**
+ * Restores the tracked working tree to a previously captured anchor. The
+ * current state is stashed first (pre-rollback snapshot) so a mistaken
+ * rollback is itself recoverable. Semantics differ by path and are disclosed
+ * to the caller: the stash path (checkout <stash> -- .) restores anchor-known
+ * paths and leaves later-created files alone; the head path (reset --hard)
+ * discards ALL tracked changes since the anchor, including staged new files.
+ * Untracked files present at anchor time were never captured and cannot be
+ * restored. remainingChangedPaths reports whatever is still dirty afterwards.
+ */
+export async function restoreRollbackAnchor(
+  anchor: RollbackAnchor,
+  cwd?: string,
+): Promise<{ ok: true; outcome: RollbackRestoreOutcome } | { ok: false; error: string }> {
+  const root = anchor.repositoryRoot;
+  const run = (args: string[]) => executeCommand("git", args, { cwd: cwd ?? root });
+
+  const preStash = await run(["stash", "create"]).catch(() => undefined);
+  const preRollbackStashSha =
+    preStash && preStash.exitCode === 0 && preStash.stdout.trim()
+      ? preStash.stdout.trim()
+      : undefined;
+
+  // If HEAD moved since the anchor, another actor is reshaping history; refuse
+  // rather than fight over it.
+  const head = await run(["rev-parse", "HEAD"]).catch(() => undefined);
+  if (anchor.headSha && head && head.exitCode === 0 && head.stdout.trim() !== anchor.headSha) {
+    return {
+      ok: false,
+      error: `HEAD moved since the anchor was captured (${anchor.headSha.slice(0, 12)} -> ${head.stdout.trim().slice(0, 12)}); refusing to roll back over another actor's commits.`,
+    };
+  }
+
+  let restoredVia: RollbackRestoreOutcome["restoredVia"];
+  if (anchor.stashSha) {
+    const checkout = await run(["checkout", anchor.stashSha, "--", "."]).catch(() => undefined);
+    if (!checkout || checkout.exitCode !== 0) {
+      return {
+        ok: false,
+        error: `Failed to restore tracked files from anchor stash ${anchor.stashSha.slice(0, 12)}: ${checkout?.stderr?.trim() || "git checkout failed"}`,
+      };
+    }
+    restoredVia = "stash";
+  } else if (anchor.headSha) {
+    // The anchor tracked tree was clean: discard every tracked change since.
+    const reset = await run(["reset", "--hard", anchor.headSha]).catch(() => undefined);
+    if (!reset || reset.exitCode !== 0) {
+      return {
+        ok: false,
+        error: `Failed to reset tracked files to anchor HEAD ${anchor.headSha.slice(0, 12)}: ${reset?.stderr?.trim() || "git reset failed"}`,
+      };
+    }
+    restoredVia = "head";
+  } else {
+    return { ok: false, error: "Anchor has neither stash nor HEAD reference; cannot restore." };
+  }
+
+  const after = await captureRepositoryState(root);
+  return {
+    ok: true,
+    outcome: {
+      restoredVia,
+      preRollbackStashSha,
+      fingerprintAfter: after?.fingerprint,
+      remainingChangedPaths: changedPathsNow(after),
+    },
+  };
+}

@@ -160,9 +160,10 @@ describe("mcp background delegate and poll_task", () => {
     // The gate never resolves here, so a foreground call would hang forever.
     expect(Date.now() - startedAt).toBeLessThan(10_000);
     expect(background.activeCount).toBe(1);
-    // The adapter's first output chunk lands asynchronously after dispatch;
-    // its appearance proves the run actually started in the background.
-    await waitFor(() => fs.existsSync(outputFilePathOf(taskId)));
+    // The adapter's first output chunk lands asynchronously after dispatch.
+    // Since P-R14-3 the file is created eagerly (empty) at registration, so
+    // existence alone no longer proves the run started — wait for content.
+    await waitFor(() => fs.readFileSync(outputFilePathOf(taskId), "utf-8").includes("started"));
     expect(fs.readFileSync(outputFilePathOf(taskId), "utf-8")).toContain("started");
     const persisted = fs.readFileSync(registry.registryFilePath, "utf-8");
     expect(persisted).toContain(taskId);

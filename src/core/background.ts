@@ -34,6 +34,8 @@ export const STALLED_TERMINATE_THRESHOLD_MS = 30 * 60_000;
  * preserved because another live process may still be working on them.
  */
 export const ORPHAN_GC_GRACE_MS = 24 * 60 * 60_000;
+/** Dead-lettered orphan records kept for poll_task interrupted-lookups (P-R14-3). */
+export const MAX_RETAINED_ORPHANS = 100;
 
 /** How often the stalled watchdog inspects active tasks while any exist. */
 export const WATCHDOG_INTERVAL_MS = 30_000;
@@ -61,6 +63,13 @@ export interface BackgroundTaskRecord {
   startedAtMs: number;
   /** Absolute path of the tee'd stdout/stderr capture file. */
   outputFile: string;
+  /**
+   * Set when a startup orphan scan found the owning process dead without a
+   * terminal result (P-R14-3): the record is retained as dead-letter evidence
+   * so poll_task can report 'interrupted by restart' instead of NOT_FOUND.
+   * Orphaned records are pruned by age/count on subsequent scans.
+   */
+  orphanedAtMs?: number;
 }
 
 /** Terminal outcome written by the completion callback to <taskId>.result.json. */
@@ -74,7 +83,7 @@ export interface StoredTaskResult {
   completedAtMs: number;
 }
 
-export type PollTaskStatus = "running" | "completed" | "failed" | "stalled";
+export type PollTaskStatus = "running" | "completed" | "failed" | "stalled" | "interrupted";
 
 export interface PollTaskOutcome {
   taskId: string;
@@ -87,6 +96,10 @@ export interface PollTaskOutcome {
   hasMore: boolean;
   /** Present once the task reached a terminal state. */
   result?: StoredTaskResult;
+  /** Dead-letter timestamp when the owning bridge died before completion (P-R15-1). */
+  interruptedAtMs?: number;
+  /** Re-dispatch guidance accompanying an interrupted status. */
+  guidance?: string;
 }
 
 export interface PollTaskOptions {
@@ -211,6 +224,10 @@ function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
       pid: candidate.pid,
       startedAtMs: candidate.startedAtMs,
       outputFile: candidate.outputFile,
+      // Dead-letter marker (P-R14-3); old registry lines predate it.
+      ...(typeof candidate.orphanedAtMs === "number"
+        ? { orphanedAtMs: candidate.orphanedAtMs }
+        : {}),
     };
   } catch {
     return undefined;
@@ -269,6 +286,19 @@ export class BackgroundTaskRegistry {
     this.pidAlive = options.isPidAlive ?? isPidAlive;
   }
 
+  /**
+   * Looks up a dead-lettered orphan record (owning process died without a
+   * terminal result). Returns undefined for live/unknown tasks — callers use
+   * this after their normal lookups miss, to distinguish "never existed" from
+   * "interrupted by a bridge restart" (P-R14-3).
+   */
+  public getInterruptedTask(taskId: string): BackgroundTaskRecord | undefined {
+    const record = this.readPersistedRecords().find(
+      (candidate) => candidate.taskId === taskId && candidate.orphanedAtMs,
+    );
+    return record ? { ...record } : undefined;
+  }
+
   /** Directory holding registry.jsonl, output captures and result records. */
   public get tasksDirectory(): string {
     return this.tasksDir;
@@ -293,6 +323,10 @@ export class BackgroundTaskRegistry {
    */
   public registerTask(record: BackgroundTaskRecord): void {
     fs.mkdirSync(this.tasksDir, { recursive: true });
+    // Eagerly create the declared output capture (P-R14-3): the dispatch
+    // response promises this path, so it must exist even if the vendor never
+    // writes a byte before a crash.
+    fs.writeFileSync(record.outputFile, "", { flag: "a" });
     fs.appendFileSync(this.registryFile, `${JSON.stringify(record)}\n`, "utf-8");
     this.active.set(record.taskId, { ...record });
     this.ensureWatchdogTimer();
@@ -391,15 +425,24 @@ export class BackgroundTaskRegistry {
     if (records.length === 0) return [];
     const kept: BackgroundTaskRecord[] = [];
     const reaped: BackgroundTaskRecord[] = [];
+    // P-R15-1 follow-up (r16 问题 2): only records WITHOUT a terminal result
+    // get the interrupted dead-letter. A dead process's COMPLETED task is not
+    // interrupted — it keeps its record unmarked so the result file stays
+    // discoverable and the panel never shows a false "被打断" badge.
+    const completedByDeadProcess: BackgroundTaskRecord[] = [];
     for (const record of records) {
       const hasResult = fs.existsSync(this.resultFilePath(record.taskId));
       if (!this.pidAlive(record.pid)) {
-        reaped.push(record);
+        if (hasResult) {
+          completedByDeadProcess.push(record);
+        } else {
+          reaped.push(record);
+        }
         continue;
       }
       // A finished task owned by a live bridge needs no further tracking.
       if (hasResult && !this.active.has(record.taskId)) {
-        reaped.push(record);
+        completedByDeadProcess.push(record);
         continue;
       }
       if (
@@ -407,13 +450,27 @@ export class BackgroundTaskRegistry {
         record.pid !== process.pid &&
         this.now() - record.startedAtMs >= ORPHAN_GC_GRACE_MS
       ) {
-        reaped.push(record);
+        completedByDeadProcess.push(record);
         continue;
       }
       kept.push(record);
     }
     if (reaped.length > 0) {
-      await this.rewriteRegistry(kept);
+      // P-R14-3: orphaned records are dead-lettered (marked, not dropped) so a
+      // later poll_task reports "interrupted by restart" with the declared
+      // output path instead of a bare NOT_FOUND. Prune by age and count.
+      const now = this.now();
+      const marked = reaped.map((record) => ({ ...record, orphanedAtMs: now }));
+      const retainedOrphans = [...this.readPersistedRecords()]
+        .filter((record) => record.orphanedAtMs)
+        .sort((a, b) => (b.orphanedAtMs ?? 0) - (a.orphanedAtMs ?? 0))
+        .slice(0, MAX_RETAINED_ORPHANS - 1);
+      await this.rewriteRegistry([
+        ...kept,
+        ...completedByDeadProcess,
+        ...retainedOrphans,
+        ...marked,
+      ]);
     }
     return reaped;
   }
@@ -536,6 +593,21 @@ export class BackgroundTaskRegistry {
       Math.max(0, sinceOffset),
       MAX_POLL_READ_BYTES,
     );
+    // P-R15-1: a dead-lettered record means the owning bridge died without a
+    // terminal result. That is NOT a task failure — surface the interruption
+    // with the declared output path so the orchestrator can re-dispatch.
+    if (record.orphanedAtMs) {
+      return {
+        taskId,
+        status: "interrupted",
+        outputSinceOffset: read.content,
+        nextOffset: read.nextOffset,
+        hasMore: read.hasMore,
+        interruptedAtMs: record.orphanedAtMs,
+        guidance:
+          "The bridge process owning this task died (crash or kill) before completion. Partial output above (if any); re-dispatch the task (same idempotencyKey if one was used) to re-execute.",
+      };
+    }
     let status: PollTaskStatus;
     if (stored) {
       status = stored.status;

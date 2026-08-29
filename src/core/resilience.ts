@@ -13,8 +13,10 @@ import type { ErrorCode } from "./types.js";
  */
 const SPAWN_FAILURE_PATTERN =
   /\bspawn\s+(?:\S+\s+)?(?:ENOENT|EACCES|EPERM)\b|command\s+not\s+found|is\s+not\s+recognized\s+as\s+an\s+internal\s+or\s+external\s+command/i;
+const VENDOR_QUOTA_PATTERN =
+  /预扣费|额度不足|余额不足|insufficient[_\s]*(?:user[_\s]*)?(?:credit|balance|quota)|(?:credit|balance|quota)[_\s]*(?:exhaust|deplet)/i;
 const MODEL_REJECTION_PATTERN =
-  /\b(?:invalid|unsupported)[_-]?model\b|model.{0,40}not\s+(?:supported|available|found|valid)|does\s+not\s+have\s+access|no\s+access\s+to\s+model|model[_-]not[_-]found/i;
+  /\b(?:invalid|unsupported)[_-]?model\b|model.{0,40}not\s+(?:supported|available|found|valid)|does\s+not\s+have\s+access|no\s+access\s+to\s+model|model[_-]not[_-]found|模型不存在|unknown\s+model|no\s+such\s+model/i;
 const TRANSIENT_PATTERN =
   /\b(?:5\d\d|408|429)\b|\b(?:internal\s+server\s+error|bad\s+gateway|service\s+unavailable|server\s+error|overloaded|rate[-\s]?limit(?:ed)?|too\s+many\s+requests|request\s+timeout|stream_error|fetch\s+failed|socket\s+hang\s+up)\b|connection\s+(?:refused|reset|closed|timed?\s?out)|ECONN(?:RESET|REFUSED|ABORTED)|ETIMEDOUT/i;
 const SANDBOX_PATTERN =
@@ -48,6 +50,7 @@ export function classifyErrorCode(signal: FailureSignal): ErrorCode | undefined 
 
   if (SPAWN_FAILURE_PATTERN.test(message)) return "SPAWN_FAILED";
   if (signal.exitCode === 127) return "SPAWN_FAILED";
+  if (VENDOR_QUOTA_PATTERN.test(message)) return "VENDOR_QUOTA";
   if (MODEL_REJECTION_PATTERN.test(message)) return "MODEL_REJECTED";
   if (TRANSIENT_PATTERN.test(message)) return "TRANSIENT_5XX";
   if (SANDBOX_PATTERN.test(message)) return "SANDBOX_UNAVAILABLE";

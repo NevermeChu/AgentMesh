@@ -21,10 +21,21 @@ import {
 } from "./capabilities.js";
 import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
+import { FREE_POOL_HINT, validateModelAgainstCatalog } from "./modelCatalog.js";
+import {
+  detectDestructiveInstructions,
+  formatSafetyWarning,
+  scanForCredentialLeaks,
+} from "./outputSafety.js";
 import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import type { AgentMetadata, BudgetConfig } from "./config.js";
-import { captureRepositoryState } from "./repository.js";
+import {
+  captureRepositoryState,
+  captureRollbackAnchor,
+  restoreRollbackAnchor,
+  type RollbackAnchor,
+} from "./repository.js";
 import { classifyErrorCode } from "./resilience.js";
 import { buildSummaryPrompt, stripAnalysisDraft, buildReworkFixPrompt } from "./prompts.js";
 import { truncateText } from "./text.js";
@@ -250,6 +261,11 @@ function renderSharedTurn(
   }
   if (history.reviewerSafety) {
     details.push(`Reviewer safety: ${JSON.stringify(history.reviewerSafety)}`);
+  }
+  if (history.evidence?.testFilesModified?.length) {
+    details.push(
+      `Test files modified by this worker (anti-reward-hacking evidence): ${history.evidence.testFilesModified.join(", ")}. Each test modification must be individually justified.`,
+    );
   }
   return { text: details.join("\n"), answerTruncated };
 }
@@ -561,6 +577,44 @@ function buildReviewerSafetyReport(options: {
     changedPaths,
     warning: warnings.length ? warnings.join(" ") : undefined,
   };
+}
+
+/** Test-path heuristic for the anti-reward-hacking evidence (broad on purpose). */
+function isTestPath(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/").toLowerCase();
+  return (
+    /(^|\/)(tests?|__tests__|spec)(\/|$)/.test(normalized) ||
+    /\.(test|spec)\.[a-z0-9]+$/.test(normalized) ||
+    /_test\.[a-z0-9]+$/.test(normalized)
+  );
+}
+
+/**
+ * Anti-reward-hacking evidence: which test files changed during a worker turn.
+ * Mirrors buildReviewerSafetyReport's diff logic (fingerprints when both sides
+ * have them, coarse changed-path union otherwise). Undefined when nothing
+ * test-shaped changed or when no repository evidence exists.
+ */
+function computeTestFilesModified(
+  repositoryBefore?: RepositoryStateEvidence,
+  repositoryAfter?: RepositoryStateEvidence,
+): string[] | undefined {
+  if (!repositoryBefore || !repositoryAfter) return undefined;
+  const beforePaths = repositoryBefore.pathFingerprints;
+  const afterPaths = repositoryAfter.pathFingerprints;
+  const changed =
+    beforePaths && afterPaths
+      ? [...new Set([...Object.keys(beforePaths), ...Object.keys(afterPaths)])].filter(
+          (filePath) => beforePaths[filePath] !== afterPaths[filePath],
+        )
+      : [
+          ...new Set([
+            ...(repositoryBefore.changedPaths || []),
+            ...(repositoryAfter.changedPaths || []),
+          ]),
+        ];
+  const testFiles = changed.filter(isTestPath).slice(0, 50);
+  return testFiles.length ? testFiles : undefined;
 }
 
 function applyReviewerSafety(result: AgentResult, report: ReviewerSafetyReport): void {
@@ -1065,6 +1119,46 @@ export class MultiAgentRunner {
     const role: AgentRole = params.role ?? session.role;
 
     const repositoryBefore = await captureRepositoryState(effectiveCwd);
+
+    // Round-15 follow-up: validate the requested model against the vendor's
+    // own catalog BEFORE spawning (zero quota cost). A wrong or dead model id
+    // (typo, missing `opencode/` prefix, a config-imported provider with no
+    // balance) fails here with closest alternatives instead of a confusing
+    // vendor error that reads as "the models are broken".
+    if (params.model && adapter.name === "opencode") {
+      // getExecutablePath is optional on AgentAdapter; opencode always defines
+      // it, but the guard keeps the type system honest for future adapters.
+      const bin = adapter.getExecutablePath ? await adapter.getExecutablePath() : undefined;
+      const validation = bin
+        ? await validateModelAgainstCatalog(bin, effectiveCwd, params.model, params.env)
+        : ({
+            ok: true,
+            catalogUnavailable: "executable path unavailable; skipped validation",
+          } as const);
+      if (!validation.ok) {
+        const hint = validation.suggestions?.length
+          ? `Did you mean: ${validation.suggestions.join(", ")}? ${FREE_POOL_HINT}`
+          : FREE_POOL_HINT;
+        const detail = `Model '${params.model}' is not in the opencode catalog. ${hint}`;
+        return {
+          status: "failed",
+          agent: adapter.name,
+          sessionId: session.id,
+          summary: detail,
+          output: detail,
+          error: detail,
+          errorCode: "MODEL_REJECTED",
+          durationMs: Date.now() - startTime,
+        };
+      }
+    }
+
+    const rollbackWarning = await this.anchorWorkerTurn(
+      session,
+      role,
+      effectiveCwd,
+      repositoryBefore,
+    );
     // Native resume covers the target session's OWN history only; explicit
     // context sources always inject so cross-session facts arrive first-hand.
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
@@ -1178,6 +1272,43 @@ export class MultiAgentRunner {
         );
       }
 
+      // Anti-reward-hacking evidence: workers that touched test-shaped files get
+      // that fact surfaced structurally and as a warning, so reviewers must
+      // individually justify every test modification (a green suite built by
+      // weakening assertions must not pass silently).
+      if (role !== "reviewer") {
+        const testFilesModified = computeTestFilesModified(repositoryBefore, repositoryAfter);
+        if (testFilesModified?.length) {
+          result.testFilesModified = testFilesModified;
+          const note = `Worker modified test files: ${testFilesModified.join(", ")}. Each test modification must be individually justified before the result can pass review.`;
+          result.warning = [result.warning, note].filter(Boolean).join(" ");
+        }
+      }
+
+      // P-R14-1: credential-leak scan on worker output + destructive-pattern
+      // scan on task text. Warnings only — never blocking — but they ride the
+      // normal warning channel into the MCP response and session history.
+      {
+        const destructiveMatches =
+          role !== "reviewer" ? detectDestructiveInstructions(params.task) : [];
+        if (destructiveMatches.length) {
+          result.warning = [
+            result.warning,
+            formatSafetyWarning("destructive-task", destructiveMatches),
+          ]
+            .filter(Boolean)
+            .join(" ");
+        }
+        const leakMatches = scanForCredentialLeaks(
+          [result.finalAnswer, result.output].filter(Boolean).join("\n"),
+        );
+        if (leakMatches.length) {
+          result.warning = [result.warning, formatSafetyWarning("credential-leak", leakMatches)]
+            .filter(Boolean)
+            .join(" ");
+        }
+      }
+
       // Structured capability diagnostics: never let a requested vendor model or
       // reasoning option disappear silently on a transport that ignores it.
       const executedDiagnostics = evaluateModelOptionSupport({
@@ -1195,7 +1326,11 @@ export class MultiAgentRunner {
       const diagnostics = [
         ...new Set([...preflightDiagnostics, ...executedDiagnostics, ...rejectionDiagnostics]),
       ];
-      const extraWarnings = [...diagnostics, ...(spawnHint ? [spawnHint] : [])];
+      const extraWarnings = [
+        ...diagnostics,
+        ...(spawnHint ? [spawnHint] : []),
+        ...(rollbackWarning ? [rollbackWarning] : []),
+      ];
       if (extraWarnings.length > 0) {
         result.warning = [result.warning, ...extraWarnings].filter(Boolean).join(" ");
       }
@@ -1504,6 +1639,29 @@ export class MultiAgentRunner {
     // Native resume carries the session's OWN history; explicit context sources
     // inject alongside it so reviewer/tester feedback arrives first-hand.
     const repositoryBefore = await captureRepositoryState(session.cwd);
+    const rollbackWarning = await this.anchorWorkerTurn(
+      session,
+      session.role,
+      session.cwd,
+      repositoryBefore,
+    );
+
+    // P-R15-2: budget gate on the continue path too. Accumulated usage is real
+    // here (unlike a fresh delegate session), so the pre-dispatch check actually
+    // bites — including for rework rounds that route through continue_task.
+    const budgetGate = this.evaluateBudgetForSession(session.cwd, session);
+    if (budgetGate.action === "reject") {
+      return {
+        status: "failed",
+        agent: adapter.name,
+        sessionId: session.id,
+        summary: budgetGate.warning,
+        output: budgetGate.warning,
+        error: budgetGate.warning,
+        errorCode: "BUDGET_EXHAUSTED",
+        durationMs: Date.now() - startTime,
+      };
+    }
     const ownHistoryInjectable = !session.nativeSessionId && session.history.length > 0;
     const injectionSources = [...contextSessions, ...(ownHistoryInjectable ? [session] : [])];
     const sharedContext = buildSharedContextDetailed(injectionSources, repositoryBefore);
@@ -1581,6 +1739,28 @@ export class MultiAgentRunner {
         );
       }
 
+      // P-R14-1 scans for continued runs too (see delegateTask for rationale).
+      {
+        const destructiveMatches =
+          session.role !== "reviewer" ? detectDestructiveInstructions(params.task) : [];
+        if (destructiveMatches.length) {
+          result.warning = [
+            result.warning,
+            formatSafetyWarning("destructive-task", destructiveMatches),
+          ]
+            .filter(Boolean)
+            .join(" ");
+        }
+        const leakMatches = scanForCredentialLeaks(
+          [result.finalAnswer, result.output].filter(Boolean).join("\n"),
+        );
+        if (leakMatches.length) {
+          result.warning = [result.warning, formatSafetyWarning("credential-leak", leakMatches)]
+            .filter(Boolean)
+            .join(" ");
+        }
+      }
+
       // Structured capability diagnostics for continued runs as well.
       const executedDiagnostics = evaluateModelOptionSupport({
         agent: session.agent,
@@ -1597,7 +1777,11 @@ export class MultiAgentRunner {
       const diagnostics = [
         ...new Set([...preflightDiagnostics, ...executedDiagnostics, ...rejectionDiagnostics]),
       ];
-      const extraWarnings = [...diagnostics, ...(spawnHint ? [spawnHint] : [])];
+      const extraWarnings = [
+        ...diagnostics,
+        ...(spawnHint ? [spawnHint] : []),
+        ...(rollbackWarning ? [rollbackWarning] : []),
+      ];
       if (extraWarnings.length > 0) {
         result.warning = [result.warning, ...extraWarnings].filter(Boolean).join(" ");
       }
@@ -1872,6 +2056,113 @@ export class MultiAgentRunner {
    * Persists native session binding changes and one normalized turn of
    * execution evidence. Shared by delegateTask and continueTask.
    */
+  /**
+   * Rollback anchor (T4b): snapshot the pre-worker tracked state so a
+   * destructive or off-task turn can be recovered via rollback_task. Reviewer
+   * turns never write and never re-anchor. Non-git working directories yield a
+   * disclosed warning instead of a silent capability gap. Returns the warning
+   * text to attach to the turn result (or undefined).
+   */
+  private async anchorWorkerTurn(
+    session: BridgeSession,
+    role: AgentRole,
+    effectiveCwd: string,
+    repositoryBefore: RepositoryStateEvidence | undefined,
+  ): Promise<string | undefined> {
+    if (role === "reviewer") return undefined;
+    if (!repositoryBefore) {
+      return "No git repository detected at the working directory; automatic rollback (rollback_task) is unavailable for this task.";
+    }
+    const anchor = await captureRollbackAnchor(effectiveCwd, repositoryBefore);
+    if (!anchor) return undefined;
+    const metadata = { ...(session.metadata ?? {}), rollbackAnchor: anchor };
+    this.sessionManager.updateSession(session.id, { metadata });
+    session.metadata = metadata;
+    return undefined;
+  }
+
+  /**
+   * T4b: restores the tracked working tree of a session's repository to the
+   * anchor captured before its last worker dispatch. The current state is
+   * stashed first (pre-rollback snapshot in session metadata) so a mistaken
+   * rollback is itself recoverable. Disclosed limitations: files created after
+   * the anchor remain on disk and are reported; untracked files present at
+   * anchor time were never captured and cannot be restored.
+   */
+  public async rollbackTask(params: { sessionId: string }): Promise<{
+    status: "success" | "failed";
+    summary: string;
+    sessionId?: string;
+    restoredVia?: "stash" | "head";
+    preRollbackStashSha?: string;
+    fingerprintBefore?: string;
+    fingerprintAfter?: string;
+    remainingChangedPaths?: string[];
+    warning?: string;
+    error?: string;
+  }> {
+    const session = this.sessionManager.getSession(params.sessionId);
+    if (!session) {
+      return {
+        status: "failed",
+        summary: `Session '${params.sessionId}' not found.`,
+        error: `Session '${params.sessionId}' not found.`,
+      };
+    }
+    const anchor = session.metadata?.rollbackAnchor as RollbackAnchor | undefined;
+    if (!anchor?.repositoryRoot) {
+      return {
+        status: "failed",
+        sessionId: session.id,
+        summary: `Session '${session.id}' has no rollback anchor (non-git working directory, reviewer-only session, or anchored before this feature).`,
+        error: "No rollback anchor available for this session.",
+      };
+    }
+
+    const fingerprintBefore = anchor.fingerprint;
+    const outcome = await restoreRollbackAnchor(anchor);
+    if (!outcome.ok) {
+      return {
+        status: "failed",
+        sessionId: session.id,
+        summary: outcome.error,
+        error: outcome.error,
+      };
+    }
+
+    // Record the pre-rollback snapshot on the session so this rollback itself
+    // can be undone by a human (best-effort; the stash is a dangling commit).
+    if (outcome.outcome.preRollbackStashSha) {
+      const metadata = {
+        ...(session.metadata ?? {}),
+        preRollbackStashSha: outcome.outcome.preRollbackStashSha,
+      };
+      this.sessionManager.updateSession(session.id, { metadata });
+    }
+
+    const remaining = outcome.outcome.remainingChangedPaths;
+    const warning = [
+      "Untracked files present at anchor time cannot be restored by design.",
+      remaining.length
+        ? `Working-tree changes still present after the restore: ${remaining.join(", ")}.`
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    return {
+      status: "success",
+      sessionId: session.id,
+      summary: `Working tree restored to the pre-dispatch anchor via ${outcome.outcome.restoredVia === "stash" ? "anchor stash snapshot" : "anchor HEAD reset"}.`,
+      restoredVia: outcome.outcome.restoredVia,
+      preRollbackStashSha: outcome.outcome.preRollbackStashSha,
+      fingerprintBefore,
+      fingerprintAfter: outcome.outcome.fingerprintAfter,
+      remainingChangedPaths: remaining.length ? remaining : undefined,
+      warning,
+    };
+  }
+
   private recordTurn(options: {
     session: BridgeSession;
     role: AgentRole;
@@ -1940,6 +2231,9 @@ export class MultiAgentRunner {
         cleanupSucceeded: result.cleanupSucceeded,
         resourceEvidence: result.resourceEvidence,
         transportFallback: result.transportFallback,
+        ...(result.testFilesModified?.length
+          ? { testFilesModified: result.testFilesModified }
+          : {}),
       },
       reviewerSafety: result.reviewerSafety,
       requestedModel: options.requestedModel,

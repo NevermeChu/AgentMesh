@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as nodePath from "node:path";
-import type { BridgeSession, SessionHistoryEntry } from "../core/types.js";
+import type { BridgeSession, SessionHistoryEntry, TimelineEntry } from "../core/types.js";
 import type { BackgroundTaskRecord, StoredTaskResult } from "../core/background.js";
 import { isPidAlive } from "../core/background.js";
 import { loadProjectConfig } from "../core/config.js";
@@ -29,6 +29,13 @@ export interface SessionSummary {
   lastStatus: string | null;
   lastActivityAt: string | null;
   totalTokens: number;
+  lastModelId?: string;
+  /** True when at least one turn carries vendor usage (r18: 0 tokens on an old session means 未计量, not 没用). */
+  hasUsage?: boolean;
+  /** Distinct files with recorded changes across the session's turns (r18: the honest did-work signal). */
+  changedFiles?: string[];
+  /** First line of the orchestrator's dispatch prompt — the task this session worked on (r18). */
+  taskTitle?: string;
 }
 
 export interface TaskSummary {
@@ -86,6 +93,44 @@ function sumTokens(history: SessionHistoryEntry[]): number {
   return total;
 }
 
+function findLastRequestedModel(history: SessionHistoryEntry[]): string | undefined {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const model = history[i]!.requestedModel;
+    if (model !== undefined) return model;
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Timeline derivation
+// ---------------------------------------------------------------------------
+
+const MAX_TASK_LENGTH = 500;
+
+function isWorkerEntry(entry: SessionHistoryEntry): boolean {
+  return !!(entry.finalAnswer || entry.summary || entry.evidence || entry.findings);
+}
+
+export function buildTimeline(session: BridgeSession): TimelineEntry[] {
+  const history = session.history ?? [];
+  return history.map((entry) => {
+    const base: TimelineEntry = {
+      timestamp: entry.timestamp,
+      status: entry.status,
+      role: entry.role,
+      task: entry.task.length > MAX_TASK_LENGTH ? entry.task.slice(0, MAX_TASK_LENGTH) : entry.task,
+      from: isWorkerEntry(entry) ? "worker" : "orchestrator",
+    };
+    // r18: 主模型给组员的完整提示词原文（前端折叠展示，不受 MAX_TASK_LENGTH 截断）。
+    if (entry.task.length > MAX_TASK_LENGTH) base.taskFull = entry.task;
+    if (entry.summary !== undefined) base.summary = entry.summary;
+    if (entry.finalAnswer !== undefined) base.finalAnswer = entry.finalAnswer;
+    if (entry.usage !== undefined) base.usage = entry.usage;
+    if (entry.requestedModel !== undefined) base.modelId = entry.requestedModel;
+    return base;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
@@ -97,7 +142,21 @@ export function listSessions(homeDir: string): SessionSummary[] {
     .map((s) => {
       const history = s.history ?? [];
       const lastEntry = history.at(-1);
-      return {
+      const lastModelId = findLastRequestedModel(history);
+      // r18: the honest did-work signal — distinct files with recorded changes.
+      const changedFiles = [
+        ...new Set(
+          history.flatMap((entry) => {
+            const paths = [
+              ...(entry.evidence?.repositoryAfter?.changedPaths ?? []),
+              ...(entry.evidence?.testFilesModified ?? []),
+            ];
+            return paths;
+          }),
+        ),
+      ].slice(0, 50);
+      const hasUsage = history.some((entry) => entry.usage !== undefined);
+      const summary: SessionSummary = {
         id: s.id,
         agent: s.agent,
         role: s.role,
@@ -108,9 +167,58 @@ export function listSessions(homeDir: string): SessionSummary[] {
         lastStatus: lastEntry?.status ?? null,
         lastActivityAt: lastEntry?.timestamp ?? null,
         totalTokens: sumTokens(history),
+        taskTitle: history[0]?.task.split(/\r?\n/)[0]?.slice(0, 60),
+        changedFiles: changedFiles.length ? changedFiles : undefined,
+        ...(hasUsage ? { hasUsage } : {}),
       };
+      if (lastModelId !== undefined) summary.lastModelId = lastModelId;
+      return summary;
     })
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+}
+
+/**
+ * r18: groups sessions by project directory (cwd) — one archival group per
+ * task/project, newest activity first. Collapsed rendering is the panel's job;
+ * this only provides the stable grouping key and per-group aggregates.
+ */
+export interface ProjectGroup {
+  project: string;
+  label: string;
+  sessions: SessionSummary[];
+  totalTokens: number;
+  meteredCount: number;
+  lastActivityAt: string;
+}
+
+export function groupSessionsByProject(sessions: SessionSummary[]): ProjectGroup[] {
+  const groups = new Map<string, ProjectGroup>();
+  for (const session of sessions) {
+    const key = session.cwd || "(未知目录)";
+    let group = groups.get(key);
+    if (!group) {
+      const normalized = key.replace(/\\/g, "/");
+      const label = normalized.split("/").filter(Boolean).pop() || key;
+      group = {
+        project: key,
+        label,
+        sessions: [],
+        totalTokens: 0,
+        meteredCount: 0,
+        lastActivityAt: session.updatedAt,
+      };
+      groups.set(key, group);
+    }
+    group.sessions.push(session);
+    group.totalTokens += session.totalTokens ?? 0;
+    if (session.hasUsage) group.meteredCount++;
+    if (new Date(session.updatedAt).getTime() > new Date(group.lastActivityAt).getTime()) {
+      group.lastActivityAt = session.updatedAt;
+    }
+  }
+  return [...groups.values()].sort(
+    (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+  );
 }
 
 /** Returns a single session by id, or undefined if not found. */

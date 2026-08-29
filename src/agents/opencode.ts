@@ -5,6 +5,7 @@ import type {
   RunAgentOptions,
   SandboxMechanism,
   TransportMode,
+  UsageInfo,
 } from "./types.js";
 import { executeCommand, ProcessExecutionError } from "../core/executor.js";
 import { buildRolePrompt } from "../core/prompts.js";
@@ -14,6 +15,7 @@ export interface ParsedOpenCodeOutput {
   output: string;
   sessionId?: string;
   error?: string;
+  usage?: UsageInfo;
 }
 
 function findStringField(value: unknown, keys: ReadonlySet<string>, depth = 0): string | undefined {
@@ -33,7 +35,19 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
   const answers: string[] = [];
   let sessionId: string | undefined;
   let error: string | undefined;
+  let usage: UsageInfo | undefined;
   let parsedAny = false;
+
+  // step_finish tokens are per-step; sum across steps so multi-turn runs report
+  // the whole turn. Non-finite or negative components are skipped rather than
+  // clamped: a partial sum beats an invented number (evidence-as-is principle).
+  const addUsage = (patch: Record<string, unknown>): void => {
+    usage = usage ?? {};
+    for (const [key, value] of Object.entries(patch)) {
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) continue;
+      usage[key as keyof UsageInfo] = (usage[key as keyof UsageInfo] ?? 0) + value;
+    }
+  };
 
   for (const line of output
     .split(/\r?\n/)
@@ -55,6 +69,28 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
             ? event.result
             : undefined;
       if (text?.trim()) answers.push(text.trim());
+      if (type === "step_finish") {
+        const tokens =
+          part?.tokens && typeof part.tokens === "object"
+            ? (part.tokens as Record<string, unknown>)
+            : event.tokens && typeof event.tokens === "object"
+              ? (event.tokens as Record<string, unknown>)
+              : undefined;
+        if (tokens) {
+          const cache =
+            tokens.cache && typeof tokens.cache === "object"
+              ? (tokens.cache as Record<string, unknown>)
+              : {};
+          addUsage({
+            inputTokens: Number(tokens.input),
+            outputTokens: Number(tokens.output),
+            reasoningOutputTokens: Number(tokens.reasoning),
+            totalTokens: Number(tokens.total),
+            cachedInputTokens: Number(cache.read),
+            cacheWriteInputTokens: Number(cache.write),
+          });
+        }
+      }
       if (type === "error" || event.error) {
         error =
           typeof event.error === "string"
@@ -71,6 +107,7 @@ export function parseOpenCodeJsonLines(output: string): ParsedOpenCodeOutput {
     output: answers.join("\n\n") || (parsedAny ? "" : output.trim()),
     sessionId,
     error,
+    usage,
   };
 }
 
@@ -159,16 +196,20 @@ export class OpenCodeAdapter extends BaseAdapter {
           cleanupMethod: res.cleanupMethod,
           cleanupSucceeded: res.cleanupSucceeded,
           resourceEvidence: res.resourceEvidence,
+          ...(parsed.usage ? { usage: parsed.usage } : {}),
         };
       }
 
-      return this.formatSuccessResult(parsed.output || diagnosticOutput, startTime, {
-        nativeSessionId,
-        exitCode: res.exitCode,
-        finalAnswer: parsed.output || undefined,
-        role,
-        reviewVerdictRequired: options.reviewVerdictRequired,
-      });
+      return {
+        ...this.formatSuccessResult(parsed.output || diagnosticOutput, startTime, {
+          nativeSessionId,
+          exitCode: res.exitCode,
+          finalAnswer: parsed.output || undefined,
+          role,
+          reviewVerdictRequired: options.reviewVerdictRequired,
+        }),
+        ...(parsed.usage ? { usage: parsed.usage } : {}),
+      };
     } catch (err) {
       if (err instanceof ProcessExecutionError) {
         return {

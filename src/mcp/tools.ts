@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import { existsSync } from "node:fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -437,6 +438,12 @@ export const PollTaskInputSchema = z.object({
 });
 
 export const ReviewChangesInputSchema = z.object({
+  background: z
+    .boolean()
+    .optional()
+    .describe(
+      "Run asynchronously: returns immediately with taskId and outputFile; use poll_task to observe (P-R14-4: reviews routinely exceed the host's 30s sync window)",
+    ),
   agent: z
     .string()
     .trim()
@@ -538,6 +545,12 @@ export const GetSessionInputSchema = z.object({
   sessionId: NonBlankString.describe("The Bridge session ID to inspect"),
 });
 
+export const RollbackTaskInputSchema = z.object({
+  sessionId: NonBlankString.describe(
+    "Bridge session whose pre-dispatch rollback anchor should be restored",
+  ),
+});
+
 export const GetRoleConfigInputSchema = z.object({
   cwd: NonBlankString.optional().describe(
     "Project directory used to locate the nearest .agentmesh/config.json",
@@ -614,6 +627,9 @@ export function registerMcpTools(
     [
       "Delegates a task to an explicit agent or to the agent assigned to its role in .agentmesh/config.json.",
       "",
+      "Requirements gate (run BEFORE the first dispatch of any new project):",
+      "0. Vague user input is normal and expected. Before decomposing, restate your understanding back to the user: the goal, what is explicitly OUT of scope, and acceptance criteria that are objectively decidable (test results, file existence, command exit codes — never 'nice' or 'usable'). Ask at most 3 questions that affect decomposition or acceptance, then WAIT for confirmation. Only after the user confirms, write the confirmed criteria into ORCHESTRATION.md (the project constitution) and start dispatching.",
+      "0b. Mid-project requirement changes are normal, not failures: update ORCHESTRATION.md first, then re-dispatch only the affected tasks.",
       "Delegation discipline (protocol-as-prompt):",
       "1. Brief like a smart colleague who just walked in — NEVER delegate understanding: every instruction must carry concrete file paths and the exact intended change. Anti-pattern: 'based on your findings' — the downstream agent has only what you wrote, not your understanding.",
       "2. Parallelism: fan out read-only tasks (research/review/analysis) freely; strictly serialize write tasks that touch the same set of files.",
@@ -745,6 +761,35 @@ export function registerMcpTools(
         };
       } catch (err) {
         if (err instanceof BackgroundTaskNotFoundError) {
+          // P-R14-3: distinguish "never existed" from "the owning bridge died
+          // and a restart dead-lettered the registration". The declared output
+          // file is the only salvage trail a SIGKILL leaves behind.
+          const interrupted = background.registry.getInterruptedTask(err.taskId);
+          if (interrupted) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify(
+                    {
+                      taskId: err.taskId,
+                      status: "interrupted",
+                      reason:
+                        "The bridge process owning this background task died (crash or kill) before a terminal result was recorded; a restart dead-lettered the registration.",
+                      interruptedAtMs: interrupted.orphanedAtMs,
+                      startedAtMs: interrupted.startedAtMs,
+                      outputFile: interrupted.outputFile,
+                      outputExists: existsSync(interrupted.outputFile),
+                      guidance:
+                        "No checkpoint was taken (SIGKILL skips graceful failure handling). Inspect the output file for partial vendor output; re-dispatch the task (same idempotencyKey if one was used) to re-execute.",
+                    },
+                    null,
+                    2,
+                  ),
+                },
+              ],
+            };
+          }
           return {
             content: [
               {
@@ -808,6 +853,51 @@ export function registerMcpTools(
     ReviewChangesInputSchema.shape,
     async (args: z.infer<typeof ReviewChangesInputSchema>, extra) => {
       try {
+        if (args.background) {
+          const taskId = `bgtask_${Date.now().toString(36)}${crypto.randomBytes(4).toString("hex")}`;
+          const outputFile = background.registry.outputFilePath(taskId);
+          background.registry.registerTask({
+            taskId,
+            pid: process.pid,
+            startedAtMs: Date.now(),
+            outputFile,
+          });
+          background.launch({
+            taskId,
+            outputFile,
+            run: (signal) =>
+              runner.reviewChanges({
+                agent: args.agent,
+                task: args.task,
+                cwd: args.cwd,
+                baseCommit: args.baseCommit,
+                mode: args.mode,
+                timeoutMs: args.timeoutMs,
+                model: args.model,
+                reasoningEffort: args.reasoningEffort,
+                contextSessionId: args.contextSessionId,
+                contextSessionIds: args.contextSessionIds,
+                maxReworkRounds: args.maxReworkRounds,
+                workerSessionId: args.workerSessionId,
+                signal,
+              }),
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: [
+                  "[Background Review Accepted]",
+                  `Task ID: ${taskId}`,
+                  `Output File: ${outputFile}`,
+                  "Status: RUNNING",
+                  "",
+                  "Use poll_task to observe; a FAIL verdict with maxReworkRounds continues autonomously in the background.",
+                ].join("\n"),
+              },
+            ],
+          };
+        }
         const result = await runWithProgress(extra, "Review", () =>
           runner.reviewChanges({
             agent: args.agent,
@@ -1038,6 +1128,33 @@ export function registerMcpTools(
           },
         ],
       };
+    },
+  );
+
+  // rollback_task
+  server.tool(
+    "rollback_task",
+    "Restores the tracked working tree of a session's repository to the anchor captured before its last worker dispatch (T4b). The current state is stashed first (pre-rollback snapshot in session metadata) so a mistaken rollback is itself recoverable. Disclosed limitations: files created after the anchor remain on disk and are reported; untracked files present at anchor time cannot be restored.",
+    RollbackTaskInputSchema.shape,
+    async (args: z.infer<typeof RollbackTaskInputSchema>) => {
+      try {
+        const outcome = await runner.rollbackTask({ sessionId: args.sessionId });
+        const isError = outcome.status === "failed";
+        return {
+          content: [{ type: "text", text: JSON.stringify(outcome, null, 2) }],
+          isError,
+        };
+      } catch (errorMsg) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Bridge Error in rollback_task: ${errorMsg instanceof Error ? errorMsg.message : String(errorMsg)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
     },
   );
 }

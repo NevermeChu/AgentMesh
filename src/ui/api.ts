@@ -9,6 +9,7 @@ import {
   taskExists,
   readTaskOutput,
   readFile,
+  buildTimeline,
   FileNotFoundError,
   NotAFileError,
   TaskNotFoundError,
@@ -89,7 +90,7 @@ export async function handleUiApiRequest(opts: {
     const id = decodeURIComponent(sessionMatch[1]!);
     const session = getSession(homeDir, id);
     if (!session) return json(404, { error: "Session not found" });
-    return json(200, session);
+    return json(200, { ...session, timeline: buildTimeline(session) });
   }
 
   // -----------------------------------------------------------------------

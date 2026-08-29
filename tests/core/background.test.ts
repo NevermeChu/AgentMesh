@@ -85,13 +85,18 @@ describe("core/background registry", () => {
     const reaped = await registry.scanAndReapOrphans();
 
     expect(reaped.map((entry) => entry.taskId)).toEqual(["bg_dead"]);
+    // P-R14-3: reaped records are dead-lettered (orphanedAtMs set), not
+    // dropped, so poll_task can still report "interrupted" for them.
     const remaining = fs
       .readFileSync(registry.registryFilePath, "utf-8")
       .split("\n")
       .filter(Boolean)
-      .map((line) => JSON.parse(line) as { taskId: string })
-      .map((parsed) => parsed.taskId);
-    expect(remaining).toEqual(["bg_live"]);
+      .map((line) => JSON.parse(line) as { taskId: string; orphanedAtMs?: number });
+    expect(remaining.map((parsed) => parsed.taskId).sort()).toEqual(["bg_dead", "bg_live"]);
+    const dead = remaining.find((parsed) => parsed.taskId === "bg_dead");
+    expect(dead?.orphanedAtMs).toBeTypeOf("number");
+    const live = remaining.find((parsed) => parsed.taskId === "bg_live");
+    expect(live?.orphanedAtMs).toBeUndefined();
   });
 
   it("reads output incrementally at a byte offset", async () => {
@@ -289,5 +294,77 @@ describe("core/executor task activity tee", () => {
       executeCommand("definitely-missing-executable-agentmesh", [], {}),
     ).rejects.toBeInstanceOf(Error);
     expect(getActivityHandle(taskId)).toBeUndefined();
+  });
+});
+
+describe("core/background orphan dead-lettering (P-R14-3)", () => {
+  let homeDir: string;
+  let nowMs: number;
+  const alivePids = new Set<number>();
+
+  const makeRegistry = () =>
+    new BackgroundTaskRegistry({
+      homeDir,
+      now: () => nowMs,
+      isPidAlive: (pid) => alivePids.has(pid),
+    });
+
+  beforeEach(() => {
+    homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-orphan-"));
+    nowMs = 1_000_000;
+    alivePids.clear();
+    alivePids.add(process.pid);
+  });
+
+  afterEach(() => {
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  });
+
+  it("creates the declared output file eagerly at registration", () => {
+    const registry = makeRegistry();
+    const outputFile = path.join(registry.tasksDirectory, "bgtask_eager.output");
+    registry.registerTask({
+      taskId: "bgtask_eager",
+      pid: process.pid,
+      startedAtMs: nowMs,
+      outputFile,
+    });
+    expect(fs.existsSync(outputFile)).toBe(true);
+  });
+
+  it("dead-letters orphans on startup scan so poll_task can report interrupted", async () => {
+    const registry = makeRegistry();
+    const outputFile = path.join(registry.tasksDirectory, "bgtask_killed.output");
+    registry.registerTask({
+      taskId: "bgtask_killed",
+      pid: process.pid,
+      startedAtMs: nowMs,
+      outputFile,
+    });
+
+    // Simulate a restart: fresh registry instance, owning pid no longer alive.
+    nowMs += 5_000;
+    const restarted = makeRegistry();
+    alivePids.delete(process.pid);
+    const reaped = await restarted.scanAndReapOrphans();
+    expect(reaped.map((r) => r.taskId)).toContain("bgtask_killed");
+
+    // The record must be dead-lettered, not silently dropped.
+    const interrupted = restarted.getInterruptedTask("bgtask_killed");
+    expect(interrupted).toBeDefined();
+    expect(interrupted?.orphanedAtMs).toBe(nowMs);
+    expect(interrupted?.outputFile).toBe(outputFile);
+
+    // A live task registered by the new process is never touched by scans.
+    restarted.registerTask({
+      taskId: "bgtask_live",
+      pid: process.pid,
+      startedAtMs: nowMs,
+      outputFile: path.join(restarted.tasksDirectory, "bgtask_live.output"),
+    });
+    alivePids.add(process.pid);
+    const secondScan = await restarted.scanAndReapOrphans();
+    expect(secondScan.map((r) => r.taskId)).not.toContain("bgtask_live");
+    expect(restarted.getInterruptedTask("bgtask_live")).toBeUndefined();
   });
 });

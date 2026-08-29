@@ -153,9 +153,19 @@ export class CheckpointStore {
     const filePath = this.checkpointPath(checkpointId, bucket);
     await fsp.mkdir(path.dirname(filePath), { recursive: true });
     // 'wx' keeps a rerun from overwriting the first recovery evidence.
-    await fsp.writeFile(filePath, JSON.stringify(record, null, 2), {
+    // Atomic publish (temp + rename) so a concurrent reader can never observe
+    // a half-written checkpoint (P-R14-3 follow-up; same pattern as the
+    // background registry rewrite).
+    const tempFile = `${filePath}.tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    await fsp.writeFile(tempFile, JSON.stringify(record, null, 2), {
       encoding: "utf-8",
       flag: "wx",
+    });
+    await fsp.rename(tempFile, filePath).catch(async (renameErr) => {
+      // Windows rename can fail under concurrent readers; fall back to copy.
+      await fsp.copyFile(tempFile, filePath);
+      await fsp.unlink(tempFile).catch(() => {});
+      if (renameErr instanceof Error) throw renameErr;
     });
     try {
       await fsp.appendFile(

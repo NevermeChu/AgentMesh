@@ -50,7 +50,9 @@ export type ErrorCode =
   /** Fail-fast response while this adapter's circuit breaker is open (P1 T1.3). */
   | "CIRCUIT_OPEN"
   /** Fail-fast response because a token budget cap is exhausted (P5 T5.4). */
-  | "BUDGET_EXHAUSTED";
+  | "BUDGET_EXHAUSTED"
+  /** The vendor account/provider ran out of balance or quota (e.g. 预扣费失败). Distinct from our own session budget gate. */
+  | "VENDOR_QUOTA";
 
 /**
  * Terminal-outcome tombstone recorded for an idempotency key (P1 T1.1).
@@ -120,6 +122,12 @@ export interface SessionExecutionEvidence {
   resourceEvidence?: ResourceEvidence;
   /** Present when the executed turn switched transports via auto-mode fallback. */
   transportFallback?: TransportFallbackEvidence;
+  /**
+   * Test files whose content changed during a worker turn (anti-reward-hacking
+   * evidence). Surfaced to reviewers so every test modification must be
+   * individually justified; absent when no test-path file changed.
+   */
+  testFilesModified?: string[];
 }
 
 /** Verbatim-audit record for the shared context injected into one turn's prompt. */
@@ -153,6 +161,21 @@ export interface SessionHistoryEntry {
   sharedContextAudit?: SharedContextAudit;
   /** Vendor-reported token usage for this turn (P2 T2.1); feeds the T5.4 budget gate. */
   usage?: UsageInfo;
+}
+
+/** Semantic timeline entry derived from SessionHistoryEntry for the UI panel. */
+export interface TimelineEntry {
+  timestamp: string;
+  status: "success" | "failed";
+  role: AgentRole;
+  task: string;
+  /** Full untruncated dispatch prompt when it exceeded MAX_TASK_LENGTH (r18: 组长提示词原文查看). */
+  taskFull?: string;
+  summary?: string;
+  finalAnswer?: string;
+  usage?: UsageInfo;
+  modelId?: string;
+  from: "orchestrator" | "worker";
 }
 
 export interface BridgeSession {

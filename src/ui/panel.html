@@ -5,84 +5,132 @@
 <title>AgentMesh UI · 可视化面板</title>
 <style>
   :root{
-    --bg:#0a0e14; --panel:#11161d; --panel2:#0f141b; --border:#2a313a; --text:#c9d1d9; --dim:#7d8590;
-    --green:#3fb950; --red:#f85149; --orange:#d29922; --blue:#58a6ff; --purple:#bc8cff; --yellow:#e3b341;
-    --term-bg:#000000;
+    --bg:#0d1117; --card:#161b22; --card2:#1c2129; --inset:#11161d;
+    --border:#2d333b; --border-soft:#22272e;
+    --text:#e6edf3; --dim:#8b949e; --faint:#6e7681;
+    --blue:#58a6ff; --green:#3fb950; --red:#f85149; --orange:#d29922;
+    --yellow:#e3b341; --purple:#bc8cff;
+    --mono:"Cascadia Code",Consolas,"SFMono-Regular",Menlo,monospace;
+    --sans:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    --term-bg:#0a0c10;
   }
   *{box-sizing:border-box;margin:0;padding:0}
-  body{background:var(--bg);color:var(--text);font:13px/1.5 "Cascadia Code",Consolas,monospace;height:100vh;display:flex;flex-direction:column;overflow:hidden}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--text);font:14px/1.6 var(--sans);display:flex;flex-direction:column;overflow:hidden}
+  ::-webkit-scrollbar{width:8px;height:8px}
+  ::-webkit-scrollbar-thumb{background:#2d333b;border-radius:4px}
+  ::-webkit-scrollbar-track{background:transparent}
+  .mono{font-family:var(--mono)}
+  .break{word-break:break-all;overflow-wrap:anywhere}
 
-  .statusbar{display:flex;gap:18px;align-items:center;padding:8px 14px;background:var(--panel);border-bottom:1px solid var(--border);font-size:12px}
-  .statusbar .logo{color:var(--blue);font-weight:bold}
-  .statusbar .kv b{color:var(--text);font-weight:normal}
-  .statusbar .right{margin-left:auto;display:flex;gap:14px;align-items:center}
+  /* ── 顶部状态栏 ── */
+  .statusbar{display:flex;gap:20px;align-items:center;padding:10px 18px;background:var(--card);border-bottom:1px solid var(--border);font-size:13px;flex-shrink:0}
+  .statusbar .logo{color:var(--blue);font-weight:700;font-size:14px}
+  .statusbar .kv{color:var(--dim)}
+  .statusbar .kv b{color:var(--text);font-weight:600}
+  .statusbar .right{margin-left:auto;display:flex;gap:10px;align-items:center}
   .pulse{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-  .statusbar .error-msg{color:var(--red);font-size:11px;margin-left:10px}
+  .statusbar .error-msg{color:var(--red);font-size:12px;margin-left:10px}
 
-  .main{flex:1;display:grid;grid-template-columns:230px 1.6fr 1fr 280px;gap:10px;padding:10px;overflow:hidden}
-  .col{overflow-y:auto;display:flex;flex-direction:column;gap:10px}
-  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px}
-  .panel h2{font-size:12px;color:var(--dim);margin-bottom:8px}
+  /* ── 布局 ── */
+  .main{flex:1;display:grid;grid-template-columns:300px minmax(0,1.7fr) 340px;gap:14px;padding:14px;overflow:hidden}
+  .col{overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding-right:2px}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:14px 16px;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+  .card h2{font-size:12px;font-weight:600;color:var(--dim);letter-spacing:.06em;margin-bottom:10px}
+  .card-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+  .card-head h2{margin-bottom:0}
 
-  .grp{margin-bottom:10px}
-  .grp-title{font-size:11px;color:var(--dim);padding:2px 4px}
-  .sess{padding:6px 8px;border-radius:5px;cursor:pointer;border:1px solid transparent}
-  .sess:hover{background:#1a2029}
-  .sess.active{background:#1c2633;border-color:var(--blue)}
-  .sess .id{font-size:11px;color:var(--text);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .sess .sub{font-size:10px;color:var(--dim);display:flex;gap:6px;align-items:center;flex-wrap:wrap}
-  .dot{display:inline-block;width:7px;height:7px;border-radius:50%}
+  /* ── 侧栏会话 ── */
+  .sess{padding:9px 10px;border-radius:8px;cursor:pointer;border:1px solid transparent;margin-bottom:6px;transition:background .12s,border-color .12s}
+  .sess:last-child{margin-bottom:0}
+  .sess:hover{background:var(--card2)}
+  .sess.active{background:#14202e;border-color:var(--blue)}
+  .sess-top{display:flex;gap:8px;align-items:center;margin-bottom:3px}
+  .sess-role{color:var(--dim);font-size:12px}
+  .sess-id{font-size:12px;color:var(--text);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px}
+  .sess-model{font-size:11px;color:var(--green);display:block;line-height:1.45}
+  .sess-model .gear{color:var(--faint);margin-right:2px}
+  .sess-sub{font-size:11px;color:var(--faint);margin-top:3px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+  .sess-task{font-size:10px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.85;margin-top:2px}
+  .tl-prompt-toggle{color:var(--blue);cursor:pointer;font-size:11px;margin:4px 0}
+  .tl-prompt-full{background:#0a0e14;border:1px solid var(--border);border-radius:5px;padding:8px;white-space:pre-wrap;word-break:break-word;font-size:11px;color:var(--text);max-height:300px;overflow-y:auto;margin-top:4px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
   .dot.success{background:var(--green)} .dot.failed{background:var(--red)}
   .dot.running{background:var(--blue);animation:pulse 1.5s infinite} .dot.interrupted{background:var(--orange)}
-  .badge{display:inline-block;padding:0 6px;border-radius:3px;font-size:10px}
-  .b-agent{background:#1f3a5f;color:var(--blue)}
-  .b-interrupted{background:#3d2a14;color:var(--orange);border:1px solid var(--orange);font-weight:bold}
+  .badge{display:inline-block;padding:1px 8px;border-radius:5px;font-size:11px;line-height:1.5}
+  .b-agent{background:#1f3a5f;color:var(--blue);font-weight:600}
+  .b-interrupted{background:#3d2a14;color:var(--orange);border:1px solid var(--orange);font-weight:700}
   .b-interrupted::before{content:"⚠ "}
 
-  .live-banner{background:#14202e;border:1px solid #1f4468;border-radius:6px;padding:8px 12px;margin-bottom:8px;display:flex;gap:12px;align-items:center}
-  .live-banner .t{color:var(--blue)}
-  .kv b{color:var(--text);font-weight:normal}
-  .kv{color:var(--dim);font-size:12px}
-  .chip{display:inline-block;background:#1a2029;border-radius:3px;padding:0 6px;font-size:11px;color:var(--dim);margin-right:5px}
-
-  .terminal{background:var(--term-bg);border:1px solid #30363d;border-radius:6px;padding:10px;font:12px/1.6 "Cascadia Code",Consolas,monospace;color:#c9d1d9;overflow-y:auto;height:240px}
-  .terminal .cmd{color:var(--green)}
+  /* ── 终端 ── */
+  .terminal{background:var(--term-bg);border:1px solid var(--border);border-radius:8px;padding:12px;font:12.5px/1.7 var(--mono);color:#c9d1d9;overflow-y:auto;height:250px}
   .terminal .ok{color:var(--green)}
   .terminal .info{color:#8b949e}
   .terminal .warn{color:var(--yellow)}
   .terminal .err{color:var(--red)}
   .cursor{display:inline-block;width:7px;height:14px;background:var(--green);vertical-align:text-bottom;animation:blink 1s steps(1) infinite}
   @keyframes blink{50%{opacity:0}}
-  .term-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-  .term-title{font-size:11px;color:var(--dim)}
-  .live-tag{font-size:10px;color:var(--orange);border:1px solid var(--orange);border-radius:3px;padding:0 5px}
+  .live-tag{font-size:11px;color:var(--orange);border:1px solid var(--orange);border-radius:5px;padding:1px 8px;font-weight:600}
+  .term-note{color:var(--faint);font-size:12px;margin-top:8px}
 
-  .timeline{border-left:2px solid var(--border);margin-left:6px;padding-left:14px}
-  .turn{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:9px;margin-bottom:9px}
-  .turn-head{display:flex;gap:8px;align-items:center;margin-bottom:5px;flex-wrap:wrap}
-  .turn-meta{color:var(--dim);font-size:12px;margin:3px 0}
-  .badge2{display:inline-block;padding:0 6px;border-radius:3px;font-size:10px;margin:0 4px 4px 0;border:1px solid;cursor:help}
-  .b2-testmod{background:#3d3414;color:var(--yellow);border-color:var(--yellow)}
-  .b2-security{background:#3d1418;color:var(--red);border-color:var(--red)}
-  .b2-safety{background:#3d2a14;color:var(--orange);border-color:var(--orange)}
+  /* ── 会话详情头部 ── */
+  .sess-head{background:var(--inset);border:1px solid var(--border-soft);border-radius:10px;padding:12px 14px;margin-bottom:12px}
+  .sess-head-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+  .sess-head-row .role{color:var(--dim);font-size:13px}
+  .sess-head-id{font-size:12.5px;color:var(--text)}
+  .sess-head-model{display:inline-block;font-size:12.5px;color:var(--green);background:#0f1f16;border:1px solid #27503a;border-radius:5px;padding:2px 10px;margin-top:2px}
+  .sess-head-model .gear{color:var(--faint);margin-right:3px}
 
-  .row{display:flex;gap:8px;padding:6px 4px;border-bottom:1px solid #1a2029;font-size:12px;align-items:center}
+  /* ── 时间线 ── */
+  .tl-empty{color:var(--dim);font-size:13px;padding:4px 0}
+  /* 组长派发块：蓝色左缘竖条 + 徽章 */
+  .tl-dispatch{background:#111a28;border:1px solid #1f3a5f;border-left:4px solid var(--blue);border-radius:8px;padding:10px 14px;margin-bottom:12px}
+  .tl-dispatch .tl-head{margin-bottom:6px}
+  .tag-dispatch{display:inline-block;background:var(--blue);color:#0d1117;font-size:11px;font-weight:700;border-radius:4px;padding:1px 9px;margin-right:8px}
+  /* worker 产出气泡：绿色系底色 + 不对称圆角 */
+  .tl-worker{background:#121f18;border:1px solid #2b4a37;border-radius:4px 14px 14px 14px;padding:10px 14px;margin-bottom:12px;margin-left:10px}
+  .tl-worker .tl-head{margin-bottom:6px}
+  .tag-worker{display:inline-block;background:#238636;color:#fff;font-size:11px;font-weight:700;border-radius:4px 10px 10px 10px;padding:1px 9px;margin-right:8px}
+  .tl-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .tl-time{color:var(--faint);font-size:12px;font-family:var(--mono)}
+  .chip{display:inline-block;background:var(--card2);border:1px solid var(--border-soft);border-radius:5px;padding:0 8px;font-size:11px;color:var(--dim)}
+  .tl-task{color:var(--text);font-size:13.5px;margin:4px 0}
+  .tl-summary{color:var(--dim);font-size:13px;margin:4px 0;white-space:pre-wrap}
+  .tl-model{display:inline-block;font-family:var(--mono);font-size:12px;color:var(--green);background:#0f1f16;border:1px solid #2b4a37;border-radius:5px;padding:2px 10px;margin:5px 0 2px;word-break:break-all;overflow-wrap:anywhere;max-width:100%}
+  .tl-model .gear{color:var(--faint);margin-right:3px}
+  .tl-model.unset{color:var(--faint);border-style:dashed}
+  .tl-usage{color:var(--faint);font-size:12px;margin-top:4px}
+  .tl-usage b{color:var(--dim);font-weight:600}
+
+  /* ── 右栏 ── */
+  .row{display:flex;gap:8px;padding:8px 2px;border-bottom:1px solid var(--border-soft);font-size:13px;align-items:flex-start}
   .row:last-child{border-bottom:none}
-  .spend{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:11px}
-  .spend .name{width:170px}
-  .spend .num{color:var(--dim)}
-  .bar{background:#1a2029;border-radius:3px;height:9px;overflow:hidden;flex:1}
+  .row .dot{margin-top:6px}
+  .no-data{color:var(--faint);font-size:13px;padding:4px 0}
+  .spend{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:12px}
+  .spend:last-child{margin-bottom:0}
+  .spend .name{width:120px;flex-shrink:0;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .spend .num{color:var(--dim);font-family:var(--mono);font-size:12px}
+  .bar{background:var(--card2);border-radius:4px;height:8px;overflow:hidden;flex:1}
   .bar>div{height:100%;background:var(--blue)}
   .bar>div.warn{background:var(--orange)}
-  .opbtn{display:block;width:100%;padding:6px;margin-bottom:6px;background:#1a2029;color:var(--dim);border:1px solid var(--border);border-radius:5px;font:inherit;font-size:11px;text-align:left}
-  .opbtn .tag{font-size:9px;background:#3a2414;color:var(--orange);padding:0 5px;border-radius:3px;margin-left:6px}
-  .bottombar{display:flex;gap:18px;padding:6px 14px;background:var(--panel);border-top:1px solid var(--border);font-size:11px;color:var(--dim)}
+  .note{color:var(--faint);font-size:12px;margin-top:10px;line-height:1.55}
+  /* 组长 token 占位说明（严禁伪造数字） */
+  .orch-note{margin-top:12px;background:#1a1f28;border:1px dashed var(--border);border-radius:8px;padding:10px 12px}
+  .orch-note-title{font-size:12px;font-weight:600;color:var(--purple);margin-bottom:4px}
+  .orch-note-text{font-size:12.5px;color:var(--dim);line-height:1.6}
 
-  .no-data{color:var(--dim);font-size:12px;padding:4px 0}
-  .file-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);z-index:1000;display:flex;align-items:center;justify-content:center}
-  .file-overlay pre{background:#11161d;border:1px solid var(--border);border-radius:8px;padding:16px;max-width:80vw;max-height:80vh;overflow:auto;color:var(--text);font:12px/1.5 "Cascadia Code",Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-  .file-overlay .close-btn{position:absolute;top:12px;right:16px;color:var(--dim);cursor:pointer;font-size:18px}
+  .opbtn{display:block;width:100%;padding:8px 10px;margin-bottom:8px;background:var(--card2);color:var(--dim);border:1px solid var(--border);border-radius:8px;font:inherit;font-size:13px;text-align:left;cursor:not-allowed}
+  .opbtn .tag{font-size:10px;background:#3a2414;color:var(--orange);padding:1px 7px;border-radius:4px;margin-left:8px}
+  .stat-line{font-size:12.5px;color:var(--dim);line-height:1.5}
+  .stat-line b{color:var(--text);font-weight:600}
+
+  .bottombar{display:flex;gap:20px;padding:8px 18px;background:var(--card);border-top:1px solid var(--border);font-size:12px;color:var(--faint);flex-shrink:0}
+
+  .file-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.72);z-index:1000;display:flex;align-items:center;justify-content:center}
+  .file-overlay pre{position:relative;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:20px;max-width:80vw;max-height:80vh;overflow:auto;color:var(--text);font:12.5px/1.6 var(--mono);white-space:pre-wrap;word-break:break-all}
+  .file-overlay .close-btn{position:fixed;top:16px;right:20px;color:var(--dim);cursor:pointer;font-size:22px;line-height:1}
 </style>
 </head>
 <body>
@@ -100,50 +148,55 @@
 
 <div class="main">
 
-  <!-- 左栏 -->
+  <!-- 左栏：会话与任务 -->
   <div class="col" id="leftCol">
-    <div class="panel" id="grpRunning"><h2>干活中的组员</h2><div class="no-data">暂无</div></div>
-    <div class="panel" id="grpReviewer"><h2>检查的组员</h2><div class="no-data">暂无</div></div>
-    <div class="panel" id="grpProblem"><h2>出问题的后台任务</h2><div class="no-data">暂无</div></div>
+    <div class="card" id="grpRunning"><h2>干活中的组员</h2><div class="no-data">暂无</div></div>
+    <div class="card" id="grpReviewer"><h2>检查的组员</h2><div class="no-data">暂无</div></div>
+    <div class="card" id="grpProblem"><h2>出问题的后台任务</h2><div class="no-data">暂无</div></div>
   </div>
 
-  <!-- 中栏 -->
+  <!-- 中栏：实时终端 + 会话详情 -->
   <div class="col">
-    <div class="panel">
-      <div class="term-head">
-        <span class="term-title">worker 实时执行过程（相当于盯着它的终端屏幕）</span>
+    <div class="card">
+      <div class="card-head">
+        <h2>worker 实时执行过程（相当于盯着它的终端屏幕）</h2>
         <span class="live-tag" id="termLiveTag" style="display:none">● 直播中 · 3 秒刷新</span>
       </div>
       <div class="terminal" id="termOutput"><div class="info">等待数据连接…</div></div>
-      <div class="turn-meta" style="margin-top:6px">数据来自 worker 的输出记录文件，每 3 秒拉取新增部分——你看到的和盯终端一模一样，只是不用守着终端。</div>
+      <div class="term-note">数据来自 worker 的输出记录文件，每 3 秒拉取新增部分——你看到的和盯终端一模一样，只是不用守着终端。</div>
     </div>
 
-    <div class="panel">
+    <div class="card">
       <h2>这个任务已完成的步骤</h2>
-      <div class="timeline" id="timeline"><div class="no-data">点击左侧会话查看时间线</div></div>
+      <div id="sessionHeader"></div>
+      <div id="timeline"><div class="tl-empty">点击左侧会话查看时间线</div></div>
     </div>
   </div>
 
-  <!-- 右栏 -->
+  <!-- 右栏：结论 / 消耗 / 统计 / 操作 -->
   <div class="col">
-    <div class="panel">
+    <div class="card">
       <h2>最近的检查结论</h2>
       <div id="reviewConclusions"><div class="no-data">暂无</div></div>
     </div>
-    <div class="panel">
+    <div class="card">
       <h2>Token 消耗（按会话）</h2>
       <div id="tokenSpend"><div class="no-data">暂无</div></div>
-      <div class="kv" id="budgetNote" style="margin-top:6px"></div>
+      <div class="note" id="budgetNote"></div>
+      <div class="orch-note">
+        <div class="orch-note-title">组长消耗</div>
+        <div class="orch-note-text">组长消耗发生在 ZCode 客户端内部，请在 ZCode 界面顶栏查看上下文用量</div>
+      </div>
     </div>
-    <div class="panel">
+    <div class="card">
       <h2>Agent 统计</h2>
       <div id="agentStats"><div class="no-data">暂无</div></div>
     </div>
-    <div class="panel">
+    <div class="card">
       <h2>手动操作</h2>
       <button class="opbtn" disabled>↺ 撤销这个任务改过的文件<span class="tag">v2 · 暂在聊天里说</span></button>
       <button class="opbtn" disabled>▶ 重新派发出问题的任务<span class="tag">v2 · 暂在聊天里说</span></button>
-      <div class="kv" style="margin-top:4px">当前版本全部操作在组长聊天里说即可，例如："把那个会话的文件改动撤销"。</div>
+      <div class="note">当前版本全部操作在组长聊天里说即可，例如："把那个会话的文件改动撤销"。</div>
     </div>
   </div>
 </div>
@@ -217,7 +270,20 @@
   }
   function shortenId(id){
     if(!id) return "";
-    return id.length>16 ? id.slice(0,8)+"…"+id.slice(-4) : id;
+    return id.length>22 ? id.slice(0,14)+"…"+id.slice(-6) : id;
+  }
+  /* 模型 ID 署名（完整显示，绝不截断） */
+  function modelSignature(modelId){
+    var wrap = el("span",{className:"tl-model break"});
+    if(modelId){
+      wrap.appendChild(el("span",{className:"gear",textContent:"⚙"}));
+      wrap.appendChild(document.createTextNode(modelId));
+    } else {
+      wrap.className += " unset";
+      wrap.appendChild(el("span",{className:"gear",textContent:"⚙"}));
+      wrap.appendChild(document.createTextNode("模型 ID 未记录"));
+    }
+    return wrap;
   }
 
   /* ── State ── */
@@ -283,14 +349,31 @@
     sessions.forEach(function(s){
       var item = el("div",{className:"sess"+(s.id===selectedSessionId?" active":"")});
       item.setAttribute("data-sid",s.id);
-      var idSpan = el("span",{className:"id",textContent:shortenId(s.id)});
-      var sub = el("span",{className:"sub"});
+      var top = el("div",{className:"sess-top"});
       var dotCls = s.lastStatus==="running" ? "running" : statusDotClass(s.lastStatus)||"success";
-      sub.appendChild(el("span",{className:"dot "+dotCls}));
-      sub.appendChild(el("span",{className:"badge b-agent"},esc(s.agent||"")));
-      if(s.role) sub.appendChild(document.createTextNode(" "+esc(roleZh(s.role))));
-      if(s.totalTokens) sub.appendChild(document.createTextNode(" · "+fmtTokens(s.totalTokens)));
+      top.appendChild(el("span",{className:"dot "+dotCls}));
+      top.appendChild(el("span",{className:"badge b-agent"},esc(s.agent||"")));
+      if(s.role) top.appendChild(el("span",{className:"sess-role",textContent:roleZh(s.role)}));
+      item.appendChild(top);
+      var idSpan = el("span",{className:"sess-id mono",textContent:shortenId(s.id)});
+      idSpan.title = s.id;
       item.appendChild(idSpan);
+      /* 会话最近使用的模型 ID —— 完整显示，不截断 */
+      // r18: 任务归属——这个会话干的是哪件事（取组长派发的首行任务）
+      if(s.taskTitle){
+        item.appendChild(el("span",{className:"sess-task",title:s.taskTitle,textContent:"任务: "+s.taskTitle}));
+      }
+      var modelLine = el("span",{className:"sess-model mono break"});
+      modelLine.appendChild(el("span",{className:"gear",textContent:"⚙"}));
+      modelLine.appendChild(document.createTextNode(s.lastModelId||"模型 ID 未记录"));
+      item.appendChild(modelLine);
+      var sub = el("span",{className:"sess-sub"});
+      // r18: 0 tokens on an unmetered session reads as 未计量, and the honest
+      // did-work signal is changed files, not tokens.
+      var subText = s.turnCount+" 轮 · ";
+      subText += s.hasUsage ? fmtTokens(s.totalTokens)+" tokens" : "未计量";
+      if(s.changedFiles && s.changedFiles.length) subText += " · 改了 "+s.changedFiles.length+" 个文件";
+      sub.appendChild(document.createTextNode(subText));
       item.appendChild(sub);
       item.addEventListener("click",function(){
         selectedSessionId = s.id;
@@ -310,18 +393,23 @@
     if(!tasks.length){ p.appendChild(el("div",{className:"no-data"},'暂无')); return; }
     tasks.forEach(function(t){
       var item = el("div",{className:"sess"});
-      var idSpan = el("span",{className:"id",textContent:shortenId(t.taskId)});
-      var sub = el("span",{className:"sub"});
+      var top = el("div",{className:"sess-top"});
       var dotCls = statusDotClass(t.status)||"";
-      sub.appendChild(el("span",{className:"dot "+dotCls}));
+      top.appendChild(el("span",{className:"dot "+dotCls}));
       if(t.status==="interrupted"){
-        sub.appendChild(el("span",{className:"badge b-interrupted"},"中途被打断"));
+        top.appendChild(el("span",{className:"badge b-interrupted"},"中途被打断"));
       } else {
-        sub.appendChild(document.createTextNode(statusLabel(t.status)));
+        top.appendChild(el("span",{className:"sess-role",textContent:statusLabel(t.status)}));
       }
-      if(t.result&&t.result.error) sub.appendChild(document.createTextNode(" "+esc(t.result.error)));
+      item.appendChild(top);
+      var idSpan = el("span",{className:"sess-id mono",textContent:shortenId(t.taskId)});
+      idSpan.title = t.taskId;
       item.appendChild(idSpan);
-      item.appendChild(sub);
+      if(t.result&&t.result.error){
+        var errLine = el("span",{className:"sess-sub"});
+        errLine.textContent = t.result.error;
+        item.appendChild(errLine);
+      }
       p.appendChild(item);
     });
   }
@@ -339,6 +427,43 @@
       document.getElementById("termLiveTag").style.display = "none";
     }
   }
+  /* r18: opencode 的原始输出是 JSONL 事件流——人看不懂。翻译成人话：
+       tool=read/grep → 读取/搜索；edit/write → 修改；bash → 运行命令；
+       step_finish → 步骤完成(带 token 计数)；text → 正文。解析不了的行原样保留。 */
+  function translateEventLine(line){
+    if(line.charAt(0)!=="{") return null;
+    try{
+      var e = JSON.parse(line);
+      var type = (e.type||"").toLowerCase();
+      var part = e.part && typeof e.part==="object" ? e.part : {};
+      var ptype = (part.type||"").toLowerCase();
+      if(type==="step_finish" || ptype==="step-finish"){
+        var tk = part.tokens||{};
+        var total = tk.total!=null ? tk.total : null;
+        return {cls:"info", text:"— 步骤完成"+(total!=null?("（累计 "+total+" tokens）"):"")};
+      }
+      if(type==="tool" || ptype==="tool" || e.tool){
+        var tool = String(e.tool||part.tool||"").toLowerCase();
+        var st = part.state&&part.state.status ? part.state.status : "";
+        var input = part.input||e.input||{};
+        var target = input.filePath||input.path||input.file||input.pattern||input.command||input.cmd||"";
+        var map = {read:"读取",edit:"修改",write:"写入",grep:"搜索",glob:"查找文件",bash:"运行命令",todowrite:"更新待办",webfetch:"抓取网页"};
+        var verb = map[tool]||("调用工具 "+tool);
+        var done = st==="completed";
+        return {cls: done?"ok":"info", text:(done?"✓ ":"… ")+verb+(target?("："+target):"")};
+      }
+      if(type==="text" && part.text){
+        var t = String(part.text).trim().slice(0,120);
+        return t ? {cls:"", text:t} : null;
+      }
+      if(type==="error"){
+        var msg = (part&&part.message)||e.message||"发生错误";
+        return {cls:"err", text:"✗ "+msg};
+      }
+      return null; // step_start 等噪音行不显示
+    }catch(err){ return null; }
+  }
+
   function renderTerminal(data){
     var box = document.getElementById("termOutput");
     if(!data || !data.output){
@@ -353,6 +478,13 @@
       if(!line && !data.hasMore) return;
       var div = el("div");
       var text = line;
+      var translated = translateEventLine(line);
+      if(translated){
+        div.className = translated.cls;
+        div.textContent = translated.text || "\u00a0";
+        box.appendChild(div);
+        return;
+      }
       if(text.indexOf("⚠")!==-1 || text.charAt(0)==="⚠"){
         div.className = "warn";
       } else if(/error|fail/i.test(text)){
@@ -375,86 +507,96 @@
     if(data.nextOffset!=null) termOffset = data.nextOffset;
   }
 
-  /* ── 4. Timeline ── */
-  function renderTimeline(history){
-    var tl = clearEl("timeline");
-    if(!history||!history.length){
-      tl.appendChild(el("div",{className:"no-data"},'该会话暂无历史步骤'));
+  /* ── 4. 会话详情头部（含完整模型 ID）── */
+  function renderSessionHeader(s){
+    var box = clearEl("sessionHeader");
+    if(!s){
+      box.style.display = "none";
       return;
     }
-    history.forEach(function(h,i){
-      var turn = el("div",{className:"turn"});
-      var head = el("div",{className:"turn-head"});
-      var dotCls = statusDotClass(h.status)||"success";
+    box.style.display = "";
+    var head = el("div",{className:"sess-head"});
+    var row = el("div",{className:"sess-head-row"});
+    row.appendChild(el("span",{className:"badge b-agent"},esc(s.agent||"")));
+    if(s.role) row.appendChild(el("span",{className:"role",textContent:roleZh(s.role)}));
+    var dotCls = s.lastStatus==="running" ? "running" : statusDotClass(s.lastStatus)||"success";
+    row.appendChild(el("span",{className:"dot "+dotCls}));
+    row.appendChild(el("span",{className:"role",textContent:statusLabel(s.lastStatus)||"完成"}));
+    row.appendChild(el("span",{className:"chip",textContent:s.turnCount+" 轮"}));
+    row.appendChild(el("span",{className:"chip",textContent:fmtTokens(s.totalTokens)+" tokens"}));
+    head.appendChild(row);
+    var idLine = el("div",{className:"sess-head-id mono break",textContent:s.id});
+    head.appendChild(idLine);
+    /* 详情头部模型 ID —— 完整显示，不截断 */
+    var modelLine = el("div");
+    modelLine.appendChild(modelSignature(s.lastModelId));
+    head.appendChild(modelLine);
+    box.appendChild(head);
+  }
+
+  /* ── 5. Timeline（渲染 /api/sessions/{id} 的 timeline，不依赖 history）──
+     from === "orchestrator" → 组长派发块（蓝色左缘竖条 + 徽章）
+     from === "worker"       → worker 产出气泡（绿色底 + 模型 ID 署名） */
+  function renderTimeline(timeline){
+    var tl = clearEl("timeline");
+    if(!timeline||!timeline.length){
+      tl.appendChild(el("div",{className:"tl-empty"},'该会话暂无时间线'));
+      return;
+    }
+    timeline.forEach(function(t){
+      var isWorker = t.from === "worker";
+      var block = el("div",{className:isWorker?"tl-worker":"tl-dispatch"});
+      var head = el("div",{className:"tl-head"});
+      head.appendChild(el("span",{className:isWorker?"tag-worker":"tag-dispatch"},isWorker?"worker 产出":"组长派发"));
+      var dotCls = statusDotClass(t.status)||"success";
       head.appendChild(el("span",{className:"dot "+dotCls}));
-      head.appendChild(el("b",null,'第 '+(i+1)+' 步 · '+roleZh(h.role)));
-      if(h.evidence&&h.evidence.durationMs!=null){
-        head.appendChild(el("span",{className:"chip"},fmtDuration(h.evidence.durationMs)));
-      }
-      head.appendChild(el("span",{className:"chip"},statusLabel(h.status)||"完成"));
-      turn.appendChild(head);
+      head.appendChild(el("span",{className:"tl-time",textContent:fmtTime(t.timestamp)}));
+      head.appendChild(el("span",{className:"chip"},statusLabel(t.status)||"完成"));
+      if(t.role) head.appendChild(el("span",{className:"chip",textContent:roleZh(t.role)}));
+      block.appendChild(head);
 
-      if(h.task){
-        turn.appendChild(el("div",{className:"turn-meta kv",textContent:"任务："+h.task}));
+      if(t.task){
+        block.appendChild(el("div",{className:"tl-task",textContent:t.task}));
+      }
+      // r18: 主模型的完整提示词原文——折叠块，点开展开
+      if(t.taskFull){
+        var promptDetails = document.createElement("details");
+        var promptSummary = el("summary",{className:"tl-prompt-toggle",textContent:"▸ 查看主模型完整提示词"});
+        promptDetails.appendChild(promptSummary);
+        var promptPre = el("pre",{className:"tl-prompt-full",textContent:t.taskFull});
+        promptDetails.appendChild(promptPre);
+        block.appendChild(promptDetails);
       }
 
-      var badges = el("div",{style:"margin:5px 0"});
-      var hasBadge = false;
-      if(h.evidence && h.evidence.testFilesModified && h.evidence.testFilesModified.length){
-        var tf = el("span",{className:"badge2 b2-testmod",title:"worker 改了测试文件——评审员必须逐条说明这样改是否正当，防止改测试让测试变绿"});
-        tf.textContent = "改了测试文件："+h.evidence.testFilesModified.join("、")+"（评审重点核对）";
-        badges.appendChild(tf);
-        hasBadge = true;
+      /* worker 产出：模型 ID 署名 */
+      if(isWorker){
+        block.appendChild(modelSignature(t.modelId));
       }
-      if(h.reviewerSafety){
-        var sf = el("span",{className:"badge2 b2-security",title:"worker 输出里疑似有敏感内容，已打码"});
-        sf.textContent = "输出中有疑似敏感内容（已打码）";
-        badges.appendChild(sf);
-        hasBadge = true;
-      }
-      if(hasBadge) turn.appendChild(badges);
 
-      if(h.usage){
-        var u = h.usage;
+      var summary = t.summary||t.finalAnswer||"";
+      if(summary){
+        var shown = summary.length>400 ? summary.slice(0,400)+"…" : summary;
+        var sm = el("div",{className:"tl-summary",textContent:shown});
+        if(summary.length>400) sm.title = summary;
+        block.appendChild(sm);
+      }
+
+      if(t.usage){
+        var u = t.usage;
         var total = (u.totalTokens!=null?u.totalTokens:((u.inputTokens||0)+(u.outputTokens||0)));
-        turn.appendChild(el("div",{className:"turn-meta kv",textContent:"消耗：输入 "+fmtTokens(u.inputTokens)+" + 输出 "+fmtTokens(u.outputTokens)+" = "+fmtTokens(total)+" tokens"}));
+        var usageDiv = el("div",{className:"tl-usage"});
+        usageDiv.appendChild(document.createTextNode("消耗：输入 "+fmtTokens(u.inputTokens)+" + 输出 "+fmtTokens(u.outputTokens)+" = "));
+        usageDiv.appendChild(el("b",null,fmtTokens(total)+" tokens"));
+        block.appendChild(usageDiv);
       }
 
-      if(h.contextSources && h.contextSources.length){
-        var csCount = h.contextSources.length;
-        var csChars = 0;
-        h.contextSources.forEach(function(c){ if(c&&c.bytes) csChars+=c.bytes; });
-        var csText = "参考了 "+csCount+" 个上游会话的结论（"+fmtTokens(csChars)+" 字符，已存档可复核）";
-        var csDiv = el("div",{className:"turn-meta kv"});
-        csDiv.textContent = csText;
-        if(h.sharedContextAudit && h.sharedContextAudit.file){
-          var fname = h.sharedContextAudit.file;
-          var link = el("span",{style:"color:var(--blue);cursor:pointer;text-decoration:underline",title:"点击查看原文"});
-          link.textContent = fname;
-          link.addEventListener("click",function(e){
-            e.stopPropagation();
-            showFileOverlay(fname);
-          });
-          csDiv.appendChild(document.createTextNode("，文件："));
-          csDiv.appendChild(link);
-        }
-        turn.appendChild(csDiv);
-      }
-
-      if(h.evidence && h.evidence.testFilesModified && h.evidence.testFilesModified.length){
-        var ch = el("div",{className:"turn-meta kv"});
-        ch.textContent = "改动文件："+h.evidence.testFilesModified.join("、");
-        turn.appendChild(ch);
-      }
-
-      tl.appendChild(turn);
+      tl.appendChild(block);
     });
   }
 
-  /* ── 5. Review conclusions ── */
-  /* ── 5. 最近的检查结论 ──
-     列表接口 /api/sessions 不带 history，检查结论需要完整轮次：按需拉取最近
-     几个检查会话的详情（本机只读接口，开销可忽略）。 */
+  /* ── 6. Review conclusions ──
+     列表接口 /api/sessions 不含轮次数据，检查结论需要完整轮次：按需拉取最近
+     几个检查会话的详情，用 timeline 字段渲染（不依赖 history）。 */
   function refreshReviewConclusions(){
     var reviewers=(lastSessions||[]).filter(function(s){
       var r=(s.role||"").toLowerCase();
@@ -474,10 +616,10 @@
     (sessions||[]).forEach(function(s){
       var r = (s.role||"").toLowerCase();
       if(r!=="reviewer"&&r!=="tester") return;
-      if(!s.history||!s.history.length) return;
-      s.history.forEach(function(h){
-        if(h.status==="success"||h.status==="completed"||h.status==="failed"){
-          items.push({session:s,turn:h,ts:h.timestamp});
+      var timeline = s.timeline||[];
+      timeline.forEach(function(t){
+        if(t.status==="success"||t.status==="failed"){
+          items.push({session:s,turn:t,ts:t.timestamp});
         }
       });
     });
@@ -491,14 +633,14 @@
       var row = el("div",{className:"row"});
       var dotCls = it.turn.status==="failed"?"failed":"success";
       row.appendChild(el("span",{className:"dot "+dotCls}));
+      var span = el("span",{style:"flex:1;min-width:0"});
       var label = it.turn.status==="failed"?"不通过":"通过";
+      span.appendChild(document.createTextNode(label));
       var summary = it.turn.summary||"";
-      var dur = it.turn.evidence&&it.turn.evidence.durationMs ? " · "+fmtDuration(it.turn.evidence.durationMs) : "";
-      var span = el("span");
-      span.appendChild(document.createTextNode(label+dur));
       if(summary){
-        span.appendChild(document.createElement("br"));
-        var sm = el("span",{className:"kv",textContent:summary.slice(0,80)+(summary.length>80?"…":"")});
+        var br = document.createElement("br");
+        span.appendChild(br);
+        var sm = el("span",{className:"stat-line",textContent:summary.slice(0,80)+(summary.length>80?"…":"")});
         span.appendChild(sm);
       }
       row.appendChild(span);
@@ -506,40 +648,80 @@
     });
   }
 
-  /* ── 6. Token spend ── */
+  /* ── 7. Token spend ── */
   function renderTokenSpend(sessions,budget){
     var box = clearEl("tokenSpend");
     var note = document.getElementById("budgetNote");
     var items = (sessions||[]).slice().sort(function(a,b){
-      return (b.totalTokens||0)-(a.totalTokens||0);
+      return new Date(b.updatedAt).getTime()-new Date(a.updatedAt).getTime();
     });
     if(!items.length){
       box.appendChild(el("div",{className:"no-data"},'暂无'));
       note.textContent = "";
       return;
     }
-    var maxTokens = 1;
-    items.forEach(function(s){ if((s.totalTokens||0)>maxTokens) maxTokens=s.totalTokens; });
+
+    // r18: group by project (cwd) — one archival group per task, collapsed by
+    // default; unmetered sessions (no usage data) show 未计量 instead of a
+    // lying 0, and are hidden unless the user opts in.
+    var groups = {};
+    var order = [];
     items.forEach(function(s){
-      var row = el("div",{className:"spend"});
-      var name = el("span",{className:"name",textContent:esc(shortenId(s.id)+" "+roleZh(s.role))});
-      var num = el("span",{className:"num",textContent:fmtTokens(s.totalTokens)});
-      if(budget && budget.perSessionTokenCap){
-        var barWrap = el("div",{className:"bar"});
-        var pct = Math.min(100, Math.round(((s.totalTokens||0)/budget.perSessionTokenCap)*100));
-        var barInner = el("div");
-        if(pct>80) barInner.className="warn";
-        barInner.style.width = pct+"%";
-        barWrap.appendChild(barInner);
-        row.appendChild(name);
-        row.appendChild(barWrap);
-        row.appendChild(num);
-      } else {
-        row.appendChild(name);
-        row.appendChild(num);
-      }
-      box.appendChild(row);
+      var key = s.cwd || "(未知目录)";
+      if(!groups[key]){ groups[key] = []; order.push(key); }
+      groups[key].push(s);
     });
+    order.sort(function(a,b){
+      var la = groups[a][0].updatedAt||"", lb = groups[b][0].updatedAt||"";
+      return new Date(lb).getTime()-new Date(la).getTime();
+    });
+    var unmeteredCount = items.filter(function(s){return !s.hasUsage;}).length;
+    var showUnmetered = window.__showUnmetered === true;
+
+    order.forEach(function(key){
+      var list = groups[key];
+      var groupTokens = list.reduce(function(acc,x){return acc+(x.hasUsage?(x.totalTokens||0):0);},0);
+      var anyMetered = list.some(function(x){return x.hasUsage;});
+      if(!showUnmetered && !anyMetered) return; // 隐藏从未计量过的旧项目组
+      var label = key.replace(/\\/g,"/").split("/").filter(Boolean).pop() || key;
+      var details = document.createElement("details");
+      details.className = "proj-group";
+      if(key === (items[0]&&items[0].cwd)) details.open = true;
+      var summary = document.createElement("summary");
+      summary.style.cursor = "pointer";
+      summary.textContent = label+" · "+list.length+" 会话 · "+fmtTokens(groupTokens)+" tokens";
+      summary.title = key;
+      details.appendChild(summary);
+      list.forEach(function(sess){
+        var row = el("div",{className:"spend"});
+        var name = el("span",{className:"name",title:sess.id,textContent:shortenId(sess.id)});
+        var num = el("span",{className:"num"});
+        var metered = !!sess.hasUsage;
+        num.textContent = metered ? fmtTokens(sess.totalTokens) : "未计量";
+        var changed = sess.changedFiles ? sess.changedFiles.length : 0;
+        var flex = el("span",{style:"flex:1",textContent: metered ? "" : "未计量"});
+        row.appendChild(name);
+        if(changed) row.appendChild(el("span",{className:"num",textContent:"改了 "+changed+" 文件"}));
+        row.appendChild(flex);
+        row.appendChild(num);
+        details.appendChild(row);
+      });
+      box.appendChild(details);
+    });
+    if(box.children.length===0){
+      box.appendChild(el("div",{className:"no-data"},'全部会话均未计量（早于计量功能的历史数据）。勾选下方可查看。'));
+    }
+    var toggleLabel = " 显示未计量的旧会话"+(unmeteredCount?("（"+unmeteredCount+" 条）"):"");
+    var toggle = el("label",{style:"display:block;margin-top:8px;color:#7d8590;font-size:11px;cursor:pointer"});
+    var checkbox = el("input",{type:"checkbox"});
+    checkbox.checked = showUnmetered === true;
+    checkbox.addEventListener("change",function(){
+      window.__showUnmetered = checkbox.checked;
+      renderTokenSpend(sessions,budget);
+    });
+    toggle.appendChild(checkbox);
+    toggle.appendChild(document.createTextNode(toggleLabel));
+    box.appendChild(toggle);
     if(budget && budget.perSessionTokenCap){
       note.textContent = "每个任务上限 "+fmtTokens(budget.perSessionTokenCap)+" tokens";
     } else {
@@ -547,7 +729,7 @@
     }
   }
 
-  /* ── 7. Agent stats ── */
+  /* ── 8. Agent stats ── */
   function renderAgentStats(stats){
     var box = clearEl("agentStats");
     if(!stats||!stats.length){
@@ -556,13 +738,16 @@
     }
     stats.forEach(function(s){
       var row = el("div",{className:"row"});
-      var parts = esc(s.agent||"未知")+" · "+roleZh(s.role)+"："+(s.turns||0)+" 轮 · 成功 "+fmtPercent(s.successRate)+" · 平均 "+fmtDuration(s.avgDurationMs)+" · "+fmtTokens(s.totalTokens)+" tokens";
-      row.appendChild(el("span",{textContent:parts,style:"flex:1;font-size:12px"}));
+      var span = el("span",{className:"stat-line",style:"flex:1"});
+      span.appendChild(el("b",null,(s.agent||"未知")+" · "+roleZh(s.role)));
+      span.appendChild(document.createElement("br"));
+      span.appendChild(document.createTextNode(s.turns+" 轮 · 成功 "+fmtPercent(s.successRate)+" · 平均 "+fmtDuration(s.avgDurationMs)+" · "+fmtTokens(s.totalTokens)+" tokens"));
+      row.appendChild(span);
       box.appendChild(row);
     });
   }
 
-  /* ── 8. File overlay ── */
+  /* ── 9. File overlay ── */
   function showFileOverlay(filePath){
     apiFetch("/api/file?path="+encodeURIComponent(filePath)).then(function(d){
       var overlay = el("div",{className:"file-overlay"});
@@ -589,6 +774,10 @@
       renderLeft(lastSessions,lastTasks);
       refreshReviewConclusions();
       renderTokenSpend(lastSessions,lastSummary?lastSummary.budget:null);
+      /* 选中会话的头部随列表数据（lastModelId）更新 */
+      if(selectedSessionId){
+        renderSessionHeader(findSession(selectedSessionId));
+      }
     }).catch(function(){});
     var tasksDone = apiFetch("/api/tasks").then(function(d){
       lastTasks = (d&&d.tasks)||[];
@@ -604,6 +793,12 @@
     }).catch(function(){
       showApiError("无法连接数据接口（API 未启动？）");
     });
+  }
+
+  function findSession(sid){
+    var found = null;
+    (lastSessions||[]).forEach(function(s){ if(s.id===sid) found=s; });
+    return found;
   }
 
   /* 没有 running 任务时显示最近一个任务的结尾（只在任务切换时拉一次，
@@ -649,10 +844,14 @@
     }).catch(function(){});
   }
 
+  /* ── 会话详情：timeline 优先，history 不依赖 ── */
   function loadSessionDetail(sid){
+    renderSessionHeader(findSession(sid));
     apiFetch("/api/sessions/"+encodeURIComponent(sid)).then(function(d){
-      renderTimeline(d.history||[]);
+      if(selectedSessionId!==sid) return;
+      renderTimeline(d.timeline||[]);
     }).catch(function(){
+      if(selectedSessionId!==sid) return;
       renderTimeline([]);
     });
   }

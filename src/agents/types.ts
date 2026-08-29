@@ -133,6 +133,12 @@ export interface AgentResult {
   attempts?: number;
   /** Estimated time until a rejected dispatch may be retried, in milliseconds. */
   retryAfterMs?: number;
+  /**
+   * Test files whose content changed during this worker turn (anti-reward-hacking
+   * evidence). Computed by the runner from repository fingerprints; reviewers are
+   * required to individually justify every listed test modification.
+   */
+  testFilesModified?: string[];
   /** True when this result was replayed from an idempotency tombstone (P1 T1.1). */
   replayed?: boolean;
   /**
@@ -173,6 +179,8 @@ export interface AgentExecutableInfo {
 }
 
 export interface AgentAdapter {
+  /** Optional: expose the resolved vendor binary for catalog checks (opencode). */
+  getExecutablePath?: () => Promise<string>;
   readonly name: AgentName;
   readonly displayName: string;
   readonly aliases?: readonly string[];

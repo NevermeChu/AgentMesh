@@ -356,6 +356,54 @@ describe("agents/args construction", () => {
     expect(opencode.output).toBe("Implemented safely.");
   });
 
+  it("accumulates step_finish token usage across steps and skips non-finite components", () => {
+    const parsed = parseOpenCodeJsonLines(
+      [
+        JSON.stringify({
+          type: "step_finish",
+          part: {
+            type: "step-finish",
+            tokens: {
+              total: 100,
+              input: 90,
+              output: 4,
+              reasoning: 6,
+              cache: { write: 3, read: 7 },
+            },
+          },
+        }),
+        JSON.stringify({
+          type: "step_finish",
+          part: {
+            type: "step-finish",
+            tokens: { total: 50, input: 45, output: 5, reasoning: 0, cache: { write: 0, read: 0 } },
+          },
+        }),
+        // Malformed token blocks must not poison the accumulated sum.
+        JSON.stringify({ type: "step_finish", part: { type: "step-finish", tokens: "garbage" } }),
+        JSON.stringify({
+          type: "step_finish",
+          part: { type: "step-finish", tokens: { total: "NaN", input: -5 } },
+        }),
+      ].join("\n"),
+    );
+    expect(parsed.usage).toEqual({
+      inputTokens: 135,
+      outputTokens: 9,
+      reasoningOutputTokens: 6,
+      totalTokens: 150,
+      cachedInputTokens: 7,
+      cacheWriteInputTokens: 3,
+    });
+  });
+
+  it("leaves usage undefined when no step_finish events are present", () => {
+    const parsed = parseOpenCodeJsonLines(
+      JSON.stringify({ type: "text", part: { type: "text", text: "hi" } }),
+    );
+    expect(parsed.usage).toBeUndefined();
+  });
+
   it("exposes semantic errors from successful JSON transports", () => {
     const antigravity = parseAntigravityJsonOutput(
       JSON.stringify({

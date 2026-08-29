@@ -47,6 +47,16 @@ export const CLAUDE_WORKER_DENY_RULES: readonly string[] = [
   "Bash(curl:*)",
   "Bash(wget:*)",
   "Bash(sudo:*)",
+  // Destructive/irreversible commands (best-effort blacklist: variable
+  // indirection and script files can bypass pattern matching; this is defense
+  // in depth, not a sandbox — see PROBLEMS P-006).
+  "Bash(rm -rf:*)",
+  "Bash(git reset --hard:*)",
+  "Bash(git push --force:*)",
+  "Bash(git push -f:*)",
+  "Bash(git clean:*)",
+  "Bash(git checkout -- :*)",
+  "Bash(dd:*)",
 ];
 
 /**

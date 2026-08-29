@@ -101,6 +101,65 @@ describe("ui/api", () => {
     expect(body.sessions[1]!.id).toBe("older");
   });
 
+  it("returns lastModelId equal to the most recent requestedModel in history", async () => {
+    const sessions = [
+      makeSession({
+        id: "model_session",
+        updatedAt: "2026-01-01T00:02:00.000Z",
+        history: [
+          {
+            role: "worker",
+            task: "step 1",
+            timestamp: "2026-01-01T00:00:00Z",
+            status: "success",
+            requestedModel: "model-old",
+          },
+          {
+            role: "worker",
+            task: "step 2",
+            timestamp: "2026-01-01T00:01:00Z",
+            status: "success",
+            requestedModel: "model-new",
+          },
+        ],
+      }),
+    ];
+    fs.writeFileSync(path.join(homeDir, "sessions.json"), JSON.stringify(sessions), "utf-8");
+
+    const res = await call("GET", "/api/sessions");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as { sessions: Array<{ id: string; lastModelId?: string }> };
+    expect(body.sessions[0]!.id).toBe("model_session");
+    expect(body.sessions[0]!.lastModelId).toBe("model-new");
+  });
+
+  it("omits lastModelId when history has no requestedModel entries", async () => {
+    const sessions = [
+      makeSession({
+        id: "no_model_session",
+        updatedAt: "2026-01-01T00:02:00.000Z",
+        history: [
+          {
+            role: "worker",
+            task: "run tests",
+            timestamp: "2026-01-01T00:00:00Z",
+            status: "success",
+            summary: "all green",
+          },
+        ],
+      }),
+    ];
+    fs.writeFileSync(path.join(homeDir, "sessions.json"), JSON.stringify(sessions), "utf-8");
+
+    const res = await call("GET", "/api/sessions");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as { sessions: Array<{ id: string; lastModelId?: string }> };
+    expect(body.sessions[0]!.id).toBe("no_model_session");
+    expect(body.sessions[0]!).not.toHaveProperty("lastModelId");
+  });
+
   // -----------------------------------------------------------------------
   // /api/sessions/{id} — detail with full history
   // -----------------------------------------------------------------------
@@ -528,5 +587,102 @@ describe("ui/api", () => {
     const missing = await call("GET", "/api/tasks/task_missing");
     expect(missing).not.toBeNull();
     expect(missing!.status).toBe(404);
+  });
+
+  // -----------------------------------------------------------------------
+  // Timeline derivation
+  // -----------------------------------------------------------------------
+
+  it('maps worker turn with finalAnswer to from:"worker" and propagates modelId', async () => {
+    const session = makeSession({
+      id: "timeline_worker",
+      history: [
+        {
+          role: "worker",
+          task: "implement feature",
+          timestamp: "2026-01-01T00:00:30Z",
+          status: "success",
+          finalAnswer: "Done implementing feature",
+          requestedModel: "claude-sonnet-4-20250514",
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        },
+      ],
+    });
+    fs.writeFileSync(path.join(homeDir, "sessions.json"), JSON.stringify([session]), "utf-8");
+
+    const res = await call("GET", "/api/sessions/timeline_worker");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as {
+      history: unknown[];
+      timeline: Array<{
+        from: string;
+        modelId: string;
+        finalAnswer: string;
+        role: string;
+        status: string;
+        timestamp: string;
+        task: string;
+      }>;
+    };
+    expect(body.timeline).toHaveLength(1);
+    expect(body.timeline[0]!.from).toBe("worker");
+    expect(body.timeline[0]!.modelId).toBe("claude-sonnet-4-20250514");
+    expect(body.timeline[0]!.finalAnswer).toBe("Done implementing feature");
+    expect(body.timeline[0]!.role).toBe("worker");
+    expect(body.timeline[0]!.status).toBe("success");
+    // Original history field preserved for backward compatibility.
+    expect(body.history).toHaveLength(1);
+  });
+
+  it('maps pure dispatch turn (no execution output) to from:"orchestrator"', async () => {
+    const session = makeSession({
+      id: "timeline_orch",
+      history: [
+        {
+          role: "worker",
+          task: "implement feature X",
+          timestamp: "2026-01-01T00:00:00Z",
+          status: "success",
+        },
+      ],
+    });
+    fs.writeFileSync(path.join(homeDir, "sessions.json"), JSON.stringify([session]), "utf-8");
+
+    const res = await call("GET", "/api/sessions/timeline_orch");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as {
+      timeline: Array<{ from: string; task: string; modelId?: string }>;
+    };
+    expect(body.timeline).toHaveLength(1);
+    expect(body.timeline[0]!.from).toBe("orchestrator");
+  });
+
+  it("omits modelId when requestedModel is absent", async () => {
+    const session = makeSession({
+      id: "timeline_no_model",
+      history: [
+        {
+          role: "worker",
+          task: "run tests",
+          timestamp: "2026-01-01T00:00:10Z",
+          status: "success",
+          summary: "all green",
+        },
+      ],
+    });
+    fs.writeFileSync(path.join(homeDir, "sessions.json"), JSON.stringify([session]), "utf-8");
+
+    const res = await call("GET", "/api/sessions/timeline_no_model");
+    expect(res).not.toBeNull();
+    expect(res!.status).toBe(200);
+    const body = JSON.parse(res!.body) as {
+      timeline: Array<{ from: string; modelId?: string; summary: string }>;
+    };
+    expect(body.timeline).toHaveLength(1);
+    expect(body.timeline[0]!.from).toBe("worker");
+    expect(body.timeline[0]!.summary).toBe("all green");
+    expect(body.timeline[0]!).not.toHaveProperty("modelId");
   });
 });

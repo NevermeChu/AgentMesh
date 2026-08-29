@@ -65,7 +65,7 @@ export function startUiServer(options: UiServerOptions = {}): Promise<UiServerHa
   const homeDir = options.homeDir ?? resolveAgentMeshHome();
   const startDir = options.startDir ?? process.cwd();
   const panelPath = resolvePanelHtmlPath();
-  const panelCache = new Map<string, { contentType: string; body: Buffer }>();
+  const panelCache = new Map<string, { contentType: string; body: Buffer; mtimeMs: number }>();
 
   const requestListener = (req: http.IncomingMessage, res: http.ServerResponse): void => {
     const method = req.method ?? "GET";
@@ -102,11 +102,15 @@ export function startUiServer(options: UiServerOptions = {}): Promise<UiServerHa
         // Only the panel itself is served as a static asset; it is a single
         // self-contained file, so no directory serving is ever exposed.
         if (url.pathname === "/" || url.pathname === "/index.html") {
+          // mtime-aware cache (r17 问题 2): dev edits to panel.html show up on
+          // the next refresh without restarting the ui process.
+          const mtime = fs.statSync(panelPath).mtimeMs;
           let cached = panelCache.get(panelPath);
-          if (!cached) {
+          if (!cached || cached.mtimeMs !== mtime) {
             cached = {
               contentType: MIME_TYPES[".html"]!,
               body: fs.readFileSync(panelPath),
+              mtimeMs: mtime,
             };
             panelCache.set(panelPath, cached);
           }
@@ -126,13 +130,14 @@ export function startUiServer(options: UiServerOptions = {}): Promise<UiServerHa
 
   return new Promise((resolve, reject) => {
     const server = http.createServer(requestListener);
-    server.on("error", reject);
     const requestedPort = options.port ?? 7788;
     let attempt = 0;
 
     const tryListen = (port: number): void => {
-      // Errors on one probe must not reject the outer promise: only probe
-      // exhaustion or unexpected listen failures do.
+      // The single error handler lives here: EADDRINUSE advances the probe,
+      // everything else rejects. (r17 问题 3: a persistent on("error", reject)
+      // registered alongside this handler rejected the promise on the first
+      // EADDRINUSE before the retry could fire.)
       server.once("error", (err: NodeJS.ErrnoException) => {
         if (err.code === "EADDRINUSE" && attempt < MAX_PORT_PROBES) {
           attempt++;

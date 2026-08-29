@@ -178,6 +178,26 @@ agentmesh capabilities show
 
 配置查找会从 `cwd` 向上查找，但不会越过最近的 Git 仓库根目录，防止意外继承其他项目的角色配置。
 
+### 预算水位闸门 (P5 T5.4)
+
+在 `.agentmesh/config.json` 中可选声明 `budget` 段，为每个 Bridge Session 的 token 消耗设置硬顶：
+
+```json
+{
+  "version": 1,
+  "roles": { "worker": "codex" },
+  "budget": {
+    "perSessionTokenCap": 2000000,
+    "onExceed": "rejectNew"
+  }
+}
+```
+
+- 用量数据来自 vendor 上报的 usage（T2.1：codex 走官方 `turn.completed.usage` 事件；采不到 usage 的 turn 计 0，不估算、不伪造）；
+- 会话累计用量达到上限的 **80%** 起，后续响应会附预算 warning；
+- `onExceed: "warn"`（默认）：达到上限只警告，不拦截；
+- `onExceed: "rejectNew"`：达到上限后**新**的 delegate_task 派发立即失败并返回 `error_code: BUDGET_EXHAUSTED`（附可行动指引），在途任务与 poll_task 观察完全不受影响——闸门只挡新派发，不掐正在跑的工作。被拒的派发不注册幂等键，修复预算配置或换新会话后即可重派。
+
 ---
 
 ## 🔌 MCP Server 配置指南
@@ -192,13 +212,15 @@ agentmesh capabilities show
    - `background: true` 时立即返回 `{taskId, outputFile}` 而不等待执行完成；stdout/stderr 会同步 tee 到 `<agentmeshHome>/tasks/<taskId>.output`，用 `poll_task` 观察进度并收取最终结果。服务优雅关闭时会回收所有活跃后台任务（复用现有进程树终止路径），serve 启动时自动清理属主进程已死亡的孤儿注册条目。
 2. **`poll_task`**
    - 观察一个后台 delegate_task：返回 `status` (`running` | `completed` | `failed` | `stalled`)、自 `sinceOffset` 起的增量输出、`nextOffset`/`hasMore` 以及终态时的 `result`。
-   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取)。单次调用内部以 100ms 间隔轮询、最长阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
+   - 参数：`taskId` (必填), `sinceOffset` (可选，输出文件的字节偏移，传上次返回的 `nextOffset` 实现增量读取)。单次调用内部以 100ms 间隔轮询、最长阻塞 500ms。输出流连续 10 分钟无新字节会标记为 `stalled`（每个任务至多提示一次）；stalled 后再持续 30 分钟无输出，看门狗会**自动终止**该任务，并先把输出尾部溢出为一次性 checkpoint（见 `continue_task` 的 `fromCheckpoint`），终态 result 会注明终止原因。查询不存在的 taskId 返回结构化 `NOT_FOUND` 错误。
 3. **`review_changes`**
    - 调度指定 Agent 执行只读代码审查，强制遵循独立审查 Prompt 并返回结构化 PASS/FAIL 结果；PASS 可附带 medium/low 非阻塞 findings（critical/high 仍判失败）。
-   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式)。
+   - 参数：`agent` (可选，省略时读取 `roles.reviewer`), `task` (可选), `cwd` (可选), `baseCommit` (可选), `mode` (可选), `timeoutMs` (可选，最大 3600000), `contextSessionIds` (可选，最多 4 个，如同时注入 Worker 与 Tester 的结论), `contextSessionId` (可选，单源兼容形式), `maxReworkRounds` (可选，0-3，默认 0), `workerSessionId` (可选)。
+   - **有界返工循环（P5）**：`maxReworkRounds > 0` 时，审查 FAIL 会自动把机器解析的结构化 findings 注入原 Worker 会话（`workerSessionId` 优先；未提供时若 `contextSessionIds` 中恰好只有一个 worker 角色会话则使用之，多个/零个候选时明示不猜），修复后再以全新 Reviewer 会话复审，最多 N 轮。评审提示词随严格契约附带 P0-P3 rubric（P0→critical、P1→high、P2→medium、P3→low；存在 P0/P1 即 FAIL）。轮次耗尽仍 FAIL 时返回完整逐轮证据链 `result.rework`；`maxReworkRounds=0` 与 v0.1 单轮行为完全一致。
 4. **`continue_task`**
    - 继续已有会话（Session Resume），并可同时注入其他会话的上下文。
-   - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000)。
+   - 参数：`sessionId` (必填), `task` (必填), `contextSessionIds` (可选，最多 4 个，与该会话自身的历史续接并存，例如一手注入 Reviewer/Tester 的反馈), `mode` (可选), `timeoutMs` (可选，最大 3600000), `fromCheckpoint` (可选)。
+   - **Checkpoint 续跑（P5）**：失败/被取消的后台任务与被看门狗终止的 stalled 任务会把输出尾部（≤32k 字符）溢出为一次性 checkpoint 工件（`<agentmeshHome>/checkpoints/`，记录 reason 与用量）。`fromCheckpoint` 消费该工件并把抢救内容注入本次续跑 prompt 头部；checkpoint 是**一次性消费令牌**——续跑提交前先落 consumed 墓碑（fail-closed），二次消费与未知 checkpointId 都会被结构化拒绝。codex 通道 SIGKILL 级崩溃的 finalAnswer 另由 rollout 文件 tail 抢救（T1.4 机制），两者互补。
 5. **`list_agents`**
    - 输出**路由表视图**（T4.2）：每个注册 Agent 一块——名称/别名/**实时可用性**（registry 扫描前置到本次调用）/传输模式/沙箱申报/**路由元数据**（`tier`、`costLevel`、`strengths`、`notGoodAt`、`notes`，来自 `.agentmesh/config.json` 的 `agents` 段；未配置显示 `unmetered` 而非报错）/**candidates 升级链视图**/最近能力诊断；`agents` 段中无法解析为二进制的档位变体（如 codex profile 档）单列展示。主模型读一次即可完成全部任务分配。
    - 参数：`cwd` (可选，用于定位最近的 `.agentmesh/config.json`，默认当前目录)。

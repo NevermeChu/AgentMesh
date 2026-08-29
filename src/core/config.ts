@@ -42,10 +42,25 @@ export interface RoleAssignment {
   safety?: ReviewerSafetyPolicy;
 }
 
+export interface BudgetConfig {
+  /**
+   * Per-bridge-session token hard cap. Totals accumulate from vendor-reported
+   * usage recorded on each turn (T2.1); turns without usage data contribute 0.
+   */
+  perSessionTokenCap?: number;
+  /**
+   * warn (default): responses attach a warning at/above 80% and at the cap.
+   * rejectNew: new delegate_task dispatches on an exhausted session fail fast
+   * with BUDGET_EXHAUSTED; in-flight and polling work is never interrupted.
+   */
+  onExceed?: "warn" | "rejectNew";
+}
+
 export interface AgentMeshProjectConfig {
   version: 1;
   roles: Partial<Record<ConfigurableRole, RoleAssignment>>;
   agents?: Record<string, AgentMetadata>;
+  budget?: BudgetConfig;
 }
 
 export interface LoadedProjectConfig {
@@ -105,6 +120,13 @@ const AgentsMetadataSchema = z
     `agents section must declare at most ${MAX_AGENT_METADATA_ENTRIES} entries`,
   );
 
+export const BudgetConfigSchema = z
+  .object({
+    perSessionTokenCap: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    onExceed: z.enum(["warn", "rejectNew"]).optional(),
+  })
+  .strict();
+
 const ProjectConfigSchema = z
   .object({
     version: z.literal(1),
@@ -117,6 +139,7 @@ const ProjectConfigSchema = z
       })
       .strict(),
     agents: AgentsMetadataSchema.optional(),
+    budget: BudgetConfigSchema.optional(),
   })
   .strict();
 
@@ -165,6 +188,7 @@ export function parseProjectConfigText(text: string): ProjectConfigParseResult {
     },
   };
   if (parsed.data.agents) config.agents = parsed.data.agents;
+  if (parsed.data.budget) config.budget = parsed.data.budget;
   return { success: true, config };
 }
 

@@ -135,6 +135,20 @@ export interface AgentResult {
   retryAfterMs?: number;
   /** True when this result was replayed from an idempotency tombstone (P1 T1.1). */
   replayed?: boolean;
+  /**
+   * Bounded rework-loop evidence (P5 T5.1): present when review_changes ran
+   * fix→re-review rounds. The final verdict is this result's reviewOutcome;
+   * rounds exhausted with a FAIL verdict carry the full per-round chain here.
+   */
+  rework?: {
+    workerSessionId: string;
+    rounds: number;
+    log: Array<{
+      round: number;
+      fixStatus: "success" | "failed";
+      reviewOutcome: "PASS" | "FAIL" | "UNKNOWN";
+    }>;
+  };
 }
 
 export type SandboxMechanism = "native-sandbox" | "tool-filtering" | "prompt-only";

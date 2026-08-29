@@ -5,9 +5,14 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
-import { BackgroundTaskNotFoundError, BackgroundTaskRegistry } from "../core/background.js";
+import {
+  BackgroundTaskNotFoundError,
+  BackgroundTaskRegistry,
+  readTailSnapshot,
+} from "../core/background.js";
 import { forgetActivityHandle, getActivityHandle } from "../core/executor.js";
 import { buildPreview, persistArtifact, selectArtifactSpill } from "../core/artifacts.js";
+import { defaultCheckpointStore } from "../core/checkpoint.js";
 import type { AgentMetadata } from "../core/config.js";
 import { truncateText } from "../core/text.js";
 
@@ -15,6 +20,8 @@ const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
 const MAX_RAW_OUTPUT_CHARS = 8_000;
 const PROGRESS_INTERVAL_MS = 15_000;
+/** Tail snapshot captured into a checkpoint when a background dispatch dies (P5 T5.2). */
+const CHECKPOINT_TAIL_BYTES = 32_768;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z.string().trim().min(1);
 
@@ -173,21 +180,57 @@ export interface BackgroundLaunchParams {
 /**
  * Owns in-process background dispatches (T1.4). Each launch registers its
  * promise for graceful shutdown and writes the terminal outcome into the
- * task registry so poll_task can report completed/failed states 鈥?including
- * after the MCP response that started the work has long returned.
+ * task registry so poll_task can report completed/failed states — including
+ * after the MCP response that started the work has long returned. Failed or
+ * terminated dispatches spill a checkpoint of the captured output tail (P5
+ * T5.2), and the stalled watchdog's second stage (P5 T5.3) aborts tasks that
+ * stay silent for STALLED_TERMINATE_THRESHOLD_MS.
  */
 export class BackgroundDispatchService {
   readonly registry: BackgroundTaskRegistry;
+  private readonly checkpoints: Pick<typeof defaultCheckpointStore, "saveCheckpoint">;
   private readonly pending = new Map<
     string,
-    { promise: Promise<void>; controller: AbortController }
+    { promise: Promise<void>; controller: AbortController; outputFile: string }
   >();
 
-  constructor(registry: BackgroundTaskRegistry = new BackgroundTaskRegistry()) {
+  constructor(
+    registry: BackgroundTaskRegistry = new BackgroundTaskRegistry(),
+    options: { checkpointStore?: typeof defaultCheckpointStore } = {},
+  ) {
     this.registry = registry;
+    this.checkpoints = options.checkpointStore ?? defaultCheckpointStore;
     this.registry.enableStalledWatchdog({
       getActivityHandle: (taskId) => getActivityHandle(taskId),
+      onStalledTerminate: (taskId) => void this.terminateStalledTask(taskId),
     });
+  }
+
+  /**
+   * P5 T5.3 watchdog second stage: aborts the stalled dispatch through its
+   * controller (the launch callback records the terminal failed result with
+   * this abort reason) and spills a checkpoint of the output tail first so
+   * the salvaged work stays injectable via continue_task(fromCheckpoint).
+   */
+  private async terminateStalledTask(taskId: string): Promise<void> {
+    const entry = this.pending.get(taskId);
+    if (!entry) return;
+    try {
+      const tail = await readTailSnapshot(entry.outputFile, CHECKPOINT_TAIL_BYTES);
+      if (tail.trim()) {
+        await this.checkpoints.saveCheckpoint({
+          taskId,
+          reason: "stalled-terminated",
+          partialAnswer: tail,
+          summary: `Background task '${taskId}' was auto-terminated after 30 minutes without output; the last captured output is preserved in this checkpoint.`,
+        });
+      }
+    } catch {
+      // Checkpoint capture is best-effort; termination must proceed.
+    }
+    entry.controller.abort(
+      new Error("stalled beyond 30 minutes without output; auto-terminated by the watchdog"),
+    );
   }
 
   /** Number of background dispatches still running in this process. */
@@ -209,12 +252,26 @@ export class BackgroundDispatchService {
           exitCode: result.exitCode,
           completedAtMs: Date.now(),
         });
+        if (result.status !== "success") {
+          await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
+            bridgeSessionId: result.sessionId,
+            reason: controller.signal.aborted ? "cancelled" : "failed",
+            summary: result.summary,
+            usage: result.usage,
+            exitCode: result.exitCode,
+          });
+        }
       } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
         await this.registry.writeStoredResult({
           taskId: params.taskId,
           status: "failed",
-          error: err instanceof Error ? err.message : String(err),
+          error: message,
           completedAtMs: Date.now(),
+        });
+        await this.spillFailureCheckpoint(params.taskId, params.outputFile, {
+          reason: controller.signal.aborted ? "cancelled" : "failed",
+          summary: message,
         });
       } finally {
         forgetActivityHandle(params.taskId);
@@ -222,7 +279,40 @@ export class BackgroundDispatchService {
         this.pending.delete(params.taskId);
       }
     })();
-    this.pending.set(params.taskId, { promise, controller });
+    this.pending.set(params.taskId, { promise, controller, outputFile: params.outputFile });
+  }
+
+  /**
+   * P5 T5.2: spills the captured output tail of a dead background dispatch
+   * into a checkpoint so continue_task(fromCheckpoint) can resume it.
+   * Best-effort by design; never masks the original failure.
+   */
+  private async spillFailureCheckpoint(
+    taskId: string,
+    outputFile: string,
+    meta: {
+      bridgeSessionId?: string;
+      reason: "failed" | "cancelled";
+      summary?: string;
+      usage?: AgentResult["usage"];
+      exitCode?: number;
+    },
+  ): Promise<void> {
+    try {
+      const tail = await readTailSnapshot(outputFile, CHECKPOINT_TAIL_BYTES);
+      if (!tail.trim()) return;
+      await this.checkpoints.saveCheckpoint({
+        taskId,
+        bridgeSessionId: meta.bridgeSessionId,
+        reason: meta.reason,
+        partialAnswer: tail,
+        summary: meta.summary,
+        usage: meta.usage,
+        exitCode: meta.exitCode,
+      });
+    } catch {
+      // Best-effort recovery evidence.
+    }
   }
 
   /**
@@ -391,6 +481,21 @@ export const ReviewChangesInputSchema = z.object({
     .describe(
       "Up to 4 Bridge sessions (e.g. worker and tester) injected first-hand so the reviewer reads their conclusions without relay",
     ),
+  maxReworkRounds: z
+    .number()
+    .int()
+    .min(0)
+    .max(3)
+    .optional()
+    .describe(
+      "P5 bounded rework loop: when the review FAILs, the structured findings are injected into the " +
+        "worker session and the change is re-reviewed, at most this many rounds (default 0 = single-pass). " +
+        "The final response carries result.rework with the per-round evidence chain",
+    ),
+  workerSessionId: NonBlankString.optional().describe(
+    "Bridge session of the worker whose changes are under review; required for the rework loop when " +
+      "no worker-role contextSessionId is provided",
+  ),
 });
 
 export const ContinueTaskInputSchema = z.object({
@@ -422,6 +527,11 @@ export const ContinueTaskInputSchema = z.object({
     .describe(
       "Up to 4 Bridge sessions (e.g. reviewer and tester) injected alongside the session's own native resume",
     ),
+  fromCheckpoint: NonBlankString.optional().describe(
+    "P5 one-shot recovery baton: checkpoint ID returned by a failed/stalled background task " +
+      "(or its output listing). The salvaged partial output is injected at the head of this " +
+      "continuation; the checkpoint is consumed exactly once — a second attempt is rejected",
+  ),
 });
 
 export const GetSessionInputSchema = z.object({
@@ -710,6 +820,8 @@ export function registerMcpTools(
             reasoningEffort: args.reasoningEffort,
             contextSessionId: args.contextSessionId,
             contextSessionIds: args.contextSessionIds,
+            maxReworkRounds: args.maxReworkRounds,
+            workerSessionId: args.workerSessionId,
             signal: extra.signal,
           }),
         );
@@ -720,10 +832,12 @@ export function registerMcpTools(
           result.findings && result.findings.length > 0
             ? ` | Findings: ${result.findings.length}`
             : "";
+        const reworkHeader = result.rework ? ` | Rework Rounds: ${result.rework.rounds}` : "";
 
         const formattedText = [
-          `[Reviewer: ${result.agent} | Review Outcome: ${result.reviewOutcome || "UNKNOWN"} | Status: ${result.status.toUpperCase()}${findingsHeader} | Session: ${result.sessionId || "none"}]`,
+          `[Reviewer: ${result.agent} | Review Outcome: ${result.reviewOutcome || "UNKNOWN"} | Status: ${result.status.toUpperCase()}${findingsHeader}${reworkHeader} | Session: ${result.sessionId || "none"}]`,
           ...(await formatResultForMcp(runner, result)),
+          ...(result.rework ? [`Rework Evidence: ${JSON.stringify(result.rework)}`] : []),
           `Duration: ${result.durationMs ?? 0}ms`,
         ].join("\n");
 
@@ -767,6 +881,7 @@ export function registerMcpTools(
             model: args.model,
             reasoningEffort: args.reasoningEffort,
             contextSessionIds: args.contextSessionIds,
+            fromCheckpoint: args.fromCheckpoint,
             signal: extra.signal,
           }),
         );

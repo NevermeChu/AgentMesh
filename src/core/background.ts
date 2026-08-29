@@ -19,6 +19,22 @@ import { resolveAgentMeshHome } from "./session.js";
 /** Output silence after which an active background task is reported as stalled. */
 export const STALLED_OUTPUT_THRESHOLD_MS = 10 * 60_000;
 
+/**
+ * Output silence after which a stalled background task is auto-terminated
+ * with a checkpoint (P5 T5.3): stalled work is first made observable, then —
+ * if the orchestrator does not intervene within the grace window — reaped so
+ * unattended runs cannot accumulate forever.
+ */
+export const STALLED_TERMINATE_THRESHOLD_MS = 30 * 60_000;
+
+/**
+ * Grace period after which an unfinished registration owned by a foreign live
+ * bridge is presumed abandoned and reaped at startup (P5 T5.3 GC, [CC]
+ * evictAfter style). Conservative on purpose: records inside the window are
+ * preserved because another live process may still be working on them.
+ */
+export const ORPHAN_GC_GRACE_MS = 24 * 60 * 60_000;
+
 /** How often the stalled watchdog inspects active tasks while any exist. */
 export const WATCHDOG_INTERVAL_MS = 30_000;
 
@@ -152,6 +168,31 @@ async function readOutputRange(
   }
 }
 
+/**
+ * Reads the last maxBytes of a task output file for checkpoint capture (P5
+ * T5.2). Missing files degrade to an empty snapshot; oversized files keep
+ * only the tail, which is where the most recent work lives.
+ */
+export async function readTailSnapshot(filePath: string, maxBytes: number): Promise<string> {
+  let handle: fsp.FileHandle;
+  try {
+    handle = await fsp.open(filePath, "r");
+  } catch {
+    return "";
+  }
+  try {
+    const total = (await handle.stat()).size;
+    const length = Math.min(maxBytes, total);
+    const buffer = Buffer.allocUnsafe(length);
+    await handle.read(buffer, 0, length, total - length);
+    return buffer.toString("utf8");
+  } catch {
+    return "";
+  } finally {
+    await handle.close();
+  }
+}
+
 function parseRegistryLine(line: string): BackgroundTaskRecord | undefined {
   try {
     const parsed: unknown = JSON.parse(line);
@@ -189,6 +230,15 @@ export interface StalledWatchdogOptions {
   thresholdMs?: number;
   /** Advisory callback invoked at most once per task (deduplicated). */
   onStalled?: (taskId: string) => void;
+  /**
+   * P5 T5.3 second-stage callback: fired at most once per task when its
+   * silence has lasted terminateThresholdMs past the stalled notification.
+   * The registry only reports; termination + checkpointing belong to the
+   * owner of the abort controllers (BackgroundDispatchService).
+   */
+  onStalledTerminate?: (taskId: string) => void;
+  /** Silence duration past the stalled notification before onStalledTerminate fires. */
+  terminateThresholdMs?: number;
 }
 
 export interface BackgroundRegistryOptions {
@@ -205,6 +255,9 @@ export class BackgroundTaskRegistry {
   private readonly active = new Map<string, BackgroundTaskRecord>();
   private readonly released = new Set<string>();
   private readonly stalledNotified = new Set<string>();
+  /** Instant each task was first notified as stalled (epoch ms, injectable clock). */
+  private readonly stalledSince = new Map<string, number>();
+  private readonly terminatedNotified = new Set<string>();
   private watchdogConfig: StalledWatchdogOptions | undefined;
   private watchdogTimer: NodeJS.Timeout | undefined;
 
@@ -324,9 +377,14 @@ export class BackgroundTaskRegistry {
   }
 
   /**
-   * Startup orphan sweep. Every registration whose owning pid is dead is
-   * removed from registry.jsonl (its output/result files remain on disk for
-   * post-mortem inspection); the removed entries are returned.
+   * Startup orphan sweep (P5 T5.3, classify-before-act). Three rulings:
+   * 1. owning pid dead → orphan, reaped (output/result files remain on disk
+   *    for post-mortem inspection);
+   * 2. finished task owned by a live bridge → tracking no longer needed, reaped;
+   * 3. live foreign owner with no result but older than the GC grace period →
+   *    presumed abandoned, reaped with the age recorded. Records owned by
+   *    ANOTHER live bridge inside the grace window are left untouched — this
+   *    process must never terminate another instance's work.
    */
   public async scanAndReapOrphans(): Promise<BackgroundTaskRecord[]> {
     const records = this.readPersistedRecords();
@@ -341,6 +399,14 @@ export class BackgroundTaskRegistry {
       }
       // A finished task owned by a live bridge needs no further tracking.
       if (hasResult && !this.active.has(record.taskId)) {
+        reaped.push(record);
+        continue;
+      }
+      if (
+        !this.active.has(record.taskId) &&
+        record.pid !== process.pid &&
+        this.now() - record.startedAtMs >= ORPHAN_GC_GRACE_MS
+      ) {
         reaped.push(record);
         continue;
       }
@@ -409,17 +475,31 @@ export class BackgroundTaskRegistry {
    * Pure-ish stall sweep with an injectable clock: flags every active task
    * whose last observed output instant is at least the threshold old. Each
    * task is notified at most once (dedup set, [AB] scheduleTurnWatchdog style).
+   * A second stage (P5 T5.3) fires onStalledTerminate once per task when the
+   * silence has lasted terminateThresholdMs past that notification.
    */
   public checkStalledTasks(nowMs: number): string[] {
     const thresholdMs = this.watchdogConfig?.thresholdMs ?? STALLED_OUTPUT_THRESHOLD_MS;
+    const terminateMs = this.watchdogConfig?.terminateThresholdMs ?? STALLED_TERMINATE_THRESHOLD_MS;
     const newlyStalled: string[] = [];
     for (const [taskId, record] of this.active) {
-      if (this.stalledNotified.has(taskId)) continue;
+      if (this.terminatedNotified.has(taskId)) continue;
       if (fs.existsSync(this.resultFilePath(taskId))) continue;
       const handle = this.watchdogConfig?.getActivityHandle?.(taskId);
       const lastOutputAtMs = handle?.getLastOutputAtMs() ?? record.startedAtMs;
-      if (nowMs - lastOutputAtMs >= thresholdMs) {
+      const silence = nowMs - lastOutputAtMs;
+      if (this.stalledNotified.has(taskId)) {
+        const since = this.stalledSince.get(taskId) ?? nowMs;
+        if (terminateMs > 0 && nowMs - since >= terminateMs) {
+          this.terminatedNotified.add(taskId);
+          this.stalledSince.delete(taskId);
+          this.watchdogConfig?.onStalledTerminate?.(taskId);
+        }
+        continue;
+      }
+      if (silence >= thresholdMs) {
         this.stalledNotified.add(taskId);
+        this.stalledSince.set(taskId, nowMs);
         newlyStalled.push(taskId);
         this.watchdogConfig?.onStalled?.(taskId);
       }
@@ -437,6 +517,7 @@ export class BackgroundTaskRegistry {
   public releaseTask(taskId: string): void {
     this.active.delete(taskId);
     this.released.add(taskId);
+    this.stalledSince.delete(taskId);
     if (this.active.size === 0) this.stopWatchdogTimer();
   }
 

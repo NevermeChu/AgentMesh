@@ -23,11 +23,13 @@ import type { CapabilitiesFile } from "./capabilities.js";
 import { defaultSessionManager, SessionManager, readSessionSummary } from "./session.js";
 import type { SessionSummary } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
-import type { AgentMetadata } from "./config.js";
+import type { AgentMetadata, BudgetConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
 import { classifyErrorCode } from "./resilience.js";
-import { buildSummaryPrompt, stripAnalysisDraft } from "./prompts.js";
+import { buildSummaryPrompt, stripAnalysisDraft, buildReworkFixPrompt } from "./prompts.js";
 import { truncateText } from "./text.js";
+import { evaluateBudgetGate } from "./budget.js";
+import { type CheckpointStore, defaultCheckpointStore } from "./checkpoint.js";
 import type {
   BridgeSession,
   ErrorCode,
@@ -58,6 +60,9 @@ export const UPGRADEABLE_ERROR_CODES: readonly ErrorCode[] = [
 
 /** Upper bound for hint.nextCandidates suggestions attached to a failed dispatch. */
 const MAX_UPGRADE_HINTS = 3;
+
+/** Hard ceiling for the T5.1 bounded rework loop; larger requests clamp to this. */
+export const MAX_REWORK_ROUNDS = 3;
 
 /** Terminal-result tombstone TTL for idempotency keys (P1 T1.1). */
 export const DEFAULT_IDEMPOTENCY_TTL_MS = 20 * 60 * 1000;
@@ -123,6 +128,15 @@ export interface ReviewChangesParams {
   contextSessionIds?: string[];
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
+  /**
+   * P5 T5.1 bounded rework loop: when the review FAILs, the structured
+   * findings are injected into the worker session (workerSessionId) via
+   * continue_task and the change is re-reviewed, at most this many rounds
+   * (0-3, default 0 = v0.1 single-pass behavior).
+   */
+  maxReworkRounds?: number;
+  /** Bridge session of the worker whose changes are under review; required for the rework loop. */
+  workerSessionId?: string;
 }
 
 export interface ContinueTaskParams {
@@ -136,6 +150,13 @@ export interface ContinueTaskParams {
   extraArgs?: string[];
   /** Source sessions (max 4) injected alongside the session's own native resume. */
   contextSessionIds?: string[];
+  /**
+   * P5 T5.2 one-shot recovery baton: consumes the named checkpoint (saved by
+   * the stalled watchdog, orphan sweep, or a failed background dispatch) and
+   * injects its salvaged partial answer at the head of this continuation. A
+   * checkpoint can be consumed exactly once; a second attempt fails closed.
+   */
+  fromCheckpoint?: string;
   /** Cancels the underlying agent run; the turn is still recorded as a failed history entry. */
   signal?: AbortSignal;
 }
@@ -624,6 +645,8 @@ export class MultiAgentRunner {
   private readonly idempotencyInFlight = new Map<string, IdempotencyInFlightEntry>();
   /** Per-source compaction promises enabling the T2.3 in-flight dedupe. */
   private readonly compactInFlight = new Map<string, Promise<CompactContextSourceOutcome>>();
+  /** T5.2 checkpoint store; overridable for test isolation. */
+  private readonly checkpoints: CheckpointStore;
 
   constructor(
     registry: AgentRegistry = defaultRegistry,
@@ -639,6 +662,7 @@ export class MultiAgentRunner {
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? DEFAULT_RUN_TIMEOUT_MS;
     this.now = options.now ?? Date.now;
     this.idempotencyTtlMs = options.idempotencyTtlMs ?? DEFAULT_IDEMPOTENCY_TTL_MS;
+    this.checkpoints = options.checkpointStore ?? defaultCheckpointStore;
   }
 
   /** Number of idempotent dispatches currently registered as in flight; observable for tests/diagnostics. */
@@ -1018,6 +1042,23 @@ export class MultiAgentRunner {
       });
     }
 
+    // P5 T5.4 budget gate: fail-fast BEFORE the dispatch goes out so a
+    // rejected session never registers an idempotency key. In-flight work and
+    // poll_task are untouched — only new dispatches are gated.
+    const budgetGate = this.evaluateBudgetForSession(configCwd, session);
+    if (budgetGate.action === "reject") {
+      return {
+        status: "failed",
+        agent: adapter.name,
+        sessionId: session.id,
+        summary: budgetGate.warning,
+        output: budgetGate.warning,
+        error: budgetGate.warning,
+        errorCode: "BUDGET_EXHAUSTED",
+        durationMs: Date.now() - startTime,
+      };
+    }
+
     // Existing sessions own their execution context. Omitted values inherit the
     // binding; explicitly supplied values were validated above.
     const effectiveCwd = params.cwd ?? session.cwd;
@@ -1161,6 +1202,9 @@ export class MultiAgentRunner {
       if (idempotencyExecutionWarning) {
         result.warning = [result.warning, idempotencyExecutionWarning].filter(Boolean).join(" ");
       }
+      if (budgetGate.warning) {
+        result.warning = [result.warning, budgetGate.warning].filter(Boolean).join(" ");
+      }
 
       this.recordTurn({
         session,
@@ -1177,6 +1221,18 @@ export class MultiAgentRunner {
         sharedContextSources: sharedContext?.sources,
         cancelReason: inFlight.isDisconnectAborted() ? "client_disconnect" : undefined,
       });
+
+      // Post-execution water-level check: this turn's usage is now in the
+      // session history, so a cap/80% crossing surfaces on the response that
+      // caused it. Re-read the session: the local binding is a pre-turn
+      // snapshot that does not include the just-recorded usage.
+      const refreshedSession = this.sessionManager.getSession(session.id);
+      if (refreshedSession) {
+        const postGate = this.evaluateBudgetForSession(configCwd, refreshedSession);
+        if (postGate.action === "warn" || postGate.action === "reject") {
+          result.warning = [result.warning, postGate.warning].filter(Boolean).join(" ");
+        }
+      }
 
       // Terminal boundary of the keyed dispatch: persist the tombstone so
       // retries within the TTL replay this turn instead of re-executing.
@@ -1224,25 +1280,115 @@ export class MultiAgentRunner {
   }
 
   /**
-   * Performs an independent code review using the designated agent.
+   * Performs an independent code review using the designated agent. With
+   * maxReworkRounds > 0 (P5 T5.1) a FAIL verdict triggers a bounded rework
+   * loop: the machine-parsed findings are injected into the original worker
+   * session via continue_task, then a fresh reviewer re-reviews the repaired
+   * working tree. Rounds are capped (≤3); exhaustion returns the final FAIL
+   * with the full per-round evidence chain attached as result.rework.
    */
   public async reviewChanges(params: ReviewChangesParams): Promise<AgentResult> {
-    return this.delegateTask({
-      agent: params.agent,
-      task: params.task || "Review all recent changes against codebase standards and git diff.",
-      cwd: params.cwd,
-      role: "reviewer",
-      baseCommit: params.baseCommit,
-      mode: params.mode,
-      timeoutMs: params.timeoutMs,
-      model: params.model,
-      reasoningEffort: params.reasoningEffort,
-      env: params.env,
-      contextSessionId: params.contextSessionId,
-      contextSessionIds: params.contextSessionIds,
-      reviewVerdictRequired: true,
-      signal: params.signal,
-    });
+    const maxRounds = Math.min(Math.max(params.maxReworkRounds ?? 0, 0), MAX_REWORK_ROUNDS);
+    const reviewOnce = (taskOverride?: string) =>
+      this.delegateTask({
+        agent: params.agent,
+        task:
+          taskOverride ||
+          params.task ||
+          "Review all recent changes against codebase standards and git diff.",
+        cwd: params.cwd,
+        role: "reviewer",
+        baseCommit: params.baseCommit,
+        mode: params.mode,
+        timeoutMs: params.timeoutMs,
+        model: params.model,
+        reasoningEffort: params.reasoningEffort,
+        env: params.env,
+        contextSessionId: params.contextSessionId,
+        contextSessionIds: params.contextSessionIds,
+        reviewVerdictRequired: true,
+        signal: params.signal,
+      });
+
+    let current = await reviewOnce();
+    if (maxRounds === 0) return current;
+
+    const workerSessionId = this.resolveReworkWorkerSession(params);
+    const log: NonNullable<AgentResult["rework"]>["log"] = [];
+    let roundsRun = 0;
+    let reworkNote: string | undefined;
+
+    while (current.reviewOutcome === "FAIL" && roundsRun < maxRounds) {
+      if (!workerSessionId) {
+        reworkNote =
+          "Rework loop requested but no worker session was identified (pass workerSessionId or exactly one worker-role contextSessionId); returning the FAIL verdict unfixed.";
+        break;
+      }
+      if (params.signal?.aborted) {
+        reworkNote = "Rework loop stopped: the caller aborted the request.";
+        break;
+      }
+      roundsRun += 1;
+      const fixResult = await this.continueTask({
+        sessionId: workerSessionId,
+        task: buildReworkFixPrompt({
+          round: roundsRun,
+          maxRounds,
+          findings: current.findings ?? [],
+          reviewSummary: current.summary,
+        }),
+        signal: params.signal,
+      });
+      log.push({
+        round: roundsRun,
+        fixStatus: fixResult.status,
+        reviewOutcome: "UNKNOWN",
+      });
+      if (fixResult.status !== "success") {
+        reworkNote = `Rework round ${roundsRun} aborted: the worker fix turn failed (${
+          fixResult.error || fixResult.summary
+        }).`;
+        break;
+      }
+
+      const reReview = await reviewOnce(
+        `Re-review (rework round ${roundsRun} of ${maxRounds}): the worker reports the previous findings have been fixed. Re-run the full review against the current working tree.`,
+      );
+      log[log.length - 1]!.reviewOutcome = reReview.reviewOutcome ?? "UNKNOWN";
+      current = reReview;
+    }
+
+    if (roundsRun > 0 || reworkNote) {
+      current.rework = {
+        ...(workerSessionId ? { workerSessionId } : { workerSessionId: "" }),
+        rounds: roundsRun,
+        log,
+      };
+      if (reworkNote) {
+        current.warning = [current.warning, reworkNote].filter(Boolean).join(" ");
+      }
+    }
+    return current;
+  }
+
+  /**
+   * Resolves the worker session a rework loop should inject fix instructions
+   * into: the explicit workerSessionId wins; otherwise exactly one worker-role
+   * context session is accepted. Ambiguous or missing → undefined (no auto
+   * guessing across multiple candidates).
+   */
+  private resolveReworkWorkerSession(params: ReviewChangesParams): string | undefined {
+    if (params.workerSessionId) {
+      const found = this.sessionManager.getSession(params.workerSessionId);
+      return found && found.role === "worker" ? found.id : undefined;
+    }
+    const candidates = [
+      ...(params.contextSessionIds ?? []),
+      ...(params.contextSessionId ? [params.contextSessionId] : []),
+    ]
+      .map((id) => this.sessionManager.getSession(id))
+      .filter((session): session is NonNullable<typeof session> => session?.role === "worker");
+    return candidates.length === 1 ? candidates[0]!.id : undefined;
   }
 
   /**
@@ -1303,6 +1449,34 @@ export class MultiAgentRunner {
     }
     const contextSessions = collected.sources;
 
+    // P5 T5.2: consume the one-shot checkpoint baton BEFORE anything else can
+    // observe it. Consumption is fail-closed: not-found and already-consumed
+    // checkpoints abort the continuation instead of silently continuing with
+    // less context than the caller believed.
+    let checkpointInjection: string | undefined;
+    if (params.fromCheckpoint) {
+      try {
+        const checkpoint = await this.checkpoints.consumeCheckpoint(params.fromCheckpoint);
+        checkpointInjection = [
+          `## Recovered Checkpoint (id: ${checkpoint.checkpointId}, reason: ${checkpoint.reason})`,
+          "The interrupted run produced the partial output below before it terminated. Resume from this state; do not repeat work already reflected here.",
+          "",
+          checkpoint.partialAnswer,
+        ].join("\n");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          status: "failed",
+          agent: session.agent,
+          sessionId: session.id,
+          summary: `Checkpoint consumption failed: ${message}`,
+          output: message,
+          error: message,
+          durationMs: Date.now() - startTime,
+        };
+      }
+    }
+
     const reviewerSafetyPolicy: ReviewerSafetyPolicy | undefined =
       session.role === "reviewer"
         ? readReviewerSafetyPolicy(session) ||
@@ -1344,13 +1518,16 @@ export class MultiAgentRunner {
     });
 
     try {
+      const effectiveTask = checkpointInjection
+        ? `${checkpointInjection}\n\n## Current Continuation Request / Instructions\n${params.task}`
+        : params.task;
       let result: AgentResult;
       try {
         if (adapter.continue) {
           result = await adapter.continue({
             sessionId: session.id,
             nativeSessionId: session.nativeSessionId,
-            task: params.task,
+            task: effectiveTask,
             cwd: session.cwd,
             role: session.role,
             mode: params.mode,
@@ -1365,7 +1542,7 @@ export class MultiAgentRunner {
         } else {
           // Fallback to run with context
           result = await adapter.run({
-            task: params.task,
+            task: effectiveTask,
             cwd: session.cwd,
             role: session.role,
             mode: params.mode,
@@ -1428,7 +1605,7 @@ export class MultiAgentRunner {
       this.recordTurn({
         session,
         role: session.role,
-        task: params.task,
+        task: effectiveTask,
         result,
         repositoryBefore,
         repositoryAfter,
@@ -1674,6 +1851,24 @@ export class MultiAgentRunner {
   }
 
   /**
+   * P5 T5.4: evaluates the project budget config against one session's
+   * accumulated usage. Config load failures degrade to "no gate" — a broken
+   * config must not block dispatches.
+   */
+  private evaluateBudgetForSession(
+    configCwd: string,
+    session: BridgeSession,
+  ): ReturnType<typeof evaluateBudgetGate> {
+    let budget: BudgetConfig | undefined;
+    try {
+      budget = loadProjectConfig(configCwd)?.config.budget;
+    } catch {
+      budget = undefined;
+    }
+    return evaluateBudgetGate({ config: budget, session });
+  }
+
+  /**
    * Persists native session binding changes and one normalized turn of
    * execution evidence. Shared by delegateTask and continueTask.
    */
@@ -1749,6 +1944,7 @@ export class MultiAgentRunner {
       reviewerSafety: result.reviewerSafety,
       requestedModel: options.requestedModel,
       requestedReasoningEffort: options.requestedReasoningEffort,
+      ...(result.usage ? { usage: result.usage } : {}),
       ...(options.capabilityDiagnostics?.length
         ? { capabilityDiagnostics: options.capabilityDiagnostics }
         : {}),

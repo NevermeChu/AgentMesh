@@ -89,6 +89,7 @@ export class OpenCodeAdapter extends BaseAdapter {
       baseCommit: options.baseCommit,
       cwd: options.cwd,
       historyContext: options.historyContext,
+      rubric: options.reviewVerdictRequired,
     });
     const args = ["run", prompt, "--format", "json"];
     if (options.model) args.push("--model", options.model);

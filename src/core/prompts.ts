@@ -8,7 +8,7 @@ import { truncateText } from "./text.js";
 export function buildRolePrompt(
   task: string,
   role: AgentRole = "worker",
-  context?: { baseCommit?: string; cwd?: string; historyContext?: string },
+  context?: { baseCommit?: string; cwd?: string; historyContext?: string; rubric?: boolean },
 ): string {
   let basePrompt = task;
   if (context?.historyContext && context.historyContext.trim()) {
@@ -91,13 +91,13 @@ export function stripAnalysisDraft(text: string): string {
  */
 export function buildReviewerPrompt(
   task: string,
-  context?: { baseCommit?: string; cwd?: string },
+  context?: { baseCommit?: string; cwd?: string; rubric?: boolean },
 ): string {
   const diffInstruction = context?.baseCommit
     ? `Compare against git base commit/branch: '${context.baseCommit}'.`
     : `Inspect latest uncommitted/committed changes (e.g. using 'git diff', 'git diff HEAD~1', or 'git status').`;
 
-  return [
+  const sections = [
     `# ROLE: Independent Code Reviewer`,
     ``,
     `## Objective`,
@@ -119,6 +119,9 @@ export function buildReviewerPrompt(
     `   - Missing or broken automated tests`,
     `   - Architecture, type-safety, and style violations`,
     ``,
+  ];
+  if (context?.rubric) sections.push(REVIEW_RUBRIC, ``);
+  sections.push(
     `## Required Output Format`,
     `If the changes are clean and meet all quality requirements, respond with:`,
     `PASS`,
@@ -138,7 +141,71 @@ export function buildReviewerPrompt(
     `  line: line number or range`,
     `  issue: Detailed explanation of what is wrong`,
     `  suggestion: How to fix the issue`,
-  ].join("\n");
+  );
+  return sections.join("\n");
+}
+
+/**
+ * T5.1 default review rubric, ported from the codex review template
+ * ([CX] prompts/templates/review/rubric.md) and collapsed into the verdict +
+ * structured-findings contract the bridge already parses (parseReviewOutput).
+ * P0-P3 priorities map onto the four severities so no parser change is needed.
+ */
+export const REVIEW_RUBRIC = `
+## Review Rubric (severity = priority)
+Judge every finding against this scale and use the mapped severity label:
+- P0 → severity: critical — correctness bug that breaks the task's stated requirements, security vulnerability, credential leak, data loss, or a change that makes existing tests fail.
+- P1 → severity: high — likely regression, unhandled error path with real trigger, broken/in missing tests for changed behavior, API or schema break.
+- P2 → severity: medium — edge case with plausible trigger, misleading error message, style/type-safety violation with maintenance cost.
+- P3 → severity: low — nit, naming, comment or formatting observation.
+Writing rules: findings must cite the exact file (and line/range when possible); describe the defect, not the taste; every critical/high finding must carry an actionable suggestion.
+Verdict rule: FAIL if any P0 or P1 finding exists, or if the change does not define done (implementation tasks must report test results); otherwise PASS.`;
+
+/**
+ * Builds the structured fix instruction injected into the original worker
+ * session for one bounded rework round (T5.1). Findings arrive machine-parsed
+ * so nothing depends on the reviewer's prose surviving the round trip.
+ */
+export function buildReworkFixPrompt(params: {
+  round: number;
+  maxRounds: number;
+  findings: ReviewFinding[];
+  reviewSummary?: string;
+}): string {
+  const lines = [
+    `# REWORK ROUND ${params.round} OF ${params.maxRounds} (bounded rework loop)`,
+    ``,
+    `The independent reviewer rejected the previous changes with verdict FAIL.`,
+  ];
+  if (params.reviewSummary) {
+    lines.push(`Reviewer summary: ${params.reviewSummary}`);
+  }
+  lines.push(
+    ``,
+    `Address EVERY finding below in the same working tree. Do not restart the task from scratch; keep the existing changes and repair them.`,
+    ``,
+    `## Reviewer Findings (must all be resolved)`,
+  );
+  if (params.findings.length === 0) {
+    lines.push(
+      "- (no structured findings were machine-parsed; re-read the reviewer context and fix the reported defects)",
+    );
+  } else {
+    for (const [index, finding] of params.findings.entries()) {
+      lines.push(
+        `${index + 1}. [${finding.severity}] ${finding.file}${finding.line ? `:${finding.line}` : ""} — ${finding.issue}`,
+      );
+      if (finding.suggestion) lines.push(`   Fix suggestion: ${finding.suggestion}`);
+    }
+  }
+  lines.push(
+    ``,
+    `## Definition of done`,
+    `1. Every finding above is fixed or explicitly argued why it should not apply.`,
+    `2. Relevant tests were run and their results are reported verbatim (pass/fail counts).`,
+    `3. A concise summary of the changes made in this round is included.`,
+  );
+  return lines.join("\n");
 }
 
 /**

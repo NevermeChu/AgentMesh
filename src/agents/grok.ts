@@ -44,6 +44,7 @@ export class GrokAdapter extends BaseAdapter {
       baseCommit: options.baseCommit,
       cwd: options.cwd,
       historyContext: options.historyContext,
+      rubric: options.reviewVerdictRequired,
     });
 
     const args: string[] = ["-p", prompt];

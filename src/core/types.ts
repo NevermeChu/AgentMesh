@@ -5,8 +5,10 @@ import type {
   ReviewerSafetyReport,
   ReviewFinding,
   TransportFallbackEvidence,
+  UsageInfo,
 } from "../agents/types.js";
 import path from "node:path";
+import type { CheckpointStore } from "./checkpoint.js";
 
 export interface RepositoryStateEvidence {
   capturedAt: string;
@@ -149,6 +151,8 @@ export interface SessionHistoryEntry {
   capabilityDiagnostics?: string[];
   /** Audit metadata for the rendered shared-context block injected into this turn. */
   sharedContextAudit?: SharedContextAudit;
+  /** Vendor-reported token usage for this turn (P2 T2.1); feeds the T5.4 budget gate. */
+  usage?: UsageInfo;
 }
 
 export interface BridgeSession {
@@ -185,4 +189,6 @@ export interface RunnerOptions {
   now?: () => number;
   /** Terminal-result tombstone TTL for idempotency keys. Default 20 minutes. */
   idempotencyTtlMs?: number;
+  /** T5.2 checkpoint store override (test isolation). Default: shared home store. */
+  checkpointStore?: CheckpointStore;
 }

@@ -287,6 +287,7 @@ export class CodexAdapter extends BaseAdapter {
       baseCommit: options.baseCommit,
       cwd: options.cwd,
       historyContext: options.historyContext,
+      rubric: options.reviewVerdictRequired,
     });
 
     const mcpArgs = ["mcp-server"];
@@ -346,6 +347,7 @@ export class CodexAdapter extends BaseAdapter {
       baseCommit: options.baseCommit,
       cwd: options.cwd,
       historyContext: options.historyContext,
+      rubric: options.reviewVerdictRequired,
     });
     const baseline = buildCodexSecurityBaselineArgs();
     const lastMessageFile = createArtifactPath("last-message");

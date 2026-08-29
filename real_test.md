@@ -1170,3 +1170,56 @@ Orchestrator 独立复核：90 条权威向量打实现 **92/92 通过**（含 2
 ## 7. 本轮结论
 
 在无 codex 约束下完成史上最复杂编排之一：异常探针（超时/取消）双双按设计留痕，两种 opencode 模型真实并发实现互补模块并经集成层合流，90 权威向量 92/92、135 项独立测试、三源评审与 ACCEPT 终检收敛，零提交零孤儿。AgentMesh 自身本轮零缺陷暴露——正常路径与已修复异常路径均稳定；**但 FAIL→fix 闭环、codex MCP、enforced safety、断连取消四个边界仍未在本轮覆盖，不能据此宣称全域稳定**。orchestrator 侧仅余两类工具脚本小噪声（N-R13-A），SPEC 机械验证流程经 N-R12-A 整改后首次全程零签发缺陷。
+
+---
+
+# R14（2026-08-29）：handoff 契约 + handoff 优先注入 + get_session_context 新交接体系首次真实链路验证
+
+## 0. 结论
+
+unitsmith 单位换算 CLI（17 项验收边角 + 4 个测试套件）经 Worker(opencode/muse-spark-1.2-contributor-free) → Tester(antigravity/agy) → Reviewer(同 opencode 模型、独立会话) → Worker 整合四阶段全链成功：终态 95/95 测试通过、A1–A17 由 Tester 独立探针与 Orchestrator 机械终检双重复核一致、Reviewer PASS(5 low 已全部被 Worker 处置或加固)。**本轮核心目标是验证 R14 之前刚落地的三层交接体系（Handoff Report 契约 → handoff 优先 token 预算注入 → get_session_context 按需取回），三项全部在真实链路生效**：4 个正式轮次中 3 次注入全部 `strategy=handoff`、预算 6000 内无丢弃、3 份 sidecar SHA256 与审计逐一吻合、`get_session_context` 每阶段真实调用成功。上下文损失评级：**无损（轻微变形）**——结构与数值零丢失，但 `goal` 字段退化为任务文本前 200 字符、files 混入 Markdown 链接包装（见问题 1/2）。发现 handoff 系统自身缺陷 2 个（非阻断）、SPEC 设计缺陷 1 个（穿透三层未被列 finding，根因在 Orchestrator）。
+
+## 1. 小任务是在做什么
+
+- **业务目标**：在隔离仓库 `C:\Users\ThisMe\agentmesh-real-r14\unitsmith` 内，按预置 SPEC.md 实现无依赖 Node CLI "unitsmith"：单位换算（仿射温度偏移、复合单位量纲分析、别名表、6 位有效数字输出、精确错误契约）。SPEC 预置 17 项验收（A1–A17，含 `-40°C→-40°F`、`1 m/s^2→12960 km/h^2`、错误消息逐字匹配）作为可复现验证命令。
+- **角色分工**：Orchestrator（本 Agent）写 SPEC 并自校验数值、分阶段驱动 MCP 工具、终检汇总；Worker 实现+自检；Tester 独立探针验证（只读+probe-tmp 临时目录）；Reviewer 只读审查 diff 与 SPEC 合规；Worker 二轮整合 findings。
+- **验收标准**：SPEC.md Appendix A1–A17 全部逐字满足 + `node --test` 全绿；终态 95/95。
+- **易错边角**：温度仿射偏移（定点通过）、复合单位指数（通过）、Windows 下 `node --test tests/` 目录语法（SPEC 缺陷，见问题 3）。
+
+## 2. 上下文交接明细与是否损失（逐轮对账）
+
+隔离设置：MCP stdio server 以 `AGENTMESH_SESSIONS_FILE=C:\Users\ThisMe\agentmesh-real-r14\out\sessions.json` 启动，会话存储与 sidecar 全部隔离于实验目录；任务 cwd 统一为 lab 仓（同 cwd 约束满足）。
+
+| 轮次        | 工具/传输                                      | 模型/Agent                               | 时长     | 状态              | 发送的 contextSessionIds | 下游实录 contextSources | 注入审计（strategy/est/budget/dropped/sidecar）  |
+| ----------- | ---------------------------------------------- | ---------------------------------------- | -------- | ----------------- | ------------------------ | ----------------------- | ------------------------------------------------ |
+| w1 (t1)     | delegate_task/cli                              | opencode muse-spark-1.2-contributor-free | 362112ms | SUCCESS           | 无（首轮）               | null                    | 无注入（首轮，符合设计）                         |
+| tester (t1) | delegate_task/cli                              | antigravity (agy)                        | 148552ms | SUCCESS           | [w1]                     | [w1] ✓                  | handoff / 893 / 6000 / 无 / **sha256 对账=true** |
+| rev (t1)    | review_changes/cli                             | opencode 同模型·独立会话                 | 188353ms | SUCCESS·PASS·5low | [w1,tester]              | [w1,tester] ✓           | handoff / 1557 / 6000 / 无 / **true**            |
+| w1 (t2)     | continue_task/cli（native ses_fb1e6d04… 续接） | opencode 同模型                          | 166368ms | SUCCESS           | [rev,tester]             | [rev,tester] ✓          | handoff / 1748 / 6000 / 无 / **true**            |
+
+- **Session 身份**：Worker native `ses_fb1e6d044ffe…` 跨 t1/t2 稳定续接；Reviewer 独立 native `ses_fb1d737f8ffe…`（未复用 Worker 会话）；Tester 独立 native `dc2c5f8f-…`。无任何身份伪装/合并。
+- **finalAnswer/summary/findings 持久化**：四轮全量落盘（answerChars：w1t1=5024、tester=9722、rev=2438、w1t2=3464）；reviewer 5 条 low findings 结构化入 history 并经 `get_session` 可查。
+- **注入内容逐字对账**（sidecar 原文）：tester 收到的块 = 全局指引 + 仓库指纹 + w1 最新轮 handoff（Goal/Tests/Open Items/Commands/Files，**无 finalAnswer 正文回放**）；w1 的 2 条 openItems（Windows `node --test tests/` 差异、epsilon 阈值）**原样到达 Tester 且其在正式输出中逐条引用处置**——open items 交接有效性的直接证据。fix2 收到的块 = reviewer 派生 handoff（verdict 决策 + 5 个 finding 文件 + 5 条 openItems=findings 逐条）+ tester handoff，worker 据此全部处置。
+- **get_session_context（新工具）**：每阶段后真实调用（w1/tester/rev/fix2-getctx 全部 isError=false），另以 `fields/turnIndex` 形态抽查；内容与 Session history 逐字一致。
+- **损失评级**：**无损（轻微变形）**。零数值丢失、零截断（3 次注入 droppedSections 全为空、est 远低于 budget）；变形两处：①`goal` 字段是任务文本前 200 字符而非一句话目标（Worker 轮尤其冗长，Tester 轮同病）；②files 条目保留 Markdown 链接包装（`[x](file:///…)`、反引号）。两者不损失信息但降低注入块信噪比。
+- **freshness**：4 轮全部处于同一工作树连续写入序列内，注入块中仓库指纹逐轮更新（dirty=true 与实际一致）；本轮无 STALE 判定需求（单一写者链）。
+
+## 3. 是否重复做无意义操作
+
+- **必要独立复核（非重复浪费）**：Tester 86→逐条 A1–A17 独立探针 + 手工复算 A2/A3/A8/A9/A13；Reviewer 独立 spot-check CLI 与全套件——均为角色职责，且各自发现了对方未覆盖的观察（tester 的 Windows `--test tests/` 输出、reviewer 的 5 项代码级 findings）。
+- **因上下文缺失导致的被迫重复**：0。注入块携带的 openItems/files/commands 使下游无需重新探明上游做了什么；无任何"重新阅读全部文件以恢复上下文"行为。
+- **真正的无效重复**：0。四轮一次通过（w1 实现→tester PASS→reviewer PASS→worker 整合），无重试、无超时/取消重跑。
+- **FAIL→tester 闭环未触发**：tester 一次 PASS（同 r13 的良性结果）；本轮改为由 reviewer findings 驱动 w1-t2 整合轮（5 findings 全处置、测试 86→95、新增 pin tests），findings→fix 闭环首次以"低严重度整合"形态走通。
+
+## 4. 暴露的问题
+
+1. **[AgentMesh-handoff] `handoff.goal` 退化为任务文本前 200 字符**（中，注入信噪比）。根因：runner 侧 goal 推导取 `task` 前 200 字符，而长任务文本开头是指令性段落不是目标句。影响：注入块 `Goal:` 行冗长（w1 轮约 200 字符的任务前言）。建议：Handoff Report 契约增加 `## Goal` 小节由 agent 自报一句话目标（解析优先生效），推导仅作 fallback 且改为首句截断。证据：w1/t1 与 tester/t1 的 audit.goal（本轮 sidecar 原文）。
+2. **[AgentMesh-handoff] `artifacts.files` 混入 Markdown 链接与反引号包装**（低）。根因：`cleanItemLine` 只剥离 emphasis（`*`/`_`），不剥离 `[text](url)`；opencode/antigravity 均倾向以 file:/// 链接列文件。影响：files 列表含长 URL，浪费注入 token 且可读性差。建议：解析时剥 `[text](url)` 取 text 或 url 之一。
+3. **[SPEC/Orchestrator] Windows 平台相关验证命令被写成必须项，穿透三层未被列正式 finding**（低，流程教训）。根因：SPEC 验证命令 `node --test tests/`（目录+尾斜杠）在 Windows Node v24 抛 MODULE_NOT_FOUND，与 SPEC "must exit 0" 文字冲突；Worker 以 auto-discovery 规避并在 openItems 申报，Tester 复核时按 Appendix 外项未判缺陷，Reviewer 未列 finding——三层都未将其升级为正式 defect。根因在 Orchestrator 的 SPEC 把平台相关命令写成了跨平台必须项。建议：SPEC 验证命令须平台中性（`node --test`），跨平台要求显式标注。
+4. **[正面确认] 新交接体系三项能力真实生效**：契约解析（opencode/antigravity 均产出可解析 handoff）；handoff 优先注入（3/3 轮 strategy=handoff、无丢弃、sidecar 对账 true）；`get_session_context` 真实调用成功且内容一致。reviewer 派生 handoff（M4）同样生效（decisions=裁决摘要、openItems=5 findings、files=涉及文件）。
+5. **[边界如实声明]**：本轮未覆盖——超时/取消/transport fallback/enforced safety/codex MCP 传输/多源 STALE 处置（单一写者链无指纹漂移）；`wait`/并发多 worker 场景亦未涉及。不能据此宣称这些路径的真实链路稳定性。
+
+## 5. 资源与清理
+
+- **采样方法**：本轮未运行外部进程采样器（与 r13 不同），资源证据来自 AgentMesh 自身 `resourceEvidence`（collection: "process"，仅 AgentMesh 进程 CPU/RSS，不代表 vendor 进程树）与各轮 `durationMs`：w1=362s、tester=149s、rev=188s、fix2=166s（合计 ≈865s）。局限如实声明：vendor 子进程 CPU/RSS、孤儿进程、峰值水位未采集，不做任何推断；不能据此声称资源无异常。
+- **清理与隔离**：实验仓零提交（仅 SPEC 基线 c322322），Worker/Tester 全部产物为未提交文件 + probe-tmp/ 临时目录（符合角色约束）；AgentMesh 主项目源码/会话/默认 sessions.json 零污染（独立 AGENTMESH_SESSIONS_FILE）；无外部网络依赖；驱动脚本 driver-r14.mjs 按 driver-r\* 惯例 gitignore。

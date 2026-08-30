@@ -1372,6 +1372,12 @@ export class MultiAgentRunner {
         summary: result.summary,
         findings: result.findings,
       });
+    // The same AgentResult object is returned to the caller; backfilling here
+    // (before addHistory) lets delegate/continue/review responses carry the
+    // openItems signal without a get_session round-trip.
+    if (handoff) {
+      result.handoff = handoff;
+    }
 
     this.sessionManager.addHistory(session.id, {
       role: options.role,

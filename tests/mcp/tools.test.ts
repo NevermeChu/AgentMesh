@@ -51,6 +51,41 @@ class TestAdapter extends BaseAdapter {
         reviewVerdictRequired: verdictRequired,
       });
     }
+    if (options.task.includes("HANDOFF_OPEN_ITEMS_TRIGGER")) {
+      return this.formatSuccessResult("done", Date.now(), {
+        nativeSessionId: "native_handoff_open",
+        exitCode: 0,
+        summary: "Task completed: HANDOFF_OPEN_ITEMS_TRIGGER",
+        finalAnswer: [
+          "Implemented the billing export.",
+          "## Goal",
+          "Ship the billing export",
+          "## Decisions",
+          "- Reuse the shared CSV writer",
+          "## Open Items",
+          "- SPEC section 3 contradicts section 5 on timeout defaults",
+          "- Docs pending",
+        ].join("\n"),
+        role: options.role,
+        reviewVerdictRequired: verdictRequired,
+      });
+    }
+    if (options.task.includes("HANDOFF_CLEAN_TRIGGER")) {
+      return this.formatSuccessResult("done", Date.now(), {
+        nativeSessionId: "native_handoff_clean",
+        exitCode: 0,
+        summary: "Task completed: HANDOFF_CLEAN_TRIGGER",
+        finalAnswer: [
+          "Implemented the billing export.",
+          "## Goal",
+          "Ship the billing export",
+          "## Decisions",
+          "- Reuse the shared CSV writer",
+        ].join("\n"),
+        role: options.role,
+        reviewVerdictRequired: verdictRequired,
+      });
+    }
     if (options.role === "reviewer") {
       if (options.task.includes("UNKNOWN_TRIGGER")) {
         return this.formatSuccessResult("Review finished without a verdict.", Date.now(), {
@@ -202,6 +237,49 @@ describe("mcp/tools protocol integration", () => {
     expect(content[0]?.text).toContain("Status: FAILED");
     expect(content[0]?.text).toContain("Findings: 1");
     expect(content[0]?.text).toContain("SQL Injection");
+    // The derived reviewer handoff carries the findings as open items so the
+    // orchestrator sees them in the response without calling get_session.
+    expect(content[0]?.text).toContain("openItems=1");
+    expect(content[0]?.text).toContain(
+      "⚠ 1 open item(s) reported — review before chaining further work (see get_session_context)",
+    );
+  });
+
+  it("surfaces a handoff digest with an open-items warning in worker responses", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Implement billing export HANDOFF_OPEN_ITEMS_TRIGGER",
+        role: "worker",
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("Handoff: goal=Ship the billing export");
+    expect(content[0]?.text).toContain("decisions=1");
+    expect(content[0]?.text).toContain("openItems=2");
+    expect(content[0]?.text).toContain(
+      "⚠ 2 open item(s) reported — review before chaining further work (see get_session_context)",
+    );
+  });
+
+  it("omits the open-items warning when the handoff has none", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Implement billing export HANDOFF_CLEAN_TRIGGER",
+        role: "worker",
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("Handoff: goal=Ship the billing export");
+    expect(content[0]?.text).toContain("openItems=0");
+    expect(content[0]?.text).not.toContain("⚠");
   });
 
   it("fails closed for an unknown reviewer verdict", async () => {

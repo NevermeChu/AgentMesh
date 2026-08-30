@@ -1,3 +1,5 @@
+import type { HandoffSummary } from "../core/types.js";
+
 export type AgentName =
   | "codex"
   | "gemini"
@@ -104,6 +106,12 @@ export interface AgentResult {
   reviewOutcome?: "PASS" | "FAIL" | "UNKNOWN";
   findings?: ReviewFinding[];
   reviewerSafety?: ReviewerSafetyReport;
+  /**
+   * Structured handoff derived for this turn; the same object the runner
+   * persists into session history, backfilled so MCP responses surface
+   * openItems without a follow-up get_session round-trip.
+   */
+  handoff?: HandoffSummary;
 }
 
 export type SandboxMechanism = "native-sandbox" | "tool-filtering" | "prompt-only";

@@ -752,6 +752,48 @@ describe("core/runner", () => {
     });
   });
 
+  it("backfills the derived handoff onto the returned AgentResult", async () => {
+    class ReportingAdapter extends MockAdapter {
+      protected override async runViaCli(options: RunAgentOptions): Promise<AgentResult> {
+        const result = await super.runViaCli(options);
+        return {
+          ...result,
+          finalAnswer: [
+            "Implemented the feature.",
+            "## Goal",
+            options.task,
+            "## Decisions",
+            "- Reuse the shared parser",
+            "## Open Items",
+            "- SPEC section 3 contradicts section 5 on timeout defaults",
+          ].join("\n"),
+        };
+      }
+    }
+    registry.register(new ReportingAdapter());
+
+    const delegated = await runner.delegateTask({ agent: "codex", task: "Fix export" });
+    expect(delegated.handoff).toMatchObject({
+      goal: "Fix export",
+      openItems: ["SPEC section 3 contradicts section 5 on timeout defaults"],
+    });
+
+    const continued = await runner.continueTask({
+      sessionId: delegated.sessionId!,
+      task: "Resolve the SPEC contradiction",
+    });
+    expect(continued.handoff).toMatchObject({
+      goal: "Resolve the SPEC contradiction",
+      openItems: ["SPEC section 3 contradicts section 5 on timeout defaults"],
+    });
+  });
+
+  it("leaves result.handoff unset when no handoff can be derived", async () => {
+    const result = await runner.delegateTask({ agent: "codex", task: "Plain task" });
+    expect(result.status).toBe("success");
+    expect(result.handoff).toBeUndefined();
+  });
+
   it("records the handoff injection strategy and audit metadata", async () => {
     const handoffSource = sessionManager.createSession({
       agent: "codex",

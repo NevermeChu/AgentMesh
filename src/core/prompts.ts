@@ -53,6 +53,7 @@ export function buildHandoffContract(): string {
     "<one line: test outcome summary>",
     "## Open Items",
     "- <unfinished work, known risks, or open questions>",
+    "- If the SPEC or task text itself is contradictory or impossible, state that FIRST here — a spec contradiction outranks any implementation defect.",
   ].join("\n");
 }
 

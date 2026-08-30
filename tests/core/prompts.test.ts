@@ -40,6 +40,11 @@ describe("core/prompts", () => {
     expect(workerPrompt).toContain("## Goal");
     expect(workerPrompt).toContain("## Decisions");
     expect(workerPrompt).toContain("## Open Items");
+    // SPEC self-contradictions must be escalated through Open Items first
+    // (P-065): the contract tells the vendor this outranks implementation work.
+    expect(workerPrompt).toContain(
+      "If the SPEC or task text itself is contradictory or impossible, state that FIRST here — a spec contradiction outranks any implementation defect.",
+    );
     expect(workerPrompt).toContain("Implement the feature");
 
     const testerPrompt = buildRolePrompt("Run the test suites", "tester");

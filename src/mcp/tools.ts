@@ -4,17 +4,39 @@ import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/proto
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { MultiAgentRunner } from "../core/runner.js";
 import type { AgentResult } from "../agents/types.js";
+import type { HandoffSummary } from "../core/types.js";
 import { truncateText } from "../core/text.js";
 
 const MAX_TIMEOUT_MS = 3_600_000;
 const MAX_FINAL_ANSWER_CHARS = 12_000;
 const MAX_RAW_OUTPUT_CHARS = 8_000;
 const PROGRESS_INTERVAL_MS = 15_000;
+const MAX_HANDOFF_GOAL_CHARS = 80;
 type ToolRequestExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 const NonBlankString = z.string().trim().min(1);
 
+/**
+ * One-line handoff digest for MCP responses. openItems is the only channel that
+ * can carry "the SPEC itself is contradictory" — surface it (with an explicit
+ * warning line) so orchestrators can escalate without polling get_session.
+ */
+function formatHandoffDigest(handoff: HandoffSummary): string[] {
+  const lines = [
+    `Handoff: goal=${truncateText(handoff.goal, MAX_HANDOFF_GOAL_CHARS)}; decisions=${handoff.keyDecisions.length}; files=${handoff.artifacts.files?.length ?? 0}; commands=${handoff.artifacts.commands?.length ?? 0}; openItems=${handoff.openItems.length}`,
+  ];
+  if (handoff.openItems.length > 0) {
+    lines.push(
+      `⚠ ${handoff.openItems.length} open item(s) reported — review before chaining further work (see get_session_context)`,
+    );
+  }
+  return lines;
+}
+
 function formatNormalizedResult(result: AgentResult): string[] {
   const details = [`Summary: ${result.summary}`];
+  if (result.handoff) {
+    details.push(...formatHandoffDigest(result.handoff));
+  }
   if (result.finalAnswer && result.finalAnswer.trim() !== result.summary.trim()) {
     details.push(
       `Final Answer:\n${truncateText(result.finalAnswer.trim(), MAX_FINAL_ANSWER_CHARS)}`,

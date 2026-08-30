@@ -261,7 +261,15 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 注入采用 **handoff 优先**策略并以 token（估算值，非字符数）为预算（默认总预算 6000 token，按源均分、单源下限 1200）：每个来源**完整内联最近一轮的结构化 handoff**（goal、关键决定、产物文件/命令、未决事项），更早轮次只保留一行索引（`[Turn N | role | status] goal`）；历史条目没有 handoff 时（旧会话或 vendor 未遵循报告契约）回退为精简的 legacy 轮次回放（`Final answer` 截断到 1200 字符）。超预算时按"先丢复现细节、后丢结论"的固定顺序丢弃（Tests → Open Items → Commands → Files → Decisions → Findings → 证据 → 最终硬截断），实际丢弃的章节记录在该轮 `sharedContextAudit.droppedSections` 中，审计还记录 `strategy`（`handoff` | `legacy`）、`estimatedTokens` 与 `injectedOwnHistory`；被裁剪的信息不会丢失——下游可用 `get_session_context` 取回全文。该轮实际注入了哪些来源仍记录在 `contextSources` 字段中。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
-**Handoff 契约（写端）**：`delegate_task`/`continue_task` 的 worker 与 tester prompt 末尾会附加固定的 Handoff Report 契约（Reviewer 除外，其输出由严格的 PASS/FAIL findings 契约约束），要求 vendor Agent 在最终回答结尾以固定小节（`## Goal` / `## Decisions` / `## Files` / `## Commands` / `## Tests` / `## Open Items`）收尾并保持简洁；`Goal` 是 agent 自报的一句话目标，注入时优先生效（缺省回退为任务首行，而非整段任务文本）。runner 由此解析出每轮的 `handoff` 结构存入会话历史（解析失败时该轮无 `handoff`，注入自动回退 legacy 渲染）；解析会剥离列表项中的 Markdown 链接包装与反引号。长度约束在源头生效，接收端不再依赖大字符截断。**Reviewer 轮次的 handoff 无需额外契约**：runner 会从解析出的 PASS/FAIL 裁决与 findings 确定性派生（outcome 映射裁决、keyDecisions 记录裁决摘要、openItems 列出 findings、files 汇总涉及文件），使下游注入同样紧凑。
+**Handoff 契约（写端）**：`delegate_task`/`continue_task` 的 worker 与 tester prompt 末尾会附加固定的 Handoff Report 契约（Reviewer 除外，其输出由严格的 PASS/FAIL findings 契约约束），要求 vendor Agent 在最终回答结尾以固定小节（`## Goal` / `## Decisions` / `## Files` / `## Commands` / `## Tests` / `## Open Items`）收尾并保持简洁；`Goal` 是 agent 自报的一句话目标，注入时优先生效（缺省回退为任务首行，而非整段任务文本）。runner 由此解析出每轮的 `handoff` 结构存入会话历史（解析失败时该轮无 `handoff`，注入自动回退 legacy 渲染）；解析会剥离列表项中的 Markdown 链接包装与反引号。长度约束在源头生效，接收端不再依赖大字符截断。契约同时明确要求：**若 SPEC 或任务文本自身矛盾或不可实现，vendor 必须最先在 Open Items 小节申报——SPEC 矛盾优先于任何实现缺陷**。**Reviewer 轮次的 handoff 无需额外契约**：runner 会从解析出的 PASS/FAIL 裁决与 findings 确定性派生（outcome 映射裁决、keyDecisions 记录裁决摘要、openItems 列出 findings、files 汇总涉及文件），使下游注入同样紧凑。
+
+**Handoff 信号（读端，MCP 返回）**：`delegate_task` / `continue_task` / `review_changes` 的返回文本在存在结构化 handoff 时会紧跟 `Summary:` 附带一行摘要：
+
+```
+Handoff: goal=<截断80字>; decisions=N; files=N; commands=N; openItems=N
+```
+
+当 `openItems>0` 时额外追加提示行 `⚠ N open item(s) reported — review before chaining further work (see get_session_context)`；`openItems=0` 时该提示行不出现。Orchestrator 应把 `openItems>0` 视为**需要人工裁决的信号**——包括 vendor 依据契约申报的 SPEC 自身矛盾——不必逐轮调用 `get_session` 才能发现未决事项。程序化调用方也可直接读取返回 `AgentResult.handoff` 结构（与会话历史中的 handoff 同源同值）。
 
 每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）或 `get_session_context(fields=["finalAnswer"])`（截断到 24000 字符）。
 

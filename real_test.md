@@ -1276,3 +1276,139 @@ cronsmith（5-field cron 语义 + next-run 计算，Vixie OR 规则、UTC 严格
 
 - 采样方法同 R14：无外部采样器，资源证据为 AgentMesh 自身 resourceEvidence（collection: "process"）+ 各轮 durationMs：w1=222s、tester=183s、rev=124s、fix2=183s、rev2=75s（合计 ≈787s）。局限如实声明：vendor 进程树 CPU/RSS、孤儿进程、峰值水位未采集，不作推断。
 - 清理：lab 仓 2 个 commit（SPEC 基线 + A8 裁决）均由 Orchestrator 提交，实现文件全部保持未提交（含 tester probe-tmp/）；AgentMesh 主项目零污染（独立 sessions 文件）；over-strip 修复以独立 commit 进入主仓。
+
+---
+
+# R16：enforced safety 矩阵 + codex MCP 冒烟 + 外部采样器首跑（2026-08-30）
+
+> 计划来源：reference/agentmesh-coverage-evidence-escalation-plan.md M3。角色按用户指定：Worker=opencode(`opencode/muse-spark-1.2-contributor-free`)，Reviewer=opencode(同模型)+codex(safety 矩阵)，Tester=antigravity（本轮无 tester 管线轮）。隔离工作区 `C:\Users\ThisMe\agentmesh-real-r16-18`（lab：r16/semver-lite、r16/smoke，均为独立 git 仓库），会话文件 `out/sessions-r16.json`，全部调用经 AgentMesh MCP（`dist/cli/index.js serve` stdio）。预注册断言：`out/acceptance-r16.md`；断言判定留痕 `out/r16-assertions-*.json`。本次运行使用含 M1 改动（`Handoff:` 返回行）的新构建。
+
+## 1. 小任务是在做什么
+
+semver-lite：按 SPEC 实现 SemVer 2.0.0 的 parse/compare/format（ESM、零依赖），验收向量 A1-A12（重点边界：prerelease 数值/字母数字比较、build 元数据忽略、前导零合法性）。Worker（opencode）负责实现+测试；codex reviewer 在 enforced 策略下独立审查同一工作树；codex MCP 冒烟（fizzbuzz scratch）验证 mode=mcp 传输的 delegate+continue。采样器（scripts/resource-sampler.mjs，M2 产物）首次在真实轮挂载取证。
+
+## 2. 上下文是否损失及程度
+
+- **w1 → 下游（reviewer/后续）**：w1 的 handoff 完整持久化（goal 自报一句话、decisions=4、files=4、commands=2、openItems=2），`out/r16-audit-r16-final-*.json` sidecar 校验通过（有 sidecar 的轮次全部 verified=true）。**评级：无损**。
+- **M1 读端信号首次真实链路生效**：w1 的 MCP 返回文本直接携带 `Handoff: goal=Implement semver-lite per SPEC.md...; decisions=4; files=4; commands=2; openItems=2` 且出现 `⚠ 2 open item(s) reported`。openItems 内容是 worker 自报的 SPEC 歧义（build 数字标识符前导零是否需要检查）——P-065 场景下 Orchestrator 无需 `get_session` 即可裁决，信息无损且即时可见。
+- **reviewer 轮**：codex 不产出 handoff report，由 runner 从 FAIL 裁决+findings 确定性派生（openItems=1=该 finding），返回文本同样携带摘要行。**评级：无损（派生路径符合设计）**。
+- **smoke 两轮**：delegate/continue 均超时失败，无 finalAnswer；continue 轮 contextSources=[自身 session]（codex MCP 未返回 native session id，按产品设计回退 own-history 注入，sidecar 校验 true）。**评级：业务信息为零产出（vendor 挂起所致），通道本身无损**。
+
+## 3. 是否重复做无意义操作
+
+- 无因上下文缺失导致的被迫重复。safety-pass 第一次失败（adapter 参数冲突，486ms，exit 2）与第二次成功（87s）是**修复后的重试**，不是无效重复；第二次的真实审查独立完成。
+- smoke 的 continue 在 delegate 已 600s 超时后仍按预注册流程执行——这是**按计划采集"continue 在 MCP 传输下是否独立可用"的探针证据**，非盲目重试（结论：同样挂起，行为一致）。
+- Orchestrator 独立复核（`node --test` 在 lab 内运行）与 worker 自检属必要独立复核。
+
+## 4. 暴露的问题（按 问题/根因/影响/证据/建议修复）
+
+1. **【AgentMesh，本轮已修复】codex reviewer CLI 参数冲突**：`codex review --uncommitted/--base` 与自定义 `[PROMPT]` 在安装的 codex CLI 0.151.0 上互斥（clap: "the argument '--uncommitted' cannot be used with '[PROMPT]'"），AgentMesh 把评审 prompt 拼在其后导致 enforced+codex 放行路径必失败（exit 2，486ms）。证据：`out/r16-safety-pass-2026-08-30T02-1*.json`（第一次）。修复：reviewer CLI 路径改用 `codex exec` + 原生只读沙箱配置（`sandbox_mode="read-only"` + `sandbox_permissions=["disk-full-read-access"]`，与 MCP 路径同键），diff scope 由 prompt 内指引；回归测试已更新（`tests/agents/args.test.ts`）。修复后同路径 87s 完成真实审查。
+2. **【vendor】codex MCP 传输（`codex mcp-server`）在本次环境一致挂起**：spawn 成功（无历史 EPERM），但 delegate 与 continue 两次工具调用各 600s 超时；采样器显示 codex.exe 全程 CPU 仅 2.25s/1.69s（≈0.3%——挂起而非计算），每次超时后进程树完整退出。影响：mode=mcp 对 codex 不可用（CLI 正常，同机 `codex exec` 87s 完成）。证据：`out/r16-smoke-delegate-*.json`、`r16-smoke-continue-*.json`、`r16-summary-smoke.json`。建议：环境级排查（codex 首次 MCP 握手/认证状态）后再复测；AgentMesh 侧无需改动（超时与结构化失败路径行为正确）。
+3. **【AgentMesh，观察项】** 分发前失败（enforced 拒绝）不产生 session/history 记录，证据仅存于 MCP 响应文本（`out/r16-safety-reject-*.json`）。对零配额断言无碍（duration=10ms、无 vendor 进程），但"拒绝发生过"在会话存储中零痕迹，后续可考虑是否需要审计事件。
+4. **【AgentMesh，观察项】** MCP 超时轮次的 `evidence.transportUsed` 为 null（`out/r16-audit` smoke 两轮 transport=null, exit=1），从参数可证 mode=mcp 但持久化证据缺该字段；不影响本轮结论，列为证据完整性改进项。
+5. **【任务设计】** semver-lite 的 SPEC 向量未覆盖 build 数字前导零（worker 在 openItems 中如实申报该歧义而非擅自扩大实现）——M1 写端契约（SPEC 矛盾/歧义优先申报）按预期工作。
+
+## 5. 资源与清理
+
+- **外部采样器首跑（M2 验收）**：w1 相位 40 tick/0 tickError，进程树 RSS 峰值 921,935,872B（含 MCP server node 进程——种子为驱动进程，按设计包含全部后代），opencode.exe 全程采到，孤儿=0；smoke 相位 238 tick，树峰值 806,993,920B，codex.exe/codex-code-mode-host.exe 生命周期与两次 600s 超时精确吻合（last=02:30:48/02:40:51），**孤儿=0 说明超时清理把 codex MCP 进程树杀干净**。JSONL：`out/r16-samples-w1.jsonl`、`r16-samples-smoke.jsonl`；汇总：`r16-summary-w1.json`、`r16-summary-smoke.json`。局限照计划声明（3s 粒度、CPU 为累计秒、树峰值含测量宿主进程、WMI 计数差异）。
+- 产品内 resourceEvidence：w1 轮未附加（undefined，如实记录）；safety-pass 轮 collection="process"（AgentMesh 自身 CPU 15/63ms、RSS 70.9MB）——与外部采样器形成"process + external"互补证据。
+- 清理：semver-lite 实现与测试保持未提交（Orchestrator 仅提交 scaffold 与 config fix 两个 commit）；AgentMesh 主项目零污染（独立 sessions 文件、独立工作区）；codex CLI 参数修复以独立代码变更进主仓（含回归测试，`npm run check` 待三轮结束后统一回归）。
+
+## 6. 覆盖矩阵更新（R16 后）
+
+| 路径                                     | 之前       | 本次                                                                       |
+| ---------------------------------------- | ---------- | -------------------------------------------------------------------------- |
+| enforced safety：prompt-only 拒绝路径    | 未真实覆盖 | **已覆盖**（10ms 分发前失败，零配额，精确文案+safety 报告）                |
+| enforced safety：native-sandbox 放行路径 | 未真实覆盖 | **已覆盖**（修复 adapter 缺陷后，codex 87s 真实 FAIL 裁决+1 high finding） |
+| codex MCP 传输（delegate+continue）      | 未覆盖     | **已覆盖（失败形态）**：spawn OK，双调用 600s 挂起，非 EPERM；清理干净     |
+| 外部采样器（M2）                         | 无         | **已验收**：双相位 JSONL+汇总+孤儿检测                                     |
+| M1 读端信号（Handoff:/⚠ 行）            | 未真实覆盖 | **已覆盖**：worker 自报 SPEC 歧义经 ⚠ 行直达 Orchestrator                 |
+
+---
+
+# R17：异常探针（超时/取消）+ 并发双写者 STALE 处置（2026-08-30）
+
+> 计划来源：M4。角色：双 Worker=opencode(free 模型)并发，Tester=antigravity。Lab：r17/textool（预植 SPEC+contract gate），探针 scratch：r17/scratch-timeout、r17/scratch-cancel。会话文件 out/sessions-r17.json。预注册断言：out/acceptance-r17.md；留痕 out/r17-assertions-\*.json。
+
+## 1. 小任务是在做什么
+
+- 超时探针：纯 stdout 长输出任务（3000 素数）+ timeoutMs=25000，验证 timedOut/cancelReason=timeout/清理证据/部分输出保留/指纹不变。
+- 取消探针：同一任务，客户端 20s AbortController 打断 MCP 请求，验证 aborted/cancelReason=client_cancel/taskkill-tree/工作树不变。
+- 双写者并发：两个 opencode worker 在**同一 MCP 连接**上并发写互补模块（slugify/truncate，各自拥有专属测试文件，预植 src/index.js 与 tests/contract.test.mjs 为集成门），随后 antigravity tester 以 contextSessionIds=[wA,wB] 多源注入消费，验证 per-source MATCHED/STALE 与写入时序一致、STALE 源被再验证。
+
+## 2. 上下文是否损失及程度
+
+- **wA/wB → tester**：sidecar（verbatim 注入审计，sha256 验证 true）显示两源各带独立新鲜度标签，**Source 1(wA)=MATCHED、Source 2(wB)=STALE**，与指纹时序精确一致：wB 先完成（89.5s，fp=49ce576c0a51），wA 后完成（107.7s，fp=11258aaf0103），tester 注入时点指纹=11258aaf0103 → 后完成者 MATCHED、先完成者 STALE。**评级：无损——多源规范化历史一手到达，且新鲜度元数据让接收方精确知道"哪些可复用、哪些需重验"**。
+- **tester 输出**：显式出现 "## Worker Context Revalidation (STALE Verification)" 章节，逐源用 git diff/实际代码复核（非照抄），并核实两 worker 未越权修改 index.js/contract gate（所有权边界）。hypothesis "STALE 触发合理重验" 成立。
+- **探针轮**：超时轮保留了 vendor 开场白（部分输出不丢）；取消轮客户端侧收到 MCP error -32001 且 abort 原因文本穿透返回（"Orchestrator cancel probe: 20s elapsed"）。两轮业务产出为零属预期（被杀），通道证据完整。**评级：无损（异常路径证据保全符合设计）**。
+
+## 3. 是否重复做无意义操作
+
+- 无重复：两 worker 并行各写各模块（wB 90s/wA 108s，总耗时≈max 而非 sum）；tester 一次消费两源。
+- tester 的逐源再验证是 **STALE 标注触发的合理复核**，不是无效重复——它同时确认了 MATCHED 源可直接复用、STALE 源需重验的部分，验证粒度受新鲜度标注引导。
+- Orchestrator 终复核（node --test 全量 43/43 含 contract gate）与 worker/tester 各自运行属必要独立复核。
+
+## 4. 暴露的问题
+
+1. **【AgentMesh，观察项】客户端取消后 cleanupSucceeded=false 但实际无孤儿**：取消轮 audit 记录 cleanupMethod=taskkill-tree、cleanupSucceeded=false，但 60s 后独立进程核查（Win32_Process 按 CLI 命令行过滤）无任何本轮 opencode 进程残留、工作树指纹不变。疑似成功判定存在竞态（进程退出前验证）或 taskkill 对已死 PID 返回非零。影响：证据字段偏保守，可能误导编排方"清理失败"。建议：清理成功判定改为"按 PID 存在性复核"而非 taskkill 返回码。证据：out/r17-cancel-verify 断言留痕 + 本节进程核查记录。
+2. **【方法论，非缺陷】按进程名匹配 vendor 会误伤同名 GUI**：初次孤儿核查把用户的 OpenCode Desktop（@opencode-ai\desktop，Electron 进程族，创建于 R15 之前的日常使用时段）误认为候选孤儿——按命令行核对后排除。外部采样器 limitations 中"同名需人工核对命令行"的警告被实证；本轮未误杀任何进程。
+3. **【任务设计】** 双写者若都跑全量 `node --test` 会因对方模块未就绪而互相污染结论——任务文本显式禁止并指定各自单文件测试命令后，两 worker 均遵守（无交叉污染证据），tester 的 contract gate 才有意义。
+4. **【对照 R13】** 超时/取消两条异常路径在 r13 后首次复测，行为与设计一致（timedOut/aborted 证据、指纹不变、树清理），未发现回归。
+
+## 5. 资源与清理
+
+- 本轮未挂外部采样器（R16 已验收其行为）；资源证据为各轮 durationMs：timeout 探针 25.6s（≈timeoutMs）、cancel 探针 20.2s（≈abort 点）、wA 107.7s/wB 89.5s（并行，墙钟≈108s）、tester 112.7s。
+- 进程核查方法与局限：Win32_Process 按名称+命令行过滤，即时快照（非持续监控），未能覆盖亚秒级存活进程；未发现本轮 CLI vendor 孤儿。
+- 清理：textool 实现/测试保持未提交（scaffold 1 commit 由 Orchestrator 提交）；scratch 两仓零变更（指纹 before==after）；主项目零污染。
+
+## 6. 覆盖矩阵更新（R17 后）
+
+| 路径                                     | 之前         | 本次                                                                                  |
+| ---------------------------------------- | ------------ | ------------------------------------------------------------------------------------- |
+| 超时探针（timedOut/部分输出/清理）       | r13 后未复测 | **已复测**（4/4 断言）                                                                |
+| 取消探针（abort/taskkill-tree/指纹不变） | r13 后未复测 | **已复测**（3/3 断言 + cleanupSucceeded 观察项）                                      |
+| 并发双写者 + 多源 STALE 处置             | r13 后未复测 | **已复测**（并行 SUCCESS；per-source MATCHED/STALE 与时序一致；STALE 再验证显式留痕） |
+
+---
+
+# R18：repair-mode tester→worker 缺陷闭环 + vendor handoff 语料（2026-08-30）
+
+> 计划来源：M5。角色：Worker=opencode(free)，Tester=antigravity，Reviewer=opencode(free)。Lab：r18/inifix（Orchestrator 预植 4 处已知缺陷的 src/legacy-ini.js + SPEC 契约；Worker 阶段一限定 C1-C6）。会话文件 out/sessions-r18.json。预注册断言：out/acceptance-r18.md。
+
+## 1. 小任务是在做什么
+
+**repair-mode 闭环设计**：遗留 INI 解析模块带 4 处预植缺陷（D1 值含 '=' 被 split 截断、D2 引号不剥离+引内 ';' 当注释、D3 空值键整体丢失、D4 缩进 section 丢失）。Worker 阶段一只需让 C1-C6 过（缺陷全部位于 C 向量之外）；Tester 的 D1-D9 探针矩阵**严于** Worker 自检范围——闭环从概率事件变为设计事件。流程：w1（修复 C1-C6）→ tester1（全矩阵）→ fix（continue worker，contextSessionIds=[tester]）→ tester2（复测）→ rev（终审）。
+
+## 2. 上下文是否损失及程度
+
+- **tester1 → worker（核心闭环通道）**：tester1 报告 D1-D4 PASS / **D5-D9 全部 VIOLATION**（5/5 与预植缺陷一一对应）；fix 轮 contextSources=["bridge-sess_a9ffefac5b46"]（成功那轮 tester），sidecar sha256 验证 true。worker t2 的 handoff goal 直接复述了 Tester 的违规清单（"Fix every Contract violation reported by Tester (C-R1/C-R3 trim-first, C-R4 multi-=, C-R5/C-R6 quote+comment, C-R7 empty value)..."）——规范化注入的一手信息被完整接收并转化为任务理解。**评级：无损**。
+- **w1 → tester1**：tester1 拿到 w1 的 handoff 注入（contextSources=[w1]），同时用 repo 外 scratch runner 独立执行 D 矩阵（未采信 worker 自检结论）。**评级：无损**。
+- **fix → tester2**：tester2（continue tester 会话）在自家历史中已有前次违规报告，worker 修复报告经 [w1] 注入；输出显式声明 "violations (D5 through D9) have been resolved without regressing Phase-1 vectors (D1 through D4)"。**评级：无损**。
+- **worker 的诚实申报链**：w1 在 openItems 主动申报"已知遗留 quirk 未修（归属后续阶段）"；fix 轮 openItems 申报残余边界（引号转义不在 SPEC 范围）——写端契约的 openItems 通道在三轮中持续产生有效升级信息。
+
+## 3. 是否重复做无意义操作
+
+- **闭环零额外轮次**：tester1 一次命中、fix 一轮修完、tester2 一次确认（D1-D9 9/9）、rev 一次 PASS——设计事件精确兑现，无"碰运气"轮次。
+- Orchestrator 独立探针（node -e 直查 5 个缺陷位）与 vendor 报告互证：fix-verify 时 D5/D6/D7/D9 实测修复；**D8 首次判 FAIL 系 Orchestrator 自身探针笔误**（`"key=" in global` 把带等号整体当键名），修正后确认 `parseIni("key=").global={"key":""}` 已修复——按"证据优先"规则记录，避免把工具误报当成产品缺陷。
+- 两次驱动层断言误报（A18-3.1 过滤在 90 字符截断上落空、A18-2.3 用累积 git status 无法归属单轮变更）均为 harness bug，产品行为经 audit 行核实正确——如实记录，不计为产品问题。
+
+## 4. 暴露的问题
+
+1. **【vendor/环境】antigravity OAuth 端点网络抖动**：tester1 前两次尝试 12.4s/12.8s 失败（`Eligibility check failed: Get https://www.googleapis.com/oauth2/v2/userinfo: EOF`，0 tokens），同机 curl 可达该端点（401/1.19s）；等待后第 3+ 次尝试成功（74s）。定性：vendor 侧网络栈间歇故障，非凭证失效、非 AgentMesh 缺陷；两次失败轮完整留痕（含 0 用量结构化输出）。影响：Tester 角色可用性在该网络环境存在间歇风险，编排方需容忍角色级重试。
+2. **【vendor】codex 配额耗尽**：语料轮 codex worker 12.8s 结构化失败（"You've hit your usage limit..."，R16 两次 600s 挂起调用也计入消耗）。计划内语料目标（vendor 多样性 handoff 形态采样）**BLOCKED**。
+3. **【vendor/用户配置】claude 备选不可用**：claude worker 8.1s 失败（路由模型 qwen3.8-27b:free 不存在或无访问权——用户侧路由配置问题）。语料轮按计划备选（codex 或 claude）双路均不可用，如实记录为 BLOCKED，待 codex 配额重置后补测。
+4. **【AgentMesh，观察项】** spawn 对不存在的 cwd 报 `ENOENT`（指向被解析的 node.exe 路径，具有误导性）——语料轮首跑时 Orchestrator 漏建 corpus 目录触发，66ms 结构化失败。建议：executor 在 spawn 前校验 cwd 存在并给出指向性错误。
+5. **【任务设计】** repair-mode 的范围限定条款（"quirks beyond C1-C6 owned by later phase"）被 worker 严格遵守且在 openItems 申报——"Worker 自检范围 < Tester 探针范围"的构造是闭环确定性触发的关键，推荐固化为标准任务模板。
+
+## 5. 资源与清理
+
+- 采样器（w1 相位）：34 tick/0 tickError，树 RSS 峰值 984,633,344B，孤儿=0（out/r18-summary-w1.json、r18-samples-w1.jsonl）。
+- 各轮耗时：w1 162.1s、tester1 74.3s（失败尝试 12.4/12.8s×2）、fix 100.6s、tester2 24.8s、rev 69.5s。
+- 清理：inifix 修复与测试保持未提交（scaffold 1 commit）；corpus scratch 已建（scaffold commit）本轮未产出实现；主项目零污染。
+
+## 6. 覆盖矩阵更新（R18 后）
+
+| 路径                                     | 之前     | 本次                                                                                                              |
+| ---------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
+| tester→worker 缺陷闭环                   | 从未触发 | **已触发（设计事件）**：D5-D9 5 违规 → 注入修复 → D1-D9 9/9 复测 → rev PASS                                       |
+| vendor handoff 语料（codex/claude 形态） | 无       | **BLOCKED**（codex 配额耗尽 + claude 路由失效，双证据在案；opencode 形态样本本轮已新增 5 份：w1/wA/wB/w1r18/fix） |

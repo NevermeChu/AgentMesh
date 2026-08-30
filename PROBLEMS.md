@@ -647,3 +647,33 @@
 **解决方法**：SPEC 编写规范：①验证命令必须平台中性（`node --test` 自动发现），平台特例显式标注适用平台；②Appendix 验收行与验证命令一一对应，避免"文字必须但无验收行"的盲区；③给下游角色加一条通用指引——"发现 SPEC 自身矛盾时在 open items 申报并按最严格平台解释执行"（本轮 worker 的 open items 行为实际就是正确示范）。
 
 **状态**：已解决（规避，无代码修复，2026-08-29）。教训：多 Agent 流水线无法修复上游权威文档的缺陷，只会把它放大成三个角色的处置分歧；SPEC 是契约，平台假设要在源头消除。
+
+## P-067 外部采样器孤儿检测自匹配：命令行正则命中采样器 argv 与其祖先链（M2 冒烟）
+
+**问题**：`scripts/resource-sampler.mjs` 首次冒烟中，孤儿检测把采样器自身、驱动 bash 包装进程判为 vendor 孤儿（orphanCount=4，期望 0）；收紧为"排除祖先的全部子孙"后，合法的 vendor 目标（驱动的另一个子进程）又漏检（orphanCount=0，期望 1）。
+
+**根因**：孤儿检测按 CommandLine 匹配 vendor 正则，而采样器自己的 argv 里带有 `--vendor-regex <pattern>` 字面量，祖先 shell 的命令行同样内嵌该模式，必然自匹配；反过来，"祖先的全部子孙"闭包会把与采样器同源兄弟关系的被测进程一并排除。
+
+**解决方法**：harness 排除域收敛为三部分且仅三部分——采样器自身 PID、其祖先链（argv 自匹配源）、采样器自己的后代（每次 tick 的 PowerShell 查询子进程）；祖先的其他子树不排除（vendor 兄弟进程是合法目标）。冒烟以 marker 正则分别验证 clean（孤儿=0）与 leak（孤儿=1）双路径。
+
+**状态**：已解决（2026-08-30）。教训：按命令行做进程匹配时，测量工具自身 argv 就是匹配源之一，排除域必须显式设计，"排除祖先"与"排除祖先的后代"是两个不同语义。
+
+## P-068 PowerShell CIM CreationDate 经 `{0:o}` 格式化产生 7 位小数秒，`Date.parse` 解析为 NaN（M2 冒烟）
+
+**问题**：`Get-CimInstance Win32_Process` 的 CreationDate 用 `"{0:o}" -f` 轮转格式输出时携带 7 位小数秒（.NET tick 精度），Node `Date.parse` 对超规格小数秒返回 NaN，导致孤儿检测的"创建时间落在采样窗口内"过滤把目标进程整批丢弃。
+
+**根因**：.NET round-trip 格式 `o` 保留 tick 精度，超出 ECMAScript Date Time String Format 的小数秒位数约定；采样器未验证解析结果就参与比较。
+
+**解决方法**：改用显式自定义格式 `"{0:yyyy-MM-ddTHH:mm:ss.fffzzz}" -f $_.CreationDate`，输出严格 3 位毫秒 + 时区偏移的 ISO 字符串；`Date.parse` 结果用 `Number.isFinite` 守卫，不可解析的行不参与窗口过滤。
+
+**状态**：已解决（2026-08-30）。教训：跨运行时传递时间戳时以接收方的解析能力为准生成格式，不要复用发送方的"最精确"格式。
+
+## P-069 codex reviewer CLI 把 prompt 拼在 `--uncommitted`/`--base` 之后，安装版 CLI 判定参数互斥（R16）
+
+**问题**：R16 enforced+codex 放行路径首次真实执行即失败（exit 2，486ms）：`error: the argument '--uncommitted' cannot be used with '[PROMPT]'`。`buildCliArgs` reviewer 分支为 `codex review [--base X|--uncommitted] <prompt>`，而安装的 codex CLI 0.151.0 中 scope 旗标与自定义 `[PROMPT]` 互斥；AgentMesh 评审契约必须携带 prompt（评审焦点+PASS/FAIL 输出格式），因此该路径在任何参数组合下都不可用。
+
+**根因**：适配器按"native review 命令只读"的旧认知拼装参数，未对照安装版本 CLI 的实际契约验证互斥关系；单测断言的是拼装形态而非 vendor 可执行性。
+
+**解决方法**：reviewer CLI 路径改用 `codex exec` + 原生只读沙箱配置（`sandbox_mode="read-only"`、`sandbox_permissions=["disk-full-read-access"]`，与 MCP 路径同键），保留 prompt、评审契约与原生沙箱；base-commit 范围由 prompt 内 diff 指引承担。回归测试改为断言 exec 形态并显式排除 `--uncommitted`/`--base`。修复后同路径 87s 完成真实审查（FAIL 裁决+1 high finding，native-sandbox enforced=true）。
+
+**状态**：已解决（2026-08-30）。教训：vendor CLI 子命令的旗标互斥关系是兼容面的一部分，"能跑通 happy path"的参数组合不等于"带业务 prompt 的组合"可执行；真实测试轮是发现这类契约漂移的唯一窗口。

@@ -164,19 +164,24 @@ export class CodexAdapter extends BaseAdapter {
     const args: string[] = [];
 
     if (role === "reviewer") {
-      // Codex supports native 'review' command which is read-only
-      args.push("review");
+      // `codex review` cannot combine custom instructions with scope flags —
+      // the installed CLI rejects `--uncommitted`/`--base` together with
+      // `[PROMPT]` — and the AgentMesh review contract requires the prompt
+      // (review focus + PASS/FAIL format). `codex exec` with a native
+      // read-only sandbox keeps prompt, contract, and sandbox enforcement;
+      // base-commit scoping is instructed inside the prompt itself.
+      args.push("exec");
       args.push(
         "-c",
         'sandbox_permissions=["disk-full-read-access"]',
         "-c",
         'sandbox_mode="read-only"',
       );
-      if (options.baseCommit) {
-        args.push("--base", options.baseCommit);
-      } else {
-        args.push("--uncommitted");
+      if (options.model) args.push("--model", options.model);
+      if (options.reasoningEffort) {
+        args.push("-c", `model_reasoning_effort=${options.reasoningEffort}`);
       }
+      args.push("--json");
       args.push(prompt);
     } else {
       // Standard worker execution via 'codex exec' or 'codex exec resume'

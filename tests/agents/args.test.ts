@@ -89,20 +89,18 @@ describe("agents/args construction", () => {
       nativeSessionId: "thread_abc123",
     });
 
-    expect(reviewerArgs[0]).toBe("review");
-    expect(reviewerArgs).toContain("--base");
-    expect(reviewerArgs).toContain("main");
+    // `codex review` cannot take scope flags together with a custom prompt
+    // (installed CLI 0.151.0), so reviewers run via `codex exec` with a
+    // native read-only sandbox and the prompt carries the diff scope.
+    expect(reviewerArgs[0]).toBe("exec");
+    expect(reviewerArgs).toContain('sandbox_mode="read-only"');
+    expect(reviewerArgs).toContain('sandbox_permissions=["disk-full-read-access"]');
+    expect(reviewerArgs).toContain("--json");
+    expect(reviewerArgs).not.toContain("--uncommitted");
+    expect(reviewerArgs).not.toContain("--base");
     expect(reviewerArgs).not.toContain("--session");
     expect(reviewerArgs).not.toContain("thread_abc123");
-    expect(reviewerArgs).toContain('sandbox_mode="read-only"');
-
-    const uncommittedArgs = adapter.buildCliArgs({
-      task: "Review uncommitted",
-      role: "reviewer",
-    });
-    expect(uncommittedArgs[0]).toBe("review");
-    expect(uncommittedArgs).toContain("--uncommitted");
-    expect(uncommittedArgs).not.toContain("--session");
+    expect(reviewerArgs.at(-1)).toContain("Review PR #99");
   });
 
   it("enforces Codex worker sandbox and native resume arguments", () => {

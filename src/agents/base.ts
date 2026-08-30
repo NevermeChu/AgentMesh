@@ -267,6 +267,8 @@ export abstract class BaseAdapter implements AgentAdapter {
       finalAnswer?: string;
       role?: AgentRole;
       reviewVerdictRequired?: boolean;
+      /** Process resource measurement from the executor (P-R18-2: success path must not drop it). */
+      resourceEvidence?: AgentResult["resourceEvidence"];
     },
   ): AgentResult {
     const isReviewer = options?.role === "reviewer";
@@ -318,6 +320,7 @@ export abstract class BaseAdapter implements AgentAdapter {
       reviewOutcome,
       findings,
       ...(warning ? { warning } : {}),
+      ...(options?.resourceEvidence ? { resourceEvidence: options.resourceEvidence } : {}),
     };
   }
 

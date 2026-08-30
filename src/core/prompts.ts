@@ -111,6 +111,8 @@ export function buildReviewerPrompt(
     `## Instructions & Constraints`,
     `1. ${diffInstruction}`,
     `2. STRICT READ-ONLY RULE: Do NOT edit, write, create, or delete any source files. You may ONLY run read-only commands (git diff, git status, read files, or test suites).`,
+    `2b. WORKSPACE CLEANLINESS: verification commands (npm test etc.) MUST redirect all output to the system temp directory (e.g. > "%TEMP%\review-out.txt" or /tmp/). NEVER create any file inside the working repository — including logs, err*.txt/out*.txt captures, or scratch scripts. The working tree must be byte-identical to how you found it; any new file counts as a violation.`,
+    `   (Rationale: the bridge fingerprints the working tree before and after your review — any file you create is detected, flagged as a HIGH finding, and flips a PASS verdict to FAIL. Round-18 real-chain incident.)`,
     `3. Check thoroughly for:`,
     `   - Correctness & logic errors`,
     `   - Regressions & breaking changes`,

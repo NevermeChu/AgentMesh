@@ -1497,3 +1497,51 @@ stdio 驱动独立桥接 serve 进程 → MCP `delegate_task(background:true, mo
 ### 本轮结论
 
 6/6 验收 PASS，数据层与界面两轮评审均一次 PASS（无返工轮）。双通道协同（MCP 后台派发 + 人腿中继）首次跑通：数据层由 opencode 4 次免费调用完成，界面由 Trae 一次交付零越界、零返工。全量 396 测试绿，组长 token 消耗按架构约束以文案占位未伪造。产出：`TimelineEntry`/`buildTimeline`/`lastModelId` 数据层 + panel.html 全面视觉重构 + 5 例新测试。
+
+---
+
+## 第十八轮：三角色全链路复验（2026-08-30，外部环境执行）
+
+> **环境说明（如实标注）**：本轮在另一套环境执行（报告标注 `D:\AgentMesh`，本机不存在该路径），台账以报告原文合并入账，本仓库未见证其会话存储。报告原文来自编排会话导出（p.md）。
+
+- 方法：Orchestrator（GLM 会话）经 AgentMesh MCP 编排；Worker/Reviewer = opencode `muse-spark-1.2-contributor-free`（免费池钉模型），Tester = antigravity（agy 1.1.22）；隔离工作区 `D:\realtest-r18\ws`，会话存储重定位隔离 home，主仓库零改动。
+- 任务：时长解析库（8 个易错拒绝分支 + CLI 契约）。
+
+### 流水线（4 次真实调用，0 次失败派发）
+
+| 阶段                             | Agent/模型          | Session                  | 耗时 | 结果                                       |
+| -------------------------------- | ------------------- | ------------------------ | ---- | ------------------------------------------ |
+| Worker                           | opencode muse-spark | bridge-sess_c0fb07f12955 | 753s | 25/25 测试绿，exit 0                       |
+| Reviewer 第 1 轮                 | opencode 独立会话   | bridge-sess_fe9663c7b983 | 269s | 正文 PASS → 机器判 **FAIL（fail-closed）** |
+| Reviewer 第 2 轮（清理后新会话） | 同上                | bridge-sess_4c092250eda8 | 351s | **PASS**，4 条 low 非阻塞                  |
+| Tester                           | antigravity         | bridge-sess_411c28f32d7f | 237s | **PASS 无缺陷**                            |
+
+### 交接质量
+
+- Worker→Reviewer（两轮）：sidecar 3836 字符未截断（任务全文/finalAnswer 原文/前后指纹/反作弊警告），新鲜度 **MATCHED**（逐位一致），两轮注入逐字节相同（同一 SHA-256，确定性成立）。
+- Worker+Reviewer→Tester：双源 3836+5145 字符未截断，Reviewer 的 4 条 findings JSON 原文完整进入注入块；Tester 引用两个来源 session ID，零澄清往返。
+- 4 份 sidecar SHA-256 与 sharedContextAudit 入账全部核对一致。
+
+### 重复操作
+
+`npm test` 共 4 次（Worker 自检/两轮评审/Tester）+ 编排者复跑 1 次，全部为职责性独立复核，无一例上下文缺失造成的被迫重复。`continue_task` 未触发：零返工配额。
+
+### 本轮最有价值的发现
+
+**fail-closed 反作弊机制被"评审器自己"真实触发并按设计拦截**：opencode reviewer 在"不要修改文件"约束下仍把验证命令输出重定向成 err/out×6 文件写进工作区 → AgentMesh 指纹比对检出 → 自动附加 high finding → 与正文 PASS 矛盾 → 按契约判 FAIL。prompt-only 非沙箱的活证据 + 反作弊检测按设计生效的双重实证。任务文本补"输出重定向到系统临时目录"约束后第二轮未复发。
+
+### 暴露的问题
+
+1. **P-R18-1（中）reviewer 验证输出污染工作区**：任务文本补约束后可缓解；建议把该约束内置进评审提示词模板（本仓库已实施，见下）。
+2. **P-R18-2（低）resourceEvidence 成功路径缺失**：executor 只在超时/取消/hard-settle 路径附加（src/core/executor.ts:469/580/618），成功路径丢弃测量结果——README 宣称默认采集不符（本仓库已实施成功路径采集，见下）。
+3. **P-R18-3（低）opencode finalAnswer 混入流式进度噪声**（7 行），随注入传给下游稀释信噪比（对结论无损）。
+4. agy 不上报 usage（已知限制复现，undefined 如实缺省）。
+5. Windows Node 24 `node --test test/` 目录问题复现——Worker 规格外添加的 test/index.js 垫片经独立复验确属必要（越规格行为有正当理由，未被误判为作弊）。
+
+### 资源与清理
+
+4 次调用 usage：Worker 1,694,927 / 评审 266,545+366,184 / Tester 不上报（undefined 如实）。评审器 6 个污染文件移入 evidence\reviewer-debris\ 存档；隔离目录保留备查；无凭据入账。
+
+### 本轮结论
+
+三角色全链路一次打通，交接质量三段全部"无损"，重复操作零无效项。2.5/4 交接核心关注点全 PASS。两个新问题（P-R18-1/2）本仓库已实施修复（评审模板约束内置 + executor 成功路径资源采集），待后续轮次真链路复验。

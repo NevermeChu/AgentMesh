@@ -207,6 +207,7 @@ export class OpenCodeAdapter extends BaseAdapter {
           finalAnswer: parsed.output || undefined,
           role,
           reviewVerdictRequired: options.reviewVerdictRequired,
+          resourceEvidence: res.resourceEvidence,
         }),
         ...(parsed.usage ? { usage: parsed.usage } : {}),
       };

@@ -35,9 +35,11 @@ Thumbs.db
 .agentmesh/
 .zcode
 
-# docs (local-only knowledge bases stay ignored; the tracked template is referenced by AGENTS.md)
+# docs (local-only knowledge bases stay ignored; tracked entries are referenced by AGENTS.md / README)
 !docs/
 docs/*
 !docs/real-test-spec-template.md
-.tmp-probe/
+!docs/GUIDE.md
+# Local scratch directories and reference material (same convention as .prettierignore's .tmp-*)
+.tmp-*/
 reference/

@@ -51,8 +51,8 @@
 
 ## Documentation and project knowledge
 
-- Read `README.md` before changing architecture, role configuration, MCP tools, CLI behavior, session semantics, or operational procedures.
-- Update README in the same change when public behavior, parameters, compatibility, or safety boundaries change.
+- Read `README.md` and `docs/GUIDE.md` before changing architecture, role configuration, MCP tools, CLI behavior, session semantics, or operational procedures.
+- Update `README.md` (English default) and `README.zh-CN.md` (Chinese mirror) together, and `docs/GUIDE.md` for technical detail, in the same change when public behavior, parameters, compatibility, or safety boundaries change.
 - Record significant, reusable development problems in Chinese in `PROBLEMS.md`.
 - Each problem entry must contain exactly: `问题`, `根因`, `解决方法`, and `状态`.
 - Do not record trivial formatting changes, temporary debugging artifacts, transient session IDs, or facts clearer from nearby code.

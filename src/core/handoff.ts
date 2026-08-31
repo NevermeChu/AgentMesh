@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import path from "node:path";
 import type { ReviewFinding } from "../agents/types.js";
 import type { HandoffSummary } from "./types.js";
 import { truncateText } from "./text.js";
@@ -207,4 +209,266 @@ export function deriveReviewHandoff(params: {
     artifacts: files.length > 0 ? { files: [...new Set(files)] } : {},
     openItems,
   };
+}
+
+/**
+ * Typed exact-match tokens extracted from handoff or final-answer text.
+ *
+ * This is the shared primitive of the lossless-handoff verification toolchain:
+ * the offline semantic gate diffs these sets between a final answer and its
+ * handoff (a precise value present in the answer but absent from the handoff is
+ * recorded as lost), and the adversarial perturbation suite asserts that token
+ * sets change exactly as a perturbation implies. Values are kept verbatim
+ * (never normalized or lowercased) so comparisons stay exact rather than
+ * fuzzy. This is a proxy metric, not end-to-end task fidelity.
+ */
+export interface TypedTokens {
+  /** Filesystem paths (relative, absolute, or glob shapes containing a separator). */
+  paths: string[];
+  /** Version numbers: full semver (`1.2.3`, with optional prerelease) or `vN.N` forms. */
+  versions: string[];
+  /** Command invocations starting with an unambiguous CLI verb, verbatim up to the line end. */
+  commands: string[];
+  /** Standalone integer counts (including comma-grouped forms), kept as matched text. */
+  counts: string[];
+  /** Hex hashes 7–64 chars (git shas and prefixes) containing both letters and digits. */
+  hashes: string[];
+}
+
+const TYPED_TOKEN_CATEGORIES = ["paths", "versions", "commands", "counts", "hashes"] as const;
+
+const COMMAND_VERBS = [
+  "npm",
+  "npx",
+  "pnpm",
+  "yarn",
+  "node",
+  "deno",
+  "bun",
+  "git",
+  "python",
+  "python3",
+  "pip",
+  "pip3",
+  "cargo",
+  "tsc",
+  "vitest",
+  "jest",
+  "eslint",
+  "prettier",
+  "pytest",
+  "dotnet",
+  "gradle",
+  "mvn",
+];
+
+const URL_RE = /\b(?:https?|file):\/\/\S+/gi;
+const COMMAND_RE = new RegExp(`\\b(?:${COMMAND_VERBS.join("|")})\\b[^\\n;\`]*`, "gi");
+const PATH_RE =
+  /(?<![\w@.%+*/\\-])(?:[A-Za-z]:[\\/])?(?:(?:[\w@.%+-]+|\*{1,2})[\\/])+(?:(?:\*{1,2})?[\w@.%+-]+|\*{1,2})(?![\w@.%+*/\\-])/g;
+const VERSION_RE =
+  /\bv\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?\b|\b\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\b/gi;
+const HASH_RE = /(?<![\w.$/\\-])[0-9a-f]{7,64}(?![\w.$/\\-])/gi;
+const COUNT_RE =
+  /(?<![\w.$/\\-])\d{1,3}(?:,\d{3})+(?![\w.$/\\-])|(?<![\w.$/\\-])\d+(?![\w.$/\\-])/g;
+
+/** Matches after every path segment is a bare 1–3 letter word with no extension — prose like "and/or", not a path. */
+const PROSE_PATH_RE = /^(?:[a-z]{1,3})(?:\/(?:[a-z]{1,3}))+$/;
+
+function collectMatches(text: string, regex: RegExp, keep?: (match: string) => boolean): string[] {
+  const values: string[] = [];
+  for (const match of text.matchAll(regex)) {
+    const value = match[0];
+    if (value && (!keep || keep(value))) values.push(value);
+  }
+  return values;
+}
+
+function uniqueValues(values: string[]): string[] {
+  return [...new Set(values)];
+}
+
+/**
+ * Collects the matches accepted by `keep` and blanks out exactly those spans,
+ * so later categories cannot re-match inside them while rejected matches stay
+ * available (e.g. digits-only runs rejected as hashes still surface as counts).
+ */
+function collectAndErase(
+  text: string,
+  regex: RegExp,
+  keep?: (match: string) => boolean,
+): { values: string[]; text: string } {
+  const values: string[] = [];
+  const erased = text.replace(regex, (match) => {
+    if (!keep || keep(match)) {
+      values.push(match);
+      return " ".repeat(match.length);
+    }
+    return match;
+  });
+  return { values, text: erased };
+}
+
+/**
+ * Extracts typed exact-match tokens (paths, versions, commands, counts, hashes)
+ * from free-form handoff or answer text. Pure and dependency-free; tolerant of
+ * Markdown residue (backticks, paired emphasis) and CRLF line endings.
+ * Extraction order matters: paths are erased before hashes/versions/counts so
+ * hex-ish path segments and dotted versions are not double-counted; commands
+ * are reported separately while their inner values still surface in the other
+ * categories.
+ */
+export function extractTypedTokens(text: string | undefined): TypedTokens {
+  const empty: TypedTokens = {
+    paths: [],
+    versions: [],
+    commands: [],
+    counts: [],
+    hashes: [],
+  };
+  if (!text || !text.trim()) return empty;
+
+  const withoutUrls = text.replace(URL_RE, " ");
+  const commands = uniqueValues(
+    collectMatches(withoutUrls, COMMAND_RE)
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0 && value.length <= 160),
+  );
+
+  const pathStep = collectAndErase(withoutUrls, PATH_RE, (value) => {
+    if (PROSE_PATH_RE.test(value)) return false;
+    const normalized = value.replace(/\\/g, "/");
+    // Strip glob/globstar noise for the heuristic: pure short word segments
+    // with no extension or wildcard are prose ("and/or"), not paths, and so
+    // are escaped-string fragments ("1\n") whose segments are all tiny.
+    const segments = normalized
+      .split("/")
+      .filter((segment) => segment && segment !== "*" && segment !== "**");
+    if (segments.length === 0) return false;
+    if (segments.every((segment) => segment.length <= 2)) return false;
+    return !(
+      segments.every((segment) => /^[a-z]{1,3}$/.test(segment)) && !normalized.includes(".")
+    );
+  });
+  const paths = uniqueValues(pathStep.values);
+
+  const hashStep = collectAndErase(
+    pathStep.text,
+    HASH_RE,
+    (value) => /[a-f]/i.test(value) && /\d/.test(value),
+  );
+  const hashes = uniqueValues(hashStep.values);
+
+  const versionStep = collectAndErase(hashStep.text, VERSION_RE);
+  const versions = uniqueValues(versionStep.values);
+
+  const counts = uniqueValues(collectMatches(versionStep.text, COUNT_RE));
+
+  return { paths, versions, commands, counts, hashes };
+}
+
+/**
+ * One category of the typed-token diff used by the offline semantic gate.
+ */
+export interface TypedTokenDiff {
+  /** Precise values present in the source text but missing from the comparison text. */
+  missing: string[];
+  /** Precise values claimed by the comparison text that the source does not contain. */
+  extra: string[];
+}
+
+/** Computes the exact per-category set difference between two token extractions. */
+export function diffTypedTokens(
+  source: TypedTokens,
+  comparison: TypedTokens,
+): Record<(typeof TYPED_TOKEN_CATEGORIES)[number], TypedTokenDiff> {
+  const result = {} as Record<(typeof TYPED_TOKEN_CATEGORIES)[number], TypedTokenDiff>;
+  for (const category of TYPED_TOKEN_CATEGORIES) {
+    const sourceSet = new Set(source[category]);
+    const comparisonSet = new Set(comparison[category]);
+    result[category] = {
+      missing: [...sourceSet].filter((value) => !comparisonSet.has(value)),
+      extra: [...comparisonSet].filter((value) => !sourceSet.has(value)),
+    };
+  }
+  return result;
+}
+
+export interface HandoffFileGrounding {
+  /** Files claimed by the handoff that could not be located in the recorded changes or the working tree. */
+  ungrounded: string[];
+  /** Files whose existence check failed with a filesystem error (never fabricated as verified or ungrounded). */
+  unverifiable: number;
+}
+
+/**
+ * Strips vendor annotation noise from a claimed path so the underlying file
+ * reference can be judged: leading status labels ("Modified: x.ts"), trailing
+ * parentheticals ("src/x.ts (created)"), em-dash comment tails ("src/x.js —
+ * created: implements ..."), line-number suffixes ("src/x.js:36", "x.js:1-2"),
+ * and separator/"./" noise. The handoff data itself is never rewritten — this
+ * normalization applies to the grounding check only.
+ */
+function normalizePathClaim(value: string): string {
+  return (
+    value
+      .replace(/^[A-Za-z][A-Za-z'\s]{1,24}:\s+/, "")
+      .replace(/\s*\([^()]*\)\s*$/, "")
+      .split(/\s+—\s*/)[0] ?? ""
+  )
+    .replace(/:\d+(?:-\d+)?$/, "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/[/\\]+$/, "");
+}
+
+/** Splits comma-separated multi-file claims ("Decisive to read: SPEC.md, src/x.ts") into judgeable parts. */
+function splitPathClaims(value: string): string[] {
+  const normalized = normalizePathClaim(value);
+  if (!normalized.includes(",")) return normalized ? [normalized] : [];
+  return value
+    .split(/,(?=\s*\S)/)
+    .map((part) => normalizePathClaim(part))
+    .filter(Boolean);
+}
+
+/**
+ * Judges whether the files a handoff claims as artifacts can actually be
+ * located: each claim must exactly or suffix-match a recorded repository
+ * change, or exist under the session working directory. Conservative by
+ * design — a filesystem failure counts the claim as unverifiable instead of
+ * pretending it was verified or inventing an ungrounded verdict.
+ */
+export function findUngroundedHandoffFiles(
+  files: readonly string[],
+  options: { cwd?: string; changedPaths?: readonly string[] } = {},
+): HandoffFileGrounding {
+  const changed = (options.changedPaths ?? []).map(normalizePathClaim);
+  const ungrounded: string[] = [];
+  let unverifiable = 0;
+  for (const file of files) {
+    for (const claim of splitPathClaims(file)) {
+      if (
+        changed.some(
+          (changedPath) =>
+            changedPath === claim ||
+            changedPath.endsWith(`/${claim}`) ||
+            claim.endsWith(`/${changedPath}`),
+        )
+      ) {
+        continue;
+      }
+      if (options.cwd) {
+        try {
+          if (fs.existsSync(path.resolve(options.cwd, claim))) continue;
+        } catch {
+          unverifiable += 1;
+          continue;
+        }
+      }
+      ungrounded.push(claim);
+    }
+  }
+  return { ungrounded: uniqueValues(ungrounded), unverifiable };
 }

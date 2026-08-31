@@ -17,7 +17,13 @@
  * The sampler runs until the stop file appears (checked at ~200ms granularity),
  * SIGINT/SIGTERM is received, or --max-duration-ms elapses. When it stops it
  * runs an orphan check: vendor-binary processes (Name or CommandLine matching
- * the vendor regex) created inside the sampling window that are still alive.
+ * the vendor regex) created inside the sampling window that are still alive
+ * AND connected to the measured pipeline (their own pid was sampled from the
+ * seed's tree, or their ancestry reaches the seed / an observed-tree pid —
+ * dead-but-observed hops included). Unrelated same-window regex matches are
+ * counted separately (`orphans.unrelatedSameWindowMatches`) instead of being
+ * reported as orphans (R20 finding: harness tooling whose paths embed the
+ * vendor name, e.g. `.zcode\...` session dirs, used to self-match `zcode`).
  * Zero orphans is the expectation; anything else must be reported as-is.
  *
  * The real-test driver should annotate the turn's resourceEvidence with
@@ -32,8 +38,9 @@
  * - WMI counter granularity differs from Task Manager; numbers are for trend
  *   and anomaly discovery, not precise pricing or accounting.
  * - The orphan check matches vendor binaries by name/command line inside the
- *   creation window, so vendor processes started by unrelated work in the same
- *   window can surface as false positives — cross-check the command lines.
+ *   creation window but only reports pipeline-connected processes (seed-tree
+ *   ancestry); unrelated same-window regex matches are counted separately in
+ *   orphans.unrelatedSameWindowMatches for transparency.
  * - Processes that exit between ticks still appear in samples with their final
  *   cumulative counters, but may be missed entirely if they live shorter than
  *   one interval.
@@ -316,11 +323,29 @@ async function main() {
 
   const windowEnd = new Date();
   let orphans = [];
+  let unrelatedSameWindowMatches = 0;
   let orphanCheckError;
   try {
     const rows = await queryProcesses();
     const harness = harnessPids(rows);
-    orphans = rows
+    // Pids sampled from the seed's tree during the window: the measured
+    // pipeline. An orphan must belong to this pipeline (still alive now, or
+    // reachable from the current table through dead-but-observed hops).
+    const observedTreePids = new Set(perProcess.keys());
+    const byPid = new Map(rows.map((row) => [Number(row.pid), row]));
+    const isPipelineConnected = (pid) => {
+      const seen = new Set();
+      let current = Number(pid);
+      while (current && !seen.has(current)) {
+        seen.add(current);
+        if (current === seedPid || observedTreePids.has(current)) return true;
+        const row = byPid.get(current);
+        if (!row) return false;
+        current = Number(row.ppid);
+      }
+      return false;
+    };
+    const candidates = rows
       .filter((row) => !harness.has(Number(row.pid)))
       .filter((row) => {
         const created = row.created ? Date.parse(row.created) : NaN;
@@ -333,8 +358,9 @@ async function main() {
       .filter(
         (row) =>
           vendorRegex.test(String(row.name ?? "")) || vendorRegex.test(String(row.cmd ?? "")),
-      )
-      .map(normalizeSample);
+      );
+    orphans = candidates.filter((row) => isPipelineConnected(Number(row.pid))).map(normalizeSample);
+    unrelatedSameWindowMatches = candidates.length - orphans.length;
   } catch (error) {
     orphanCheckError = error.message;
   }
@@ -371,6 +397,7 @@ async function main() {
       expected: 0,
       count: orphanCheckError ? null : orphans.length,
       processes: orphans,
+      unrelatedSameWindowMatches: orphanCheckError ? null : unrelatedSameWindowMatches,
       vendorRegex: vendorRegex.source,
       ...(orphanCheckError ? { error: orphanCheckError } : {}),
     },
@@ -384,7 +411,7 @@ async function main() {
       "CPU values are cumulative process-lifetime seconds, not per-interval usage",
       "WMI counter granularity differs from Task Manager; use for trends and anomaly discovery only",
       "Windows-only (PowerShell Win32_Process)",
-      "orphan check matches vendor binaries by name/command line within the creation window; unrelated same-window vendor processes can appear as false positives — cross-check command lines",
+      "orphan check matches vendor binaries by name/command line within the creation window and the measured pipeline (seed-tree ancestry, dead-but-observed hops included); regex matches outside the pipeline are counted in unrelatedSameWindowMatches, not as orphans",
       "the sampler's own process tree (itself, ancestors, descendants) is excluded from orphan detection",
     ],
   };

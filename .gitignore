@@ -35,7 +35,9 @@ Thumbs.db
 .agentmesh/
 .zcode
 
-# docs
-docs
+# docs (local-only knowledge bases stay ignored; the tracked template is referenced by AGENTS.md)
+!docs/
+docs/*
+!docs/real-test-spec-template.md
 .tmp-probe/
 reference/

@@ -1412,3 +1412,183 @@ semver-lite：按 SPEC 实现 SemVer 2.0.0 的 parse/compare/format（ESM、零�
 | ---------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------- |
 | tester→worker 缺陷闭环                   | 从未触发 | **已触发（设计事件）**：D5-D9 5 违规 → 注入修复 → D1-D9 9/9 复测 → rev PASS                                       |
 | vendor handoff 语料（codex/claude 形态） | 无       | **BLOCKED**（codex 配额耗尽 + claude 路由失效，双证据在案；opencode 形态样本本轮已新增 5 份：w1/wA/wB/w1r18/fix） |
+
+# R19：无损交接行为差分轮（注入 vs 全量，2026-08-31）
+
+> 计划来源：reference/agentmesh-lossless-handoff-verification-plan.md §1 A3（M4）。无 codex（用户指示额度紧张）。
+> 工作区：`C:\Users\ThisMe\agentmesh-real-r19\`（out/ + review-repo/，源 trace cwd 复用 R18 inifix，未改动主项目）。
+
+## 1. 差分轮是在做什么
+
+- 源 trace：R18 w1 `bridge-sess_5ce95f5a039a`（opencode worker，2 轮，legacy-ini 分阶段修复；两轮 handoff 完整）。
+- 同一 8 问验证问卷（答案客观可判：文件/计数/命令/局限/决策依据/跨轮细节/出处），同模型双臂：
+  - **Arm A 注入路径**：`delegate_task` opencode muse-spark free，`contextSessionIds=[源会话]`，cwd=源 cwd（满足一致性校验）。
+  - **Arm B 全量基线**：同模型同卷，无注入，两轮完整 finalAnswer 逐字嵌入任务文本（≈1454 估算 token）。
+- 判分：Orchestrator 脚本化标准（full 1 / partial 0.5 / wrong 0，typed 事实精确比对），并经 agy 只读评审复核判分一致性（PASS，1 low 非阻断）。
+- 预注册断言（P1-P4）先于调用落盘：`out/r19-preregistration.json`。
+
+## 2. 上下文是否损失及程度（逐问）
+
+| 问                        | 覆盖来源      | Arm A 注入                                                                                                                                       | Arm B 全量      |
+| ------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | --------------- |
+| Q1 产物文件               | T2 handoff    | full                                                                                                                                             | full            |
+| Q2 9 pass/0 fail/2 suites | T2 handoff    | full                                                                                                                                             | full            |
+| Q3 `node --test`          | T2 handoff    | full                                                                                                                                             | full            |
+| Q4 naïve 引号局限         | T2 openItems  | full                                                                                                                                             | full            |
+| Q5 slice vs split（C-R4） | T2 decisions  | full                                                                                                                                             | full            |
+| Q6 Phase-1 行号 :36       | 仅 T1         | **partial**（表达式/文件对，行号诚实申报 `NOT IN CONTEXT`）                                                                                      | full            |
+| Q7 Phase-1 保留 quirks    | T1/T2 handoff | **partial**（漏 C-R2——但该事实在注入块内逐字存在，属 vendor 转写滑失，非可用性损失；agy 指出 T2 Goal 小节的压缩写法 "(C-R1/C-R3)" 是潜在误导源） | full            |
+| Q8 出处会话/角色/新鲜度   | T2 decisions  | full                                                                                                                                             | full            |
+| **合计**                  |               | **7.0/8（87.5%）**                                                                                                                               | **8/8（100%）** |
+
+- 结论：**handoff 覆盖的事实上注入路径零损失（与全量基线打平）**；损失集中在跨轮细节（T1-only 的行号）与一处转写滑失，等级整体评定为"轻微截断"，且无幻觉（缺失即申报 NOT IN CONTEXT，未编造）。
+- 注入审计（sidecar+audit）：strategy=handoff，估算 909 token / 预算 6000，零丢弃；注入块逐字落盘且 sha256 校验通过。
+
+## 3. 是否重复做无意义操作
+
+- 双臂均在规则约束下零文件读取、零命令执行（纯上下文作答），无重复检索；Arm A 单轮 28.8s、agy 评审 86s。无因上下文缺失被迫的重复工作；无无效重试。
+
+## 4. 暴露的问题（产品面，待修复 → 已在 R19-fix 落实）
+
+1. **取回通道承诺不可执行**（根因：SHARED_CONTEXT_INSTRUCTION 指示下游"call the `get_session_context` tool"，但 vendor CLI 根本没有 AgentMesh 的 MCP 工具——承诺了一个下游无法调用的通道）。影响：跨轮细节（Q6 行号）对下游不可达，只能靠诚实申报兜底。修复：改写指令为"缺细节时向 Orchestrator 申报缺失项，由其经 get_session_context 取回"，与本次 vendor 的实际行为一致。
+2. **P2 断言未达（预注册校准失误，非产品缺陷）**：注入载荷 909 token vs 基线 ~1454 token，比值 ≈1.6×，未达预注册的 ≥5×。归因：该 trace 的 vendor 高度遵循 handoff 契约（finalAnswer≈handoff），且 transcript 仅 2 轮——节省倍数随轮数与 legacy 轮占比增长，2 轮紧凑会话本身放大不了倍数。如实记录为预注册断言 FAIL。
+3. **Q7 转写滑失**：vendor 在事实逐字可用的前提下漏写 C-R2（agy 定位到 Goal 小节压缩写法的误导性）。属 vendor 行为边界，AgentMesh 不修（诚实边界：管道忠实性已由 B3 套件保证）。
+
+## 5. 资源与清理
+
+- 外部采样器（scripts/resource-sampler.mjs，3s 间隔）双臂各挂载一次：armA ticks=6、treePeakRss≈934MB、孤儿进程 0；armB 同格式记录于 out/。
+- 会话与证据：out/ 保存原始响应、store dump（含 contextSources/handoff/audit/证据链）、assertions、双臂回答全文；review-repo 提交评审材料（未推送）。主项目源码本轮零改动。
+
+## 6. 结论
+
+四层 gate 首次全部有实测数据点：结构/证据/语义三层为离线基线（reference/lossless-gates-baseline-r16-18.json），行为层由本轮补齐——**注入路径在 handoff 覆盖事实上与全量基线等效（P1 通过），token 成本在本 trace 形态下 ≈1.6×（P2 未达预注册倍数，已归因），跨轮细节损失以诚实申报收场（P3 证实取回通道缺口）**。后续：修复指令文本（R19-fix），再做 10 轮复杂任务闭环测试（R20 起，agy worker + opencode reviewer/tester）。
+
+# R20 十轮复杂任务闭环战役（agy worker + opencode reviewer/tester，2026-08-31 起）
+
+> 设计：每轮独立 git 工作区（round-NN/lab），SPEC.md 由 Orchestrator 预植为唯一权威；流程 worker(agy) → review(opencode muse free, 注入 worker) → tester(opencode, 注入 worker+reviewer) → 缺陷时 continue_task(worker, 注入 tester+reviewer) → retest(tester 续会话)。
+> 会话存储：`agentmesh-real-r20-29/out/sessions-campaign.json`；每轮证据 dump 于 out/store-NN-\*.json。codex 全程零调用。
+
+## Round 01：strtemplate 模板引擎（原型链泄漏缺陷闭环 ✅）
+
+- **worker** agy `bridge-sess_f6d6e12c3a58`：125.4s，31 测试自检全绿，handoff 完整（decisions=3/files=4/openItems=1）。
+- **reviewer** opencode `bridge-sess_43ce59631b76`（contextSessionIds=[worker]，注入 651 tok 零丢弃）：PASS + 非阻断 finding——**medium：C6 原型链泄漏**（`first in scopeVal` 使 `{{toString}}` 渲染继承函数，违反"未知路径渲染空串"契约）。
+- **tester** opencode `bridge-sess_7a731f5b2fbe`（contextSessionIds=[worker,reviewer]，注入 1317 tok）：独立 71 向量探测 69 PASS / **2 FAIL**——独立复现了 reviewer 的原型链泄漏（跨 Agent 交叉印证），并报 2 个 low（SPEC 未定义行为：`{{this}}` 于块外、块内路径解析）。
+- **fix** continue_task(worker, contextSessionIds=[tester,reviewer])：49.9s，修复原型泄漏等缺陷，测试 31→34。
+- **retest** tester 续会话（contextSessionIds=[worker]）：40.8s，**46 项针对性复探 46/46 PASS**，"所有先前缺陷确认修复，无新偏差"。
+- 资源：worker 采样 ticks=27、treePeakRss≈694MB；检出 2 个"孤儿"实为 Orchestrator 自身并发 ZCode shell（cmd 行可见），非 vendor 泄漏——采样器并发噪音，如实记录。
+- **本轮暴露问题**：①（产品面，已属既知）agy worker 一次过实现 34 测试规模的引擎但原型链边界出错——独立评审+测试双通道均捕获，缺陷闭环按设计工作；② tester 的独立探测（71 向量）显著强于 worker 自测（31 向量），印证"tester 必须自带探测而非复跑套件"的 prompt 设计。
+
+## Round 02：csvstats RFC4180 解析器（一次过 ✅，零缺陷闭环）
+
+- **worker** agy `bridge-sess_4c8ae104a44e`：一次通过。自建 35 测试全绿。
+- **reviewer** opencode `bridge-sess_5282bc28eee2`（注入 worker）：PASS（35/35 独立复跑 + 源码逐向量核对），3 条 low——裸 `\r` 终止符超规格宽松、空白串统计口径、闭引号后尾随字符（三者均在 RFC4180 未定义区，实现选择了可互操作行为并在注入的 openItems 申报）。
+- **tester** opencode `bridge-sess_b666b6d09f50`（contextSessionIds=[worker,reviewer]）：独立复现 35/35（2×）+ 26 向量 ad-hoc 探测全 PASS（其中 1 次为测试脚手架自身转义错误、tester 自行纠正后通过——记录为 tester 过程噪声而非产品缺陷）。
+- 无 medium/critical → 不触发 fix 环。上下文链 worker→reviewer→tester 注入零丢弃（strategy=handoff）。
+- **本轮观察**：vendor 对 SPEC 未定义区（RFC4180 空隙）的裁量全部如实申报在 openItems，交接信号通道按设计工作；tester 脚手架转义错误与其自纠过程留在证据链中（out/store-02-\*.json），不粉饰。
+
+## Round 03：ratelimit 令牌桶+滑窗限流器（一次过 ✅）
+
+- **worker** agy `bridge-sess_7cf18d85f25f`：26 测试自检全绿（含注入假时钟的全部向量）。
+- **reviewer** opencode `bridge-sess_d5cfe1568a3c`：PASS；2 条 low 指向 SPEC 未定义区（refillPerSecond=0 时 retryAfterMs=Infinity 未文档化；滑窗 weight>limit 返回 Infinity 而非 bucket E4 的 RangeError——非对称性）。 reviewer 还特别核验了 per-key Map 对 `__proto__`/`toString` 键的安全性。
+- **tester** opencode `bridge-sess_803883fcd29f`（contextSessionIds=[worker,reviewer]）：C1-C10 逐条 CONFORM（含 600ms→0.6 分数累加、边界 61000ms 过期、retry 2000 精确值），并复检 epsilon 1e-9 实现细节。无阻断项。
+- **本轮观察**：worker 对"假时钟注入"契约的遵循（所有时间决策走 now()）被三方独立验证；low 项均为 SPEC 留白而非实现缺陷——SPEC 预注册（先写清错误类型边界）的价值在 E1-E4 区得到体现。
+
+## Round 04：jpath JSONPath-lite 查询引擎（C6 文档顺序违规 → 闭环 ✅）
+
+- **worker** agy `bridge-sess_cc30acec2fc7`：66 测试自检全绿，但 **`..` 递归下降的文档顺序实现错误**（父键先于子键输出：`{a:{price:1},price:5}` 的 `$..price` 得 `[5,1]` 而非 `[1,5]`）——其自带 fixture 恰好对顺序不敏感，自测无法发现。
+- **reviewer** opencode（注入 worker）：PASS 但 low finding 精确指出该顺序缺陷的代码位置（`collectRecursiveProperty` 先 push 后递归）。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：将 reviewer 的 low 证据升级为 **C6 VIOLATION**（预注册向量明确要求 document order）——reviewer→tester 的证据接力把"风格问题"正确升级为"契约违规"。
+- **fix**（continue_task worker，注入 tester+reviewer）：68 测试（+2 顺序回归测试）；**retest**（tester 续会话）：prior defects resolved，仅剩 SPEC 未行使的宽松项（trailing-colon）如实保留为 intentional。
+- **本轮暴露问题**：worker 自测对"顺序语义"盲——测试fixture 设计回避了自己实现的不对称性；第三方独立探测是唯一拦截手段。这正是 reviewer+tester 双通道的价值实证。
+
+## Round 05：confiload 分层配置加载器（原型污染缺陷 → 闭环 ✅）
+
+- **worker** agy `bridge-sess_c0b2af8f69b5`：18 测试自检全绿。
+- **reviewer** opencode `bridge-sess_5e8e62945e10`：PASS 但 **medium：merge/deepClone 未防护 `__proto__`/`constructor`/`prototype` 键——原型污染**（SPEC 未列，但"Node 配置加载器应防护"）；另有 `$$` 转义范围过宽的 low。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：独立 probe 复现同一污染缺陷（medium）+ 2 low，与 reviewer 交叉印证。
+- **fix**（worker 续会话，60.4s）：加污染防护 + 收窄 `$${` 转义作用域 → 20 测试（+2）；**retest**：pollution 与 scoped escape PASS，数组错误路径保留为 documented spec-ambiguous。
+- **本轮暴露问题**：SPEC 未覆盖的安全边界（原型污染）由 reviewer/tester 主动越出文本补位捕获——独立评审的价值不限于字面 SPEC；同时也提示未来 SPEC 模板应内建"不可信键名防护"条款。
+
+## Round 06：mdtable Markdown 表格转换器（一次过 ✅）
+
+- **worker** agy `bridge-sess_2538e2399412`：20 测试自检全绿（含转义管道、对齐解析、RFC4180 CSV 输出）。
+- **reviewer** opencode：PASS；low——表体行终止条件（空行或无未转义管道）会把紧邻的含管道散文/第二张表误吸为数据行；tester 判定按 SPEC 字面不构成违规（SPEC 说"Recognizes ONE table"但未定义终止边界），留作 documented assumption。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：复核确认 + 1 条 low（`\<char>` 非转义序列保留原样——未文档化但合理）。
+- 无 fix 环。**本轮观察**：SPEC 措辞的边界（"一行表"的终止语义）是歧义温床；按 AGENTS.md 规则这类歧义本应由 Orchestrator 在 SPEC 预注册时钉死——记录为任务设计教训（P0-SPEC 条款模板改进方向）。
+
+## Round 07：fsm 层级状态机（一次过 ✅）
+
+- **worker** agy `bridge-sess_ee6fd64685ca`：17 测试自检全绿（守卫/动作顺序、父继承/子覆盖、定时器、dispose）。
+- **reviewer** opencode `bridge-sess_23cd5dc36a36`：PASS；3 条 low（onError 吞异常、guard 抛错绕过 onError、handler 查找比 SPEC 的 map-only 宽松）——均在 SPEC 未要求区。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：逐条复核 reviewer 的 low 项并确认非违规，C1-C10 全 CONFORM。
+- 无 fix 环。5/7 轮一次过、2/7 轮缺陷闭环——独立评审的发现率与严重度分级到目前为止与实际风险匹配。
+
+## Round 08：linediff Myers 行差异（一次过 ✅）
+
+- **worker** agy `bridge-sess_d1d58130ec98`：20 测试自检全绿（hunk 算术、上下文合并、空文件 0,0 约定、最小编辑脚本）。
+- **reviewer** opencode `bridge-sess_f295688df576`：PASS；low——多尾随换行语义未文档化（`"a\n\n"` vs `"a\n"` 产生幻影空行删除，符合 SPEC 单换行措辞但超出未定义）；context 拒绝非整数浮点比 SPEC 更严格。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：全部 CONFORM，carried low 逐条复核。无 fix 环。
+
+## Round 09：schedsim 抢占式优先级调度模拟（一次过 ✅）
+
+- **worker** agy `bridge-sess_b09905dcddb0`：18 测试自检全绿（含 10 向量黄金时间线逐步核对、timeUnit=2 量化、抢占/复用事件语义）。
+- **reviewer** opencode `bridge-sess_ba08e493a21f`：PASS；low——`remainingTime===0` 精确等值在分数 burst×timeUnit 下有浮点残差风险（SPEC 向量全为整数不触发）、options=null 宽松回退。
+- **tester** opencode（contextSessionIds=[worker,reviewer]）：逐向量 CONFORM，建议 `<=1e-9` 硬化但确认无向量违规。无 fix 环。
+
+## Round 10：qsbuild 深层查询串构建器（双 medium 缺陷 → 闭环 ✅）
+
+- **worker** agy `bridge-sess_35fff4bdedae`：23 测试自检全绿。
+- **reviewer** opencode `bridge-sess_fa0e95550cb2`（注入 645 tok）：PASS 但 **2 个 medium**——① trie 节点用字符串哨兵 `_isLeaf`，与用户键名冲突产生**顺序依赖的假 "Path conflict"**（`build({_isLeaf:1, a:{b:1}})` 报错而键序反转后成功）；② 对象数组 `build({ids:[{a:1}]})` 抛出 SPEC 未定义的硬 TypeError。
+- **tester** opencode（contextSessionIds=[worker,reviewer]，注入 1667 tok）：独立复现两个 medium（并显式引用 reviewer 会话 MATCHED 新鲜度），5 处 VIOLATION 提及。
+- **fix**（worker 续会话 45.6s）：哨兵改 Symbol/Map、数组行为文档化 → 25 测试（+2）；**retest**（tester 续会话 35.1s）：所有先前缺陷 PASS，无新偏差。
+- **本轮暴露问题**：内部实现哨兵泄漏到用户数据空间（字符串键 trie 的经典陷阱）——agín 由独立评审捕获而非 worker 自测；对象数组行为属 SPEC 留白，worker 修复时选择了"明确报错+文档化"而非静默扩展（合理裁量）。
+
+# R20 战役收官：交接质量分析（AGENTS.md 五问）
+
+## 1. 小任务是在做什么
+
+10 个相互独立的"从零实现"复杂小任务（模板引擎 / CSV 统计 / 限流器 / JSONPath / 分层配置 / Markdown 表格 / 层级状态机 / Myers diff / 调度模拟 / 查询串构建器），每轮 SPEC.md 预植为唯一权威、含 C1-C10 验收向量与 E1-E4 错误契约。Worker（agy）实现 → Reviewer（opencode muse free）独立评审 → Tester（opencode，独立探测）→ 缺陷时 continue_task 修复 → retest 确认。验收 = SPEC 全向量过 + 三方无阻断分歧。
+
+## 2. 上下文是否损失及程度
+
+- 38 个 turns 中 28 个带 `contextSources` 注入（全部 worker→reviewer→tester 前向链 + 修复环反向链），28 份 sidecar 逐字审计全部 sha256 验证通过（audit 脚本 + store dump 在案），**strategy 全部为 handoff、droppedSections 全部为空**（单源注入远低于 6000 token 预算，最大单块 1667 tok）。
+- 抽查各轮 reviewer/tester 的最终回答：均能逐向量引用 worker 实现的具体行号与向量 id（如 R01 tester 引用 `src/strtemplate.js:216`、R05 引用 `172-200`），并显式标注来源会话（"carried from bridge-sess*…" / "Reuses bridge-sess*…"）。**判定：无损**。R19 的跨轮细节损失模式（更早轮仅剩索引）在本战役未复现——每轮会话通常 1 个注入源、最新轮 handoff 即全部有效信息。
+
+## 3. 是否重复做无意义操作
+
+- 无。reviewer 与 tester 对同一模块的两次独立验证属设计要求（评审=契约符合性，测试=独立探测），二者发现交叉印证而非重复：R01 tester 的 71 向量探测捕获了 reviewer 的同一缺陷并升级；R04 tester 将 reviewer 的 low 升级为 C6 VIOLATION。修复环（4 轮）全部由真实缺陷触发，retest 均为针对性复探（R01: 46/46 PASS）而非全量重跑。
+
+## 4. 暴露的问题（汇总）
+
+| #   | 问题                                                                                                                                                                             | 根因                                                                                            | 影响                                   | 归属                       | 证据                                                          |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | -------------------------------------- | -------------------------- | ------------------------------------------------------------- |
+| 1   | worker 自测对"顺序语义/内部哨兵"盲（R04 C6、R10 \_isLeaf 均未被子测拦截）                                                                                                        | fixture 由实现者自写，回避了自己实现的缺陷                                                      | 全靠独立评审/测试兜底                  | 任务设计（非 AgentMesh）   | store-04/10-\*                                                |
+| 2   | SPEC 未定义安全边界（R05 原型污染）与留白区（R02 RFC4180 空隙、R08 多换行）反复出现                                                                                              | SPEC 模板无"不可信键名防护"等固定条款                                                           | reviewer/tester 主动补位，但依赖其自觉 | 任务设计                   | store-05-\*                                                   |
+| 3   | 采样器把 Orchestrator 自身并发 shell 误计为孤儿（每轮 orphans=2，cmd 行可辨识）                                                                                                  | 采样种子进程树包含 ZCode 工具 shell                                                             | 资源证据需人工甄别                     | 外部采样器（P-067 已知域） | sampler-\*.json                                               |
+| 4   | 战役 38 轮零失败、零 eligibility 错误；分析期间曾把 R19 store 中 R18 时期遗留的失败会话（Eligibility check EOF，antigravity tester）误读为本轮事件，经 session-id 逐一核对后纠正 | 证据甄别错误（分析层，非系统层）：campaign store 复用了 R18 sessions 文件作为基底，历史会话混入 | 无（未写入任何结论）                   | Orchestrator 分析流程      | sessions-campaign.json（0 failed/38）+ sessions-r19.json 对照 |
+
+## 5. 资源与清理
+
+- 外部采样器逐 worker 轮挂载：ticks 27-46，treePeakRss 稳定在 ~775-934MB（含 Orchestrator 自身 Node 进程基线），**未发现真实 vendor 孤儿进程**（orphan 计数均为上述噪音，cmd 行逐一甄别）。
+- 38 turns 总执行时长 ≈78 分钟 vendor 时间；零超时、零取消、零 transport fallback（全部 mode=cli 显式指定）。
+- 清理：10 个 lab 工作区保留全部实现与测试（未提交 git，保持证据原样）；out/ 保留全部 38 turn 的 store dump、原始 MCP 响应、assertions、采样 JSONL；主项目源码仅 R19-fix 三处改动且 `npm run check` 全绿；codex 全程零调用。
+
+## 覆盖矩阵更新（R20 后）
+
+| 路径                                       | R18 前               | R20 后                                                   |
+| ------------------------------------------ | -------------------- | -------------------------------------------------------- |
+| 跨 vendor 缺陷闭环（tester→worker→retest） | 1 轮（R18 设计事件） | **4 轮真实触发**（R01/R04/R05/R10），retest 全部确认修复 |
+| reviewer 发现被 tester 独立证实            | 未记录               | 3 次（R01 原型链、R05 污染、R10 哨兵冲突）               |
+| agy 作为 worker 的长复杂任务能力           | 无                   | 10 轮全部 SUCCESS，平均单轮 5-8 分钟                     |
+| 注入链 sidecar 逐字审计                    | 人工抽查             | 28/28 自动验证通过、零丢弃                               |
+
+# R20 暴露问题的修复落实（2026-08-31）
+
+| 暴露问题                                                   | 修复动作                                                                                                                                                                   | 验证                                                                                                         |
+| ---------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| 采样器孤儿误报（每轮 orphans=2 均为 Orchestrator shell）   | `scripts/resource-sampler.mjs` 孤儿判定增加管线连通性准则（种子树观测成员或祖先链可达，含断链回退）；无关同窗匹配降级为 `unrelatedSameWindowMatches` 旁证计数              | 冒烟三路径：clean 0/0、leak=1 检出、R20 复现场景 orphans=0 + unrelated=2（`out/smoke-*`）；PROBLEMS.md P-072 |
+| SPEC 未定义区 / 安全条款缺失（R05 污染、R02/R06/R08 留白） | 新增 `docs/real-test-spec-template.md`：M1 不可信键防护、M2 顺序语义、M3 未定义区策略、M4 边界语义、M5 往返声明、M6 worker 反盲区自测段；后续真实测试轮 setup 阶段强制并入 | 模板条款逐一对应 R01/R04/R05/R10 缺陷形态，均可源头拦截                                                      |
+| worker 自测盲区（R04/R10 缺陷过自测）                      | 并入模板 M6（顺序敏感断言、宿主键断言、边界断言、SPEC 逐节自查申报四项强制自测）+ M2 强制顺序向量                                                                          | 同上；结构性兜底仍是 reviewer/tester 双通道（战役已实证）                                                    |
+| 证据归属混叉（campaign store 跨轮行混入单轮 dump）         | `driver-r20.mjs` dumpRoundStore 按 lab cwd 打 `roundTag`，新增 `retag` 阶段重派生全部带标签视图（源 store 不可变）                                                         | 10/10 轮 retag 后行数与 turn 数吻合（5/3/3/5/5/3/3/3/3/5=38）                                                |
+| 取回通道承诺不可执行（R19，产品面）                        | 已在 R19-fix 修复（见 P-071），本轮无新增动作                                                                                                                              | 回归测试 + npm run check 全绿                                                                                |
+| vendor 转写滑失（R19 Q7）、P2 断言校准                     | 不修（vendor 语义层边界 / 预注册以 FAIL 如实在案）                                                                                                                         | B3 管道忠实性套件覆盖管道侧；vendor 侧无修复声明                                                             |

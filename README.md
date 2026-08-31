@@ -24,7 +24,7 @@
 
 - **不是编排器**：任务拆分、阶段顺序、重试决策归外部 Orchestrator 所有。AgentMesh 只负责角色解析、执行、会话和规范化交接，不内置 DAG、调度策略或自动重试。
 - **不是守护进程**：没有独立后台 daemon，执行生命周期跟随 MCP stdio 连接；Orchestrator 断开会中止在途任务。这是当前设计，不是缺陷。
-- **不是双向消息通道**：`delegate_task` 是 turn 边界的一次性调用，不支持 mid-turn 注入或 Agent 间自由对话；跨角色通信只有 `contextSessionId` 规范化上下文交接一条路，也不存在 Agent 间的回环消息路由。
+- **不是双向消息通道**：`delegate_task` 是 turn 边界的一次性调用，不支持 mid-turn 注入或 Agent 间自由对话；跨角色通信只有规范化上下文交接（`contextSessionId` 单源兼容形式 / `contextSessionIds` 多源一手注入）与 `get_session_context` 按需取回两条只读通道，也不存在 Agent 间的回环消息路由。
 - **不是安全沙箱**：`prompt-only` 适配器没有任何运行时强制力（见 P-006/P-010）；Reviewer `best-effort` 只做执行前后指纹比对以检测误写，不阻止写入。需要硬边界时配置 `safety: enforced` 或使用 Codex Reviewer。
 - **不管凭证与额度**：不做登录代理、不缓存或转发 token、不感知订阅配额窗口；额度耗尽表现为 vendor 的结构化失败诊断，由调用方决定是否改派其他 Agent。
 - **不承诺 vendor 行为兼容**：厂商 CLI 参数、输出格式或 MCP schema 变化导致的不兼容，以结构化诊断如实报告并记录在 PROBLEMS.md，不做静默绕过或参数猜测。
@@ -83,12 +83,14 @@ Supported Agent Adapters & System Status:
 NAME            DISPLAY NAME                       STATUS        PREFERRED   PATH / NOTE
 -----------------------------------------------------------------------------------------------
 codex           OpenAI Codex                       [AVAILABLE]   MCP         D:\Work\Env\global_modules\npm_global\codex.cmd
-claude          Anthropic Claude Code              [AVAILABLE]   MCP         D:\Work\Env\global_modules\npm_global\claude.cmd
-antigravity     Google Antigravity (AGY / Gemini)  [MISSING]     CLI         Binary 'agy' was not found in system PATH.
+claude          Anthropic Claude Code              [AVAILABLE]   CLI         D:\Work\Env\global_modules\npm_global\claude.cmd
+antigravity     Google Antigravity (AGY / Gemini)  [MISSING]     CLI         Binary 'agy' (or 'gemini') was not found in system PATH.
 grok            xAI Grok                           [MISSING]     CLI         Binary 'grok' was not found in system PATH.
 opencode        OpenCode                           [MISSING]     CLI         Binary 'opencode' was not found in system PATH.
 zcode           ZCode                              [MISSING]     CLI         Binary 'zcode' was not found in system PATH.
 ```
+
+（`PREFERRED` 列取自适配器声明：codex 为 MCP 优先，其余均为 CLI；`PATH / NOTE` 随本机安装状态而变，上图为示例形态。）
 
 ---
 
@@ -118,23 +120,6 @@ agentmesh debug continue bridge-sess_8f3d1a "继续诊断"
 ### 项目级角色映射 (`.agentmesh/config.json`)
 
 在用户项目根目录创建 `.agentmesh/config.json`：
-
-```json
-{
-  "version": 1,
-  "roles": {
-    "orchestrator": "antigravity",
-    "worker": "antigravity",
-    "reviewer": {
-      "agent": "claude",
-      "mode": "cli",
-      "timeoutMs": 300000,
-      "safety": "best-effort"
-    },
-    "tester": "claude"
-  }
-}
-```
 
 ```json
 {
@@ -221,7 +206,8 @@ agentmesh capabilities show
    - 查询指定 Bridge Session 的执行历史与元数据。
    - 参数：`sessionId` (必填)。
 6. **`get_session_context`**
-   - 按轮读取一个 Bridge Session 的记录内容：默认返回该轮的结构化 handoff（goal/decisions/artifacts/open items），也可按 `fields` 取回完整 `finalAnswer`、`findings` 或执行证据，并附当前工作树下的 `MATCHED`/`STALE`/`UNKNOWN` 新鲜度。这是 handoff 优先注入的按需取回通道：下游需要上游细节时调用本工具，而不是要求 AgentMesh 把全文灌进每个 prompt。
+   - 按轮读取一个 Bridge Session 的记录内容：默认返回该轮的结构化 handoff（goal/decisions/artifacts/open items），也可按 `fields` 取回完整 `finalAnswer`、`findings` 或执行证据，并附当前工作树下的 `MATCHED`/`REWOUND`/`STALE`/`UNKNOWN` 新鲜度。这是 handoff 优先注入的按需取回通道：下游需要上游细节时调用本工具，而不是要求 AgentMesh 把全文灌进每个 prompt。
+   - 未命中（session 不存在 / 无轮次 / `turnIndex` 越界）时返回结构化 `CONTEXT_INSUFFICIENT` 形态：文本追加 `Context Status: CONTEXT_INSUFFICIENT — missing: session|turns|turn`，程序化调用方可读取 `code` 与 `missing` 字段。成功返回在新鲜度非 `MATCHED` 时附带可选 `sufficiency` 判定（`VERIFY_REQUIRED` / `INSUFFICIENT` 与原因列表），响应文本同步追加"先重验再采信"提示行。
    - 参数：`sessionId` (必填), `turnIndex` (可选，1-based，缺省为最后一轮), `fields` (可选，`handoff` | `finalAnswer` | `findings` | `evidence` 的数组，缺省 `["handoff"]`)。
 7. **`get_role_config`**
    - 加载并校验项目 `.agentmesh/config.json`，返回当前角色到 Agent 的映射。
@@ -257,9 +243,9 @@ continue_task(Worker Session, contextSessionIds=[Reviewer Session, Tester Sessio
 
 这段调用顺序由 Orchestrator 决定；AgentMesh 不会再建立第二套自动工作流状态机，也不会把 Reviewer/Tester 结果自动追加到 Worker Session。
 
-`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的交接上下文**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `STALE` / `UNKNOWN` 新鲜度（置于块尾）——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。
+`contextSessionIds`（最多 4 个）按给定顺序把多个来源 Session 的交接上下文**一手**注入目标 prompt，每个来源渲染为带独立标签的块（Session ID、Agent、轮数）并**各自计算** `MATCHED` / `REWOUND` / `STALE` / `UNKNOWN` 新鲜度（置于块尾）——接收方可以精确知道哪些来源可信、哪些需要重验，而不必经过 Orchestrator 在任务文本里转述。
 
-注入采用 **handoff 优先**策略并以 token（估算值，非字符数）为预算（默认总预算 6000 token，按源均分、单源下限 1200）：每个来源**完整内联最近一轮的结构化 handoff**（goal、关键决定、产物文件/命令、未决事项），更早轮次只保留一行索引（`[Turn N | role | status] goal`）；历史条目没有 handoff 时（旧会话或 vendor 未遵循报告契约）回退为精简的 legacy 轮次回放（`Final answer` 截断到 1200 字符）。超预算时按"先丢复现细节、后丢结论"的固定顺序丢弃（Tests → Open Items → Commands → Files → Decisions → Findings → 证据 → 最终硬截断），实际丢弃的章节记录在该轮 `sharedContextAudit.droppedSections` 中，审计还记录 `strategy`（`handoff` | `legacy`）、`estimatedTokens` 与 `injectedOwnHistory`；被裁剪的信息不会丢失——下游可用 `get_session_context` 取回全文。该轮实际注入了哪些来源仍记录在 `contextSources` 字段中。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
+注入采用 **handoff 优先**策略并以 token（估算值，非字符数）为预算（默认总预算 6000 token，按源均分、单源下限 1200）：每个来源**完整内联最近一轮的结构化 handoff**（goal、关键决定、产物文件/命令、未决事项），更早轮次只保留一行索引（`[Turn N | role | status] goal`），并显式列出**已知失败尝试**（`Known failed attempts (do not repeat):`，逐条 `[Turn N | role] 任务摘要`），避免下游重复踩坑——该列表属于低优先级可丢弃段，超预算时先于最近一轮的任何章节被丢弃。历史条目没有 handoff 时（旧会话或 vendor 未遵循报告契约）回退为精简的 legacy 轮次回放（`Final answer` 截断到 1200 字符）。超预算时按"先丢复现细节、后丢结论"的固定顺序丢弃（更早轮次索引 → 失败尝试列表 → Tests → Open Items → Commands → Files → Decisions → Findings → 证据 → 最终硬截断），实际丢弃的章节记录在该轮 `sharedContextAudit.droppedSections` 中，审计还记录 `strategy`（`handoff` | `legacy`）、`estimatedTokens` 与 `injectedOwnHistory`；被裁剪的信息不会丢失——`get_session_context` 可按轮取回全文；由于接收方 vendor Agent 并不拥有 AgentMesh 的 MCP 工具（R19 真实测试结论），注入指令会把取回请求路由给 Orchestrator（"申报缺失项，由 Orchestrator 经 `get_session_context` 取回"），而不是让 vendor 直接调用该工具。该轮实际注入了哪些来源仍记录在 `contextSources` 字段中。`contextSessionId` 仍是可用的单源兼容形式。会话自身的原生续接与外部来源注入是并存的：`continue_task` 有原生 Session ID 时只免除自身历史的注入，`contextSessionIds` 指定的其他来源照常注入。
 
 **Handoff 契约（写端）**：`delegate_task`/`continue_task` 的 worker 与 tester prompt 末尾会附加固定的 Handoff Report 契约（Reviewer 除外，其输出由严格的 PASS/FAIL findings 契约约束），要求 vendor Agent 在最终回答结尾以固定小节（`## Goal` / `## Decisions` / `## Files` / `## Commands` / `## Tests` / `## Open Items`）收尾并保持简洁；`Goal` 是 agent 自报的一句话目标，注入时优先生效（缺省回退为任务首行，而非整段任务文本）。runner 由此解析出每轮的 `handoff` 结构存入会话历史（解析失败时该轮无 `handoff`，注入自动回退 legacy 渲染）；解析会剥离列表项中的 Markdown 链接包装与反引号。长度约束在源头生效，接收端不再依赖大字符截断。契约同时明确要求：**若 SPEC 或任务文本自身矛盾或不可实现，vendor 必须最先在 Open Items 小节申报——SPEC 矛盾优先于任何实现缺陷**。**Reviewer 轮次的 handoff 无需额外契约**：runner 会从解析出的 PASS/FAIL 裁决与 findings 确定性派生（outcome 映射裁决、keyDecisions 记录裁决摘要、openItems 列出 findings、files 汇总涉及文件），使下游注入同样紧凑。
 
@@ -271,7 +257,9 @@ Handoff: goal=<截断80字>; decisions=N; files=N; commands=N; openItems=N
 
 当 `openItems>0` 时额外追加提示行 `⚠ N open item(s) reported — review before chaining further work (see get_session_context)`；`openItems=0` 时该提示行不出现。Orchestrator 应把 `openItems>0` 视为**需要人工裁决的信号**——包括 vendor 依据契约申报的 SPEC 自身矛盾——不必逐轮调用 `get_session` 才能发现未决事项。程序化调用方也可直接读取返回 `AgentResult.handoff` 结构（与会话历史中的 handoff 同源同值）。
 
-每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前指纹与各来源 Session 最后一轮指纹比较，明确标记为 `MATCHED`、`STALE` 或 `UNKNOWN`：只有 `MATCHED` 可以直接复用已有结论，`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。仓库自带可复用的外部采样器 `scripts/resource-sampler.mjs`（Windows，经 PowerShell `Win32_Process` 批量采样种子 PID 的进程树 CPU 累计秒/RSS/命令行，输出 JSONL 与汇总，并在管线结束时做 vendor 孤儿进程检测；采样间隔、stop 文件与汇总路径详见脚本头注释），真实测试轮可将其挂载取证，并在 `resourceEvidence.note` 标注 `external sampler: <jsonl path>`（对应 `collection: "external"`）；采样粒度与计数局限以汇总内 `limitations` 为准。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）或 `get_session_context(fields=["finalAnswer"])`（截断到 24000 字符）。
+**Handoff 落盘一致性（Warning 级）**：runner 记录轮次时会把 handoff 声称的 `artifacts.files` 逐项与该轮记录的 `repositoryAfter.changedPaths`（精确/后缀匹配）及会话工作目录下的实际存在性比对；未命中者构成 `ungroundedFiles`，在返回文本的 `Warning:` 段追加 `Handoff grounding: N of M reported file(s) were not found ... treat the handoff artifact list as unverified`（文件系统检查失败时按不可验证如实计数，不伪造结论）。这是对"vendor 报告产物未真正落盘"这一已知失败模式的产品化提示：Warning 只影响信任，不改变轮次状态，也不写入会话历史 schema。
+
+每次执行都会在 Session 历史中记录调用前后的 Git HEAD、工作树内容指纹、变更文件、传输方式、退出码和耗时。交接时 AgentMesh 将当前工作树与各来源 Session 记录的各轮指纹比较，明确标记为 `MATCHED`、`REWOUND`、`STALE` 或 `UNKNOWN` 四种处置语义：`MATCHED` 可以直接复用已有结论；`REWOUND` 表示工作树回到了**更早某轮**的已记录状态（git reset/revert 后常见），复用那一轮的结论是安全的，但其后各轮的证据已过期；`STALE` 只要求重新验证受影响的证据，从而减少无关的重复检查。旧 Session 没有证据字段时仍可加载，但交接状态为 `UNKNOWN`。执行超时或客户端取消时，历史证据还会记录 `timedOut`/`aborted`、取消原因（含服务端断连的 `client_disconnect`）以及平台相关的进程树清理方式和结果；`auto` 模式发生传输回退时会持久化结构化 `transportFallback` 证据。执行证据中的 `resourceEvidence` 默认采集 AgentMesh 进程自身的 CPU 用户/系统时间和结束时 RSS，并明确标记 `collection: "process"`；它不代表 vendor 子进程或进程树峰值。资源 CPU/RSS 未能采集时不会伪造为 0；需要 vendor/process-tree 曲线、孤儿进程和高水位采样时应使用外部监控，并在报告中记录采样方法与局限。仓库自带可复用的外部采样器 `scripts/resource-sampler.mjs`（Windows，经 PowerShell `Win32_Process` 批量采样种子 PID 的进程树 CPU 累计秒/RSS/命令行，输出 JSONL 与汇总，并在管线结束时做 vendor 孤儿进程检测——孤儿判定要求进程与被测管线连通（种子树窗口内观测成员，或祖先链可达种子/被观测 pid，含断链回退）；与管线无关的同窗正则匹配单独计入 `orphans.unrelatedSameWindowMatches`，不混入孤儿计数（P-072）；采样间隔、stop 文件与汇总路径详见脚本头注释），真实测试轮可将其挂载取证，并在 `resourceEvidence.note` 标注 `external sampler: <jsonl path>`（对应 `collection: "external"`）；采样粒度与计数局限以汇总内 `limitations` 为准。Orchestrator 需要完整未截断的 `finalAnswer` 时应调用 `get_session`（Session 存储保留全文；工具响应中的 `Final Answer` 截断到 12000 字符）或 `get_session_context(fields=["finalAnswer"])`（截断到 24000 字符）。
 
 Session 持久化有容量上限以防止 `sessions.json` 无界增长：每个会话默认保留最近 50 轮历史（更早轮次按时间丢弃），存储整体默认保留最近更新的 200 个会话（超出按 LRU 逐出）。两个上限均可通过程序化 `SessionManagerOptions` 调整，设为 `0` 表示不限制。
 
@@ -322,7 +310,7 @@ MCP 工具响应在 `Summary` / `Final Answer` 之外，还会包含截断到 80
 
 真实链路中还观察到几类可影响可复核性的 vendor 限制，AgentMesh 不做静默修补，只如实记录：
 
-- **Antigravity CLI 的临时测试产物无法写入工作区**：实测中 Antigravity Tester 运行对抗/临时测试时，其 `write_to_file` 工具要求产物位于自身 `antigravity-cli/brain/...` 目录，写入工作区路径会返回 `not a valid artifact path`。AgentMesh 不能改变 vendor 的 artifact 白名单；Tester 返回的测试结论只有在 `repository evidence` 中出现对应文件时才可复核。若文件未落入工作区，编排方必须将结果标记为“不可复核产物”，不能把 vendor 自述的通过数当作仓库证据。任务应要求使用可写工作区工具创建测试文件，或明确接受该限制。AgentMesh 检测到该特征时会在结果 `warning` 中标注「产物可能未落盘工作区、需独立复核」，防止下游把不可复核的自述当成功证据（该间歇性 vendor 行为在真实测试中曾以致命形态吞掉整轮产出，编排方宜默认在任务文本内嵌「改用 shell 写入」降级指引）。
+- **Antigravity CLI 的临时测试产物无法写入工作区**：实测中 Antigravity Tester 运行对抗/临时测试时，其 `write_to_file` 工具要求产物位于自身 `antigravity-cli/brain/...` 目录，写入工作区路径会返回 `not a valid artifact path`。AgentMesh 不能改变 vendor 的 artifact 白名单；Tester 返回的测试结论只有在 `repository evidence` 中出现对应文件时才可复核。若文件未落入工作区，编排方必须将结果标记为“不可复核产物”，不能把 vendor 自述的通过数当作仓库证据。任务应要求使用可写工作区工具创建测试文件，或明确接受该限制。该限制有双层产品化检测：① Adapter 检测到 `not a valid artifact path` 特征时在结果 `warning` 中标注产物可能未落盘；② 通用 **Handoff 落盘一致性检查**（见"Handoff 落盘一致性（Warning 级）"节）对任意 vendor 的 handoff `artifacts.files` 与 recorded 变更集/工作树做逐项定位，未命中即告警——两层互为补充，前者是 vendor 特异特征匹配，后者是通用产物声称核验。编排方宜默认在任务文本内嵌「改用 shell 写入」降级指引。
 - **OpenCode Reviewer 的 shell 常缺 `node`/`git`**：实测中 Reviewer 静态审阅通过但无法本地执行测试（`node`、`git` 不在其 shell PATH）。此时 PASS 仅代表静态结论，不代表已执行过测试。
 - Windows 上 `taskkill /T /F` 只回收 AgentMesh 能定位到根 PID 的 vendor 进程树；某些 vendor CLI 会 fork 出已脱离父进程的后台守护进程，这些孤儿进程需外部监控或手工清理。POSIX 平台通过进程组信号可回收 fork 子进程，但主动 `setsid` 脱离进程组的守护进程同样无法定位。
 
@@ -338,13 +326,15 @@ MCP Client / 主控 Agent (Antigravity / Codex / Claude Code)
          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    AgentMesh MCP Server                     │
-│ (delegate_task, review_changes, continue_task, config...)  │
+│ (delegate_task, review_changes, continue_task,             │
+│  get_session, get_session_context, list_agents, ...)       │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                         Core Runner                         │
 │  - SessionManager (轻量 Bridge 会话持久化与状态跟踪)        │
+│  - Handoff (结构化交接解析/派生 + typed-token 引擎)         │
 │  - ProjectConfig (.agentmesh/config.json 角色映射)          │
 │  - PromptBuilder (Reviewer 独立评审规则与格式约束)          │
 │  - Executor (跨平台子进程调度与超时保护)                   │
@@ -354,7 +344,7 @@ MCP Client / 主控 Agent (Antigravity / Codex / Claude Code)
 ┌─────────────────────────────────────────────────────────────┐
 │                        Adapters                             │
 │   ├── CodexAdapter (MCP: codex mcp-server / CLI: exec)      │
-│   ├── ClaudeAdapter (MCP: claude mcp serve / CLI: -p)       │
+│   ├── ClaudeAdapter (CLI: -p)                               │
 │   ├── AntigravityAdapter (CLI: agy -p / gemini -p)          │
 │   ├── GrokAdapter (CLI: grok -p)                            │
 │   ├── OpenCodeAdapter (CLI: opencode run --auto)            │

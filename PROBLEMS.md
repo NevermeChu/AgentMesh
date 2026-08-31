@@ -677,3 +677,33 @@
 **解决方法**：reviewer CLI 路径改用 `codex exec` + 原生只读沙箱配置（`sandbox_mode="read-only"`、`sandbox_permissions=["disk-full-read-access"]`，与 MCP 路径同键），保留 prompt、评审契约与原生沙箱；base-commit 范围由 prompt 内 diff 指引承担。回归测试改为断言 exec 形态并显式排除 `--uncommitted`/`--base`。修复后同路径 87s 完成真实审查（FAIL 裁决+1 high finding，native-sandbox enforced=true）。
 
 **状态**：已解决（2026-08-30）。教训：vendor CLI 子命令的旗标互斥关系是兼容面的一部分，"能跑通 happy path"的参数组合不等于"带业务 prompt 的组合"可执行；真实测试轮是发现这类契约漂移的唯一窗口。
+
+## P-070 真实 vendor Files 声明形态带注释噪声，落盘一致性判定需先归一化再比对（无损交接 M1/M3）
+
+**问题**：对 R16–R18 真实回放的 golden traces 做落盘一致性检查时，vendor 写入 handoff `artifacts.files` 的列表项大量携带注释形态——前缀状态标签（`Modified: `、`Created: `、`Decisive to read: `）、行号后缀（`src/x.js:36`、`src/x.js:1-2`）、破折号说明尾（`src/x.js — created: implements …`）、逗号分隔多文件声明（`Decisive to read: SPEC.md, src/legacy-ini.js`）。直接按字面路径做 `changedPaths` 匹配与 `existsSync` 判定会把 17/33 的声明误判为 ungrounded，检查不可用。
+
+**根因**：handoff 契约只约束小节标题，不约束列表项内部形态；归一化最初只处理尾注括号（`x.ts (created)`），是从 R15 单测形态归纳的，未覆盖真实轮次的注释语法。代理判定引擎（B2/B1）的稳健性必须用真实数据回放校准，单测 fixture 无法穷举 vendor 形态。
+
+**解决方法**：`normalizePathClaim` 形成固定管线——剥前缀标签（`^[A-Za-z][A-Za-z'\s]{1,24}:\s+`，冒号后需空白以避开 `C:` 盘符）→ 剥尾注括号 → 破折号切段 → 剥行号后缀（`:\d+(-\d+)?$`）→ 分隔符/`./` 归一，再把逗号分隔的多文件声明拆为逐项判定（`splitPathClaims`），未命中报告具体子项。归一化只作用于判定，从不改写 handoff 数据；R16–R18 回放达到 33/33 定位。经验固化在单测中（含"逗号列表中只缺一个文件时报那个文件"的精度用例）。
+
+**状态**：已解决（2026-08-31）。教训：从真实数据反推解析形态是代理指标工程的必要环节——先让检查引擎在历史数据上可解释，再谈上游契约收紧；判定归一化与数据保真（handoff 原文不动）必须分离。
+
+## P-071 注入指令向 vendor 承诺其无法调用的取回通道（R19）
+
+**问题**：R19 行为差分轮（8 问问卷，注入臂 vs 全量基线）证实：`SHARED_CONTEXT_INSTRUCTION` 指示下游 Agent"call the `get_session_context` tool"取回上游细节，但接收方 vendor CLI（opencode/antigravity 等）并没有 AgentMesh 的 MCP 工具——跨轮细节（如上一轮 handoff 才有的行号 `:36`）对下游实际不可达，注入臂只能靠"诚实申报 NOT IN CONTEXT"兜底（Q6 判 partial；无幻觉）。
+
+**根因**：该指令写于 get_session_context 工具加入之时，把"工具对 Orchestrator 可用"与"工具对 vendor 可用"混为一谈；注入文本的读者是 vendor Agent，而工具的实际持有者是 Orchestrator。真实差分轮之前没有任何测试覆盖"指令承诺的通道是否真的可执行"。
+
+**解决方法**：指令改为 Orchestrator 中介路由——"state exactly what is missing and ask the orchestrator to fetch it via `get_session_context` with that session ID — do not re-derive it and do not guess"，并加回归测试锚定三个断言（含"不得再出现 call the tool 式祈使句"）。README 同步取回通道语义。
+
+**状态**：已解决（2026-08-31）。教训：注入到 prompt 里的操作指引是"契约"的一部分——凡是指示接收方执行的动作，必须核对接收方是否真的持有该能力；否则应把动作路由给持有者。验证方式是行为差分轮，不是单测里的字符串存在性检查。
+
+## P-072 采样器孤儿检查按全表正则匹配，把路径中嵌入 vendor 名的无关进程误报为孤儿（R20）
+
+**问题**：R20 十轮战役中每轮外部采样器均报 `orphans=2`，逐条甄别后全部是 Orchestrator 自身的并发 ZCode shell——其命令行内嵌会话目录路径 `.zcode\cli\exec\sess_…`，被默认 vendor 正则（含 `zcode`）以**路径子串**自匹配。P-067 的排除域（采样器自身+祖先+后代，"祖先的其他子树不排除"）无法覆盖：这些 shell 是采样器祖先的**其他子树**，按既定语义属于合法目标域。
+
+**根因**：孤儿判定 = 全表扫描 + 正则匹配 + 时间窗，缺少"与被测管线的连通性"约束——任何同窗口内创建、命令行含 vendor 名的进程都会命中，无论它与本次测量是否相关。
+
+**解决方法**：孤儿判定增加**管线连通性准则**——候选者自身 pid 必须在采样窗口内被观测于种子树中，或其当前进程表祖先链可达种子/任一被观测 pid（含"父进程已死但窗口内被观测过"的断链回退，保证真孤儿仍可检出）。与管线无关的同窗正则匹配不再计入 orphans，改记 `orphans.unrelatedSameWindowMatches`（保留证据透明度）。冒烟三路径验证：clean=0/0、leak=1（种子后代泄漏仍检出）、复现 R20 场景（窗口内并发 `.zcode` 路径 shell）= orphans 0 + unrelated 2。
+
+**状态**：已解决（2026-08-31）。教训：P-067 修的是"argv 自匹配"，本条是同族新形态"路径子串自匹配"——凡按内容特征匹配进程的检测，特征源必须约束在被测管线的连通域内；"无关但相似"的信号应降级为旁证计数而不是混入主判定。

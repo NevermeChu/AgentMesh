@@ -116,7 +116,7 @@
 
 ### 任务设计与执行要求
 
-- 选择需要真实实现、独立评审和测试验证的复杂小任务，例如多模块功能、边界条件、错误处理、权限/安全约束或修复闭环；任务必须包含明确验收标准、至少一个容易出错的边界和可重复的验证命令。正式调用前先检查 SPEC 的示例与文字规则是否一致；发现歧义时，Orchestrator 必须在 task 中明确优先规则、记录决议，并要求 Worker、Reviewer、Tester 使用同一决议，不得各自猜测。
+- 选择需要真实实现、独立评审和测试验证的复杂小任务，例如多模块功能、边界条件、错误处理、权限/安全约束或修复闭环；任务必须包含明确验收标准、至少一个容易出错的边界和可重复的验证命令。SPEC 编写必须并入 `docs/real-test-spec-template.md` 的 M1–M6 强制条款（不可信键防护、顺序语义、未定义区策略、边界语义、往返声明、worker 反盲区自测段）；不适用者须显式标注 N/A 及理由，不得留空。正式调用前先检查 SPEC 的示例与文字规则是否一致；发现歧义时，Orchestrator 必须在 task 中明确优先规则、记录决议，并要求 Worker、Reviewer、Tester 使用同一决议，不得各自猜测。
 - Worker 负责实现并自检，但不得替 Reviewer 或 Tester 完成其职责；Reviewer 默认只读，必须报告实际的 sandbox 机制和任何平台降级；Tester 不得修改生产源码，若发现缺陷应报告并通过 `continue_task` 让 Worker 修复，再复测。
 - 为每次交接记录发送的 `contextSessionIds`、目标 cwd、传输方式、session ID、状态、`finalAnswer`/summary/findings 是否持久化，以及 Session history 中实际记录的 `contextSources`。不得仅根据 agent 自述“已复用上下文”就认定交接成功。
 - 真实测试发生超时、取消、vendor 诊断、部分成功或 transport fallback 时，保留 MCP 返回、Session history、exit code、duration 和执行证据；区分“业务失败”“vendor 辅助 stderr”“客户端取消”“AgentMesh 超时”和“Reviewer FAIL/UNKNOWN”。

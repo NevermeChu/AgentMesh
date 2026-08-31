@@ -363,7 +363,7 @@ npm run format
 # 仅检查格式，不修改文件
 npm run format:check
 
-# 运行单元测试和内存内 MCP 协议测试
+# 运行单元测试、内存内 MCP 协议测试与对抗性交接扰动套件
 npm test
 
 # 执行覆盖率门槛
@@ -386,6 +386,49 @@ npm run check
 ```
 
 VS Code 在安装推荐的 Prettier 扩展后会按 `.prettierrc.json` 在保存时格式化。Husky 的 pre-commit hook 会通过 lint-staged 格式化并检查暂存文件，再执行类型检查；GitHub Actions 会在 Ubuntu 与 Windows 的 Node.js 22/24 矩阵中执行完整校验。依赖统一从 npm 官方仓库解析，Dependabot 定期提交 npm 与 GitHub Actions 更新。
+
+---
+
+## 🔍 无损交接校验工具链
+
+围绕 handoff 管道的可校验性，AgentMesh 提供一组公开的库原语、离线评估脚本与对抗性测试套件；三者共用同一实现，评估结果与运行时行为不会漂移。
+
+### 库原语（`agentmesh` 包导出）
+
+```ts
+import {
+  extractTypedTokens, // (text?) => TypedTokens：从 handoff/finalAnswer 文本提取
+  diffTypedTokens, // (source, comparison) => 各类别 {missing, extra} 精确差集
+  findUngroundedHandoffFiles, // (files, {cwd?, changedPaths?}) => {ungrounded, unverifiable}
+} from "agentmesh";
+```
+
+- `TypedTokens` 为五类**精确匹配** token：`paths` / `versions` / `commands` / `counts` / `hashes`。提取容错 Markdown 残留（链接包装、反引号、成对强调）、中英混排、glob 与 cron 形态；URL 先行剥离；hash 要求同时含字母与数字（纯数字归 `counts`）。擦除顺序为"路径→hash→版本→计数"以避免跨类重复计数；`commands` 单独报告且不擦除——命令内部的路径/数字等值仍会进入对应类别。
+- `diffTypedTokens` 是**精确字符串差集**（无 embedding/模糊匹配）：`missing` = 源文本有而对照缺失（信息丢失方向），`extra` = 对照声称而源没有。语义改写对它不可见——这是声明的局限，不是缺陷。
+- `findUngroundedHandoffFiles` 判定 handoff 文件声称的可定位性：对每项声称归一化 vendor 注释噪声（`Modified:`/`Created:` 前缀、`:36` 行号后缀、破折号说明尾、逗号多文件声明拆分）后，与 `changedPaths`（精确/后缀匹配）或 `cwd` 下文件存在性比对；文件系统检查失败计入 `unverifiable`，绝不伪造"已验证"或"未落盘"任一结论。归一化只作用于判定，不改写 handoff 数据本身。
+
+### 离线评估脚本（零 vendor 配额）
+
+```bash
+# 1) 从 sessions 存储导出 golden traces（每轮一条，zod schema 校验）
+node scripts/export-golden-trace.mjs --sessions <sessions.json> [--session <id>] [--out <dir>]
+# 输出：默认 <sessions 所在目录>/golden-traces/<sessionId>-turn-NNN.json + _summary.json
+# sidecar sha256 与 audit 不符的 trace 标记 sidecarVerified:false 并保留（坏数据本身是证据）；
+# schema 不合规的 trace 进 _invalid/ 并记录原因，不静默丢弃。
+
+# 2) 对 trace 集计算离线 gate（需先 npm run build：脚本从 dist/ 导入与运行时同一套引擎）
+node scripts/lossless-gates.mjs --traces <golden-traces 目录> [--out <report.json>]
+```
+
+报告覆盖前三层 gate 的**代理指标**：structural（handoff 覆盖率、逐字段覆盖、legacy 暴露面）、evidence（文件声称可定位率，含 cwd 缺失时按 existence-unknown 如实计数的诚实口径）、semantic（finalAnswer 与 handoff 的 typed-token 差集）；behavioral 层显式输出 `requires R19 differential round`，**不填占位数字**。报告内嵌 limitations 清单——代理指标不等于端到端任务保真度。基线样例见 `real_test.md` 的 R16–R18 评估记录。
+
+### 对抗性交接扰动套件
+
+`tests/core/handoff-perturbation.test.ts` 随 `npm test` 默认运行：对固定 golden fixture 施加六类扰动（实体替换、数值篡改、否定插入、约束删除、因果倒置、时序重排）+ 语义等价改写对照，断言注入渲染逐字忠实（不丢失、不静默修正）、token 差集精确随扰动变化、文件类扰动被落盘检查标记、等价改写零误报。诚实边界：它校验的是**管道忠实性**，不声称识破 vendor 的语义层谎言。
+
+### 真实测试 SPEC 模板
+
+编写真实测试轮的 SPEC 时必须并入 `docs/real-test-spec-template.md` 的 M1–M6 强制条款（不可信键防护、顺序语义、未定义区策略、边界语义、往返有损声明、worker 反盲区自测段），不适用者显式标注 N/A 与理由——条款源自 R20 十轮战役中被 reviewer/tester 实际拦截的缺陷形态。
 
 ---
 

@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   MultiAgentRunner,
   DEFAULT_RUN_TIMEOUT_MS,
+  computeSessionFreshness,
   modelRejectionDiagnostic,
   sandboxSpawnHint,
   buildSharedContextDetailed,
@@ -20,6 +21,11 @@ import type {
   SandboxMechanism,
   TransportMode,
 } from "../../src/agents/types.js";
+import type {
+  BridgeSession,
+  RepositoryStateEvidence,
+  SessionHistoryEntry,
+} from "../../src/core/types.js";
 
 // Mock adapter for deterministic testing
 class MockAdapter extends BaseAdapter {
@@ -1341,5 +1347,228 @@ describe("core/runner", () => {
     expect(hint).toContain("--test-isolation=none");
     expect(sandboxSpawnHint("codex", "cli", { output: "spawn EPERM" })).toBeUndefined();
     expect(sandboxSpawnHint("codex", "mcp", { output: "all good" })).toBeUndefined();
+  });
+
+  it("classifies a tree reset back to an earlier turn as REWOUND and labels it in injections", () => {
+    const fingerprintA = "a".repeat(64);
+    const fingerprintB = "b".repeat(64);
+    const evidenceFor = (fingerprint: string): RepositoryStateEvidence => ({
+      capturedAt: "2026-08-30T00:00:00.000Z",
+      repositoryRoot: "/repo",
+      dirty: false,
+      fingerprint,
+      changedPaths: [],
+    });
+    const baseEntry: SessionHistoryEntry = {
+      role: "worker",
+      task: "Turn",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "success",
+    };
+    const session: BridgeSession = {
+      id: "bridge-sess_rewind",
+      agent: "codex",
+      cwd: "/repo",
+      role: "worker",
+      createdAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:00.000Z",
+      history: [
+        { ...baseEntry, evidence: { repositoryAfter: evidenceFor(fingerprintA) } },
+        { ...baseEntry, evidence: { repositoryAfter: evidenceFor(fingerprintB) } },
+      ],
+    };
+
+    expect(computeSessionFreshness(session, evidenceFor(fingerprintB))).toBe("MATCHED");
+    expect(computeSessionFreshness(session, evidenceFor(fingerprintA))).toBe("REWOUND");
+    expect(computeSessionFreshness(session, evidenceFor("c".repeat(64)))).toBe("STALE");
+    expect(computeSessionFreshness(session, undefined)).toBe("UNKNOWN");
+
+    const text = buildSharedContextDetailed([session], evidenceFor(fingerprintA))?.text ?? "";
+    expect(text).toContain("Context freshness: REWOUND");
+    expect(text).toContain("matches an EARLIER recorded turn");
+  });
+
+  it("returns structured CONTEXT_INSUFFICIENT misses from getSessionTurnContext", async () => {
+    const missingSession = await runner.getSessionTurnContext({
+      sessionId: "bridge-sess_missing",
+    });
+    expect(missingSession).toMatchObject({
+      code: "CONTEXT_INSUFFICIENT",
+      missing: ["session"],
+    });
+
+    const emptySession = sessionManager.createSession({ agent: "codex", cwd: process.cwd() });
+    const noTurns = await runner.getSessionTurnContext({ sessionId: emptySession.id });
+    expect(noTurns).toMatchObject({ code: "CONTEXT_INSUFFICIENT", missing: ["turns"] });
+
+    const source = await runner.delegateTask({ agent: "codex", task: "Only turn" });
+    const outOfRange = await runner.getSessionTurnContext({
+      sessionId: source.sessionId!,
+      turnIndex: 5,
+    });
+    expect(outOfRange).toMatchObject({ code: "CONTEXT_INSUFFICIENT", missing: ["turn"] });
+    expect("error" in outOfRange ? outOfRange.error : "").toContain(
+      "turnIndex must be between 1 and 1",
+    );
+  });
+
+  it("attaches sufficiency verdicts to retrieved turns that are not MATCHED", async () => {
+    // No git repository → no repository evidence → UNKNOWN → INSUFFICIENT.
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-sufficiency-"));
+    try {
+      const res = await runner.delegateTask({ agent: "codex", task: "Analyze tree", cwd: scratch });
+      const context = await runner.getSessionTurnContext({ sessionId: res.sessionId! });
+      if (!("error" in context)) {
+        expect(context.freshness).toBe("UNKNOWN");
+        expect(context.sufficiency?.level).toBe("INSUFFICIENT");
+        expect(context.sufficiency?.reasons.join(" ")).toContain("verify before relying");
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+
+      // The AgentMesh repo itself is a git working tree → MATCHED → no caveat.
+      const matchedRes = await runner.delegateTask({ agent: "codex", task: "Inspect repo" });
+      const matched = await runner.getSessionTurnContext({ sessionId: matchedRes.sessionId! });
+      if (!("error" in matched)) {
+        expect(matched.freshness).toBe("MATCHED");
+        expect(matched.sufficiency).toBeUndefined();
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("marks STALE and REWOUND sufficiency on retrieved turns in a real git workspace", async () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-rewound-"));
+    try {
+      execFileSync("git", ["init", "--quiet"], { cwd: repo });
+      fs.writeFileSync(path.join(repo, "feature.ts"), "export const value = 1;\n");
+      execFileSync("git", ["add", "feature.ts"], { cwd: repo });
+      execFileSync(
+        "git",
+        [
+          "-c",
+          "user.name=AgentMesh Test",
+          "-c",
+          "user.email=agentmesh@example.invalid",
+          "commit",
+          "--quiet",
+          "-m",
+          "initial",
+        ],
+        { cwd: repo },
+      );
+
+      const turn1 = await runner.delegateTask({
+        agent: "codex",
+        task: "Inspect initial",
+        cwd: repo,
+      });
+      fs.appendFileSync(path.join(repo, "feature.ts"), "// later change\n");
+      const stale = await runner.getSessionTurnContext({ sessionId: turn1.sessionId! });
+      if (!("error" in stale)) {
+        expect(stale.freshness).toBe("STALE");
+        expect(stale.sufficiency?.level).toBe("VERIFY_REQUIRED");
+        expect(stale.sufficiency?.reasons.join(" ")).toContain(
+          "differs from the last recorded handoff state",
+        );
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+
+      // A second turn in the SAME session records the dirty fingerprint;
+      // resetting the file puts the tree back to turn 1's state → REWOUND.
+      await runner.continueTask({ sessionId: turn1.sessionId!, task: "Inspect after change" });
+      execFileSync("git", ["checkout", "--", "feature.ts"], { cwd: repo });
+      const rewound = await runner.getSessionTurnContext({ sessionId: turn1.sessionId! });
+      if (!("error" in rewound)) {
+        expect(rewound.freshness).toBe("REWOUND");
+        expect(rewound.sufficiency?.level).toBe("VERIFY_REQUIRED");
+        expect(rewound.sufficiency?.reasons.join(" ")).toContain("earlier recorded turn");
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("renders known failed attempts and drops them before latest-turn detail under budget", () => {
+    const session = sessionManager.createSession({ agent: "codex", cwd: process.cwd() });
+    sessionManager.addHistory(session.id, {
+      role: "worker",
+      task: "Fix flaky timeout in the retry scheduler",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "failed",
+    });
+    // A latest turn whose Files section alone exceeds the per-source floor
+    // (1200 tokens) so the budget cascade actually engages.
+    sessionManager.addHistory(session.id, {
+      role: "worker",
+      task: "Retry with the extracted fix",
+      timestamp: "2026-08-30T00:01:00.000Z",
+      status: "success",
+      handoff: {
+        goal: "Fix flaky timeout in the retry scheduler",
+        outcome: "success",
+        keyDecisions: ["Exponential backoff removed the flake"],
+        artifacts: {
+          files: Array.from(
+            { length: 150 },
+            (_, i) => `src/generated/module${i}/component-impl-file.ts`,
+          ),
+        },
+        openItems: [],
+      },
+    });
+    const stored = sessionManager.getSession(session.id);
+    if (!stored) throw new Error("session should exist");
+
+    const render = buildSharedContextDetailed([stored]);
+    expect(render?.text).toContain("Known failed attempts (do not repeat):");
+    expect(render?.text).toContain("[Turn 1 | worker] Fix flaky timeout in the retry scheduler");
+
+    const tight = buildSharedContextDetailed([stored], undefined, { budgetTokens: 1_400 });
+    expect(tight?.droppedSections).toContain("failed attempts list");
+    expect(tight?.text).not.toContain("Known failed attempts");
+    // The latest handoff conclusions survive the failed-attempts drop.
+    expect(tight?.text).toContain("Exponential backoff removed the flake");
+  });
+
+  it("omits the failed-attempts line for all-success sources", () => {
+    const session = sessionManager.createSession({ agent: "codex", cwd: process.cwd() });
+    sessionManager.addHistory(session.id, {
+      role: "worker",
+      task: "Clean turn",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "success",
+    });
+    const stored = sessionManager.getSession(session.id);
+    if (!stored) throw new Error("session should exist");
+
+    const render = buildSharedContextDetailed([stored]);
+    expect(render?.text).not.toContain("Known failed attempts");
+  });
+
+  it("routes upstream-detail retrieval through the orchestrator, not a tool the vendor CLI lacks (R19 fix)", () => {
+    const session = sessionManager.createSession({ agent: "codex", cwd: process.cwd() });
+    sessionManager.addHistory(session.id, {
+      role: "worker",
+      task: "Any turn",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "success",
+    });
+    const stored = sessionManager.getSession(session.id);
+    if (!stored) throw new Error("session should exist");
+
+    const render = buildSharedContextDetailed([stored]);
+    // Regression (real-test R19): the injected instruction used to tell the
+    // receiving vendor agent to call get_session_context itself, but the
+    // vendor CLI has no AgentMesh MCP tools — the channel is orchestrator-owned.
+    expect(render?.text).toContain("ask the orchestrator to fetch it via `get_session_context`");
+    expect(render?.text).not.toContain("call the `get_session_context` tool");
+    expect(render?.text).toContain("do not re-derive it and do not guess");
   });
 });

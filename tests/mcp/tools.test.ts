@@ -1,3 +1,6 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -81,6 +84,22 @@ class TestAdapter extends BaseAdapter {
           "Ship the billing export",
           "## Decisions",
           "- Reuse the shared CSV writer",
+        ].join("\n"),
+        role: options.role,
+        reviewVerdictRequired: verdictRequired,
+      });
+    }
+    if (options.task.includes("GHOST_FILE_TRIGGER")) {
+      return this.formatSuccessResult("done", Date.now(), {
+        nativeSessionId: "native_ghost_file",
+        exitCode: 0,
+        summary: "Task completed: GHOST_FILE_TRIGGER",
+        finalAnswer: [
+          "Implemented the export.",
+          "## Files",
+          "- src/billing/ghost-export.ts",
+          "## Tests",
+          "3 passed, 0 failed",
         ].join("\n"),
         role: options.role,
         reviewVerdictRequired: verdictRequired,
@@ -414,6 +433,61 @@ describe("mcp/tools protocol integration", () => {
     expect(missing.isError).toBe(true);
     const missingContent = missing.content as Array<{ type: string; text: string }>;
     expect(missingContent[0]?.text).toContain("not found");
+  });
+
+  it("reports CONTEXT_INSUFFICIENT with missing inputs on retrieval misses", async () => {
+    const missingSession = await client.callTool({
+      name: "get_session_context",
+      arguments: { sessionId: "bridge-sess_missing" },
+    });
+    expect(missingSession.isError).toBe(true);
+    const missingContent = missingSession.content as Array<{ type: string; text: string }>;
+    expect(missingContent[0]?.text).toContain(
+      "Context Status: CONTEXT_INSUFFICIENT — missing: session",
+    );
+
+    const sourceRun = await runner.delegateTask({ agent: "codex", task: "Only turn" });
+    const outOfRange = await client.callTool({
+      name: "get_session_context",
+      arguments: { sessionId: sourceRun.sessionId!, turnIndex: 9 },
+    });
+    expect(outOfRange.isError).toBe(true);
+    const rangeContent = outOfRange.content as Array<{ type: string; text: string }>;
+    expect(rangeContent[0]?.text).toContain("Context Status: CONTEXT_INSUFFICIENT — missing: turn");
+  });
+
+  it("appends a sufficiency hint when retrieved context is not MATCHED", async () => {
+    // A scratch directory outside any git repo yields UNKNOWN freshness.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-mcp-sufficiency-"));
+    try {
+      const sourceRun = await runner.delegateTask({ agent: "codex", task: "Source turn", cwd });
+      const res = await client.callTool({
+        name: "get_session_context",
+        arguments: { sessionId: sourceRun.sessionId!, fields: ["handoff"] },
+      });
+      expect(res.isError).toBeFalsy();
+      const content = res.content as Array<{ type: string; text: string }>;
+      expect(content[0]?.text).toContain("Context Status: INSUFFICIENT");
+      expect(content[0]?.text).toContain("verify before relying on prior results");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("surfaces ungrounded handoff artifacts as a Warning on delegate_task", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "agentmesh-mcp-grounding-"));
+    try {
+      const res = await client.callTool({
+        name: "delegate_task",
+        arguments: { agent: "codex", task: "Export GHOST_FILE_TRIGGER", cwd },
+      });
+      const content = res.content as Array<{ type: string; text: string }>;
+      expect(content[0]?.text).toContain("Warning:");
+      expect(content[0]?.text).toContain("Handoff grounding");
+      expect(content[0]?.text).toContain("src/billing/ghost-export.ts");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("rejects invalid task and timeout inputs at the MCP boundary", async () => {

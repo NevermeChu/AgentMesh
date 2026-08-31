@@ -70,7 +70,13 @@ export {
   parseReviewOutput,
 } from "./core/prompts.js";
 export type { ParsedReviewOutput } from "./core/prompts.js";
-export { deriveReviewHandoff, parseHandoffReport } from "./core/handoff.js";
+export {
+  deriveReviewHandoff,
+  diffTypedTokens,
+  extractTypedTokens,
+  findUngroundedHandoffFiles,
+  parseHandoffReport,
+} from "./core/handoff.js";
 export { VERSION } from "./version.js";
 
 export { SessionManager, defaultSessionManager } from "./core/session.js";
@@ -98,8 +104,10 @@ export type {
   ReviewChangesParams,
   ContinueTaskParams,
   ContextFreshness,
+  ContextSufficiency,
   SessionTurnContext,
   SessionTurnContextField,
+  SessionTurnContextMiss,
 } from "./core/runner.js";
 
 // MCP Server

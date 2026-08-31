@@ -17,7 +17,7 @@ import { evaluateModelOptionSupport } from "./capabilities.js";
 import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
-import { deriveReviewHandoff, parseHandoffReport } from "./handoff.js";
+import { deriveReviewHandoff, findUngroundedHandoffFiles, parseHandoffReport } from "./handoff.js";
 import { estimateTokens, truncateText, truncateTextToTokenBudget } from "./text.js";
 import type {
   BridgeSession,
@@ -106,11 +106,29 @@ export interface SessionTurnContext {
   task: string;
   summary?: string;
   freshness: ContextFreshness;
+  /**
+   * Sufficiency verdict for contexts that are not MATCHED (additive): tells
+   * downstream agents to re-verify before adopting the injected conclusions.
+   */
+  sufficiency?: ContextSufficiency;
   handoff?: HandoffSummary;
   finalAnswer?: string;
   findings?: ReviewFinding[];
   evidence?: SessionExecutionEvidence;
   reviewerSafety?: ReviewerSafetyReport;
+}
+
+/**
+ * Structured miss shape for get_session_context (additive): unknown sessions,
+ * sessions without turns, and out-of-range indexes return a stable
+ * CONTEXT_INSUFFICIENT code plus the missing inputs instead of forcing callers
+ * to parse the error message.
+ */
+export interface SessionTurnContextMiss {
+  error: string;
+  code: "CONTEXT_INSUFFICIENT";
+  /** Which inputs could not be satisfied: "session", "turns", or "turn". */
+  missing: string[];
 }
 
 const MAX_CONTEXT_SOURCES = 4;
@@ -121,7 +139,13 @@ const LEGACY_ANSWER_CHARS = 1_200;
 /** Full-answer retrieval cap for the get_session_context tool. */
 const MAX_CONTEXT_TOOL_ANSWER_CHARS = 24_000;
 
-export type ContextFreshness = "MATCHED" | "STALE" | "UNKNOWN";
+/**
+ * Freshness of the shared context relative to the current working tree.
+ * REWOUND distinguishes "the tree moved on" (STALE) from "the tree went back
+ * to an earlier recorded state" (git reset/revert), where reusing the earlier
+ * turn's conclusions is safe.
+ */
+export type ContextFreshness = "MATCHED" | "REWOUND" | "STALE" | "UNKNOWN";
 
 function truncateSharedText(value: string, maxChars: number): string {
   return truncateText(value, maxChars, "... [truncated]");
@@ -135,30 +159,77 @@ function formatRepositoryState(evidence: RepositoryStateEvidence): string {
 }
 
 /**
- * Compares the current working tree against the source session's last recorded
- * repository fingerprint. MATCHED lets downstream agents reuse prior results
- * directly; STALE demands revalidation of affected evidence.
+ * Compares the current working tree against the source session's recorded
+ * repository fingerprints. MATCHED lets downstream agents reuse prior results
+ * directly. REWOUND means the tree matches an EARLIER recorded turn (common
+ * after a reset/revert): that earlier turn's conclusions may be reused safely,
+ * but anything recorded after it is outdated. STALE demands revalidation of
+ * affected evidence. UNKNOWN means no comparable evidence exists.
  */
 export function computeSessionFreshness(
   session: BridgeSession,
   current: RepositoryStateEvidence | undefined,
 ): ContextFreshness {
-  const previous = session.history.at(-1)?.evidence?.repositoryAfter;
-  if (previous && current) {
-    return previous.repositoryRoot === current.repositoryRoot &&
-      previous.fingerprint === current.fingerprint
-      ? "MATCHED"
-      : "STALE";
+  if (!current) return "UNKNOWN";
+  const history = session.history;
+  let hasAnyEvidence = false;
+  for (let index = history.length - 1; index >= 0; index--) {
+    const after = history[index]?.evidence?.repositoryAfter;
+    if (!after) continue;
+    hasAnyEvidence = true;
+    if (after.repositoryRoot !== current.repositoryRoot) continue;
+    if (after.fingerprint === current.fingerprint) {
+      return index === history.length - 1 ? "MATCHED" : "REWOUND";
+    }
   }
-  return "UNKNOWN";
+  return hasAnyEvidence ? "STALE" : "UNKNOWN";
 }
 
 const FRESHNESS_LABELS: Record<ContextFreshness, string> = {
   MATCHED: "MATCHED: the current working tree matches the last recorded handoff state.",
+  REWOUND:
+    "REWOUND: the working tree matches an EARLIER recorded turn rather than the latest handoff state (e.g. after a revert or reset); conclusions from that earlier turn may be reused safely, but evidence recorded after it is outdated — confirm which turn still applies.",
   STALE:
     "STALE: the current working tree differs from the last recorded handoff state; revalidate affected evidence.",
   UNKNOWN: "UNKNOWN: repository evidence is unavailable; verify before relying on prior results.",
 };
+
+/** Sufficiency verdict attached to retrieved turns whose freshness is not MATCHED. */
+export interface ContextSufficiency {
+  level: "OK" | "VERIFY_REQUIRED" | "INSUFFICIENT";
+  reasons: string[];
+}
+
+/**
+ * Derives the sufficiency verdict for a retrieved turn: MATCHED needs no
+ * caveat, STALE/REWOUND demand re-verification before adoption, and UNKNOWN
+ * means the context is insufficient to trust without independent verification.
+ */
+function deriveContextSufficiency(freshness: ContextFreshness): ContextSufficiency | undefined {
+  switch (freshness) {
+    case "MATCHED":
+      return undefined;
+    case "STALE":
+      return {
+        level: "VERIFY_REQUIRED",
+        reasons: [
+          "the current working tree differs from the last recorded handoff state; revalidate affected evidence before relying on it",
+        ],
+      };
+    case "REWOUND":
+      return {
+        level: "VERIFY_REQUIRED",
+        reasons: [
+          "the working tree matches an earlier recorded turn rather than the latest handoff; confirm which turn's conclusions still apply before relying on them",
+        ],
+      };
+    case "UNKNOWN":
+      return {
+        level: "INSUFFICIENT",
+        reasons: ["repository evidence is unavailable; verify before relying on prior results"],
+      };
+  }
+}
 
 /**
  * One droppable piece of a turn rendering. `dropPriority` orders budget-driven
@@ -340,9 +411,10 @@ interface SharedContextRender {
 
 /**
  * Renders one source session: the latest turn in full (structured handoff, or
- * a shortened legacy replay), one-line indexes of older turns, and the
- * freshness verdict at the block tail. Budget stages drop reproducibility
- * detail before conclusions so the most recent handoff state survives.
+ * a shortened legacy replay), one-line indexes of older turns, an explicit
+ * list of known failed attempts, and the freshness verdict at the block tail.
+ * Budget stages drop reproducibility detail before conclusions so the most
+ * recent handoff state survives.
  */
 function renderSourceBlock(
   session: BridgeSession,
@@ -360,9 +432,21 @@ function renderSourceBlock(
   let indexLines = history
     .slice(0, -1)
     .map((entry, offset) => renderTurnIndexLine(entry, offset + 1));
+  // Failed attempts are called out explicitly so a downstream agent never
+  // repeats an upstream dead end. The latest turn is excluded: its heading
+  // already renders its FAILED status in full. Low drop priority: this list is
+  // sacrificed before any latest-turn section under a tight budget.
+  const failedAttemptLines = history
+    .slice(0, -1)
+    .map((entry, offset) => ({ entry, turnNumber: offset + 1 }))
+    .filter(({ entry }) => entry.status === "failed")
+    .map(
+      ({ entry, turnNumber }) =>
+        `- [Turn ${turnNumber} | ${entry.role}] ${truncateText(entry.task.replace(/\s+/g, " "), 80)}`,
+    );
   const dropped: string[] = [];
 
-  const renderBlock = (): string => {
+  const renderBlock = (includeFailedAttempts: boolean): string => {
     const latestText = [
       latestRender.heading,
       latestRender.coreLine,
@@ -374,6 +458,9 @@ function renderSourceBlock(
     return [
       latestText,
       indexLines.length > 0 ? indexLines.join("\n") : undefined,
+      includeFailedAttempts && failedAttemptLines.length > 0
+        ? ["Known failed attempts (do not repeat):", ...failedAttemptLines].join("\n")
+        : undefined,
       omittedCount > 0
         ? `[${omittedCount} older turn(s) omitted within the context budget]`
         : undefined,
@@ -383,13 +470,17 @@ function renderSourceBlock(
       .join("\n");
   };
 
-  let block = renderBlock();
+  let block = renderBlock(true);
   if (estimateTokens(block) > budgetTokens && indexLines.length > 0) {
     dropped.push("older turn indexes");
   }
   while (estimateTokens(block) > budgetTokens && indexLines.length > 0) {
     indexLines = indexLines.slice(1);
-    block = renderBlock();
+    block = renderBlock(true);
+  }
+  if (estimateTokens(block) > budgetTokens && failedAttemptLines.length > 0) {
+    dropped.push("failed attempts list");
+    block = renderBlock(false);
   }
   while (estimateTokens(block) > budgetTokens && latestRender.sections.length > 0) {
     const victim = latestRender.sections.reduce((min, section) =>
@@ -397,7 +488,7 @@ function renderSourceBlock(
     );
     latestRender.sections = latestRender.sections.filter((section) => section !== victim);
     dropped.push(`turn ${history.length} ${victim.name}`);
-    block = renderBlock();
+    block = renderBlock(false);
   }
   if (estimateTokens(block) > budgetTokens) {
     block = truncateTextToTokenBudget(block, budgetTokens);
@@ -411,8 +502,15 @@ function renderSourceBlock(
   };
 }
 
+/**
+ * The retrieval sentence is deliberately orchestrator-mediated: the receiving
+ * vendor agent has no AgentMesh MCP tools of its own (R19 differential finding),
+ * so instructing it to "call get_session_context" promises a channel it cannot
+ * use. The honest instruction is to declare the gap so the orchestrator —
+ * which does own the tool — can fetch the detail.
+ */
 const SHARED_CONTEXT_INSTRUCTION =
-  "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context. Each source inlines its latest turn as a structured handoff, with older turns as one-line indexes; for upstream detail that is not inlined here (full final answers, findings, evidence), call the `get_session_context` tool with that session ID instead of re-deriving the work.";
+  "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE, REWOUND, or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks; REWOUND additionally means the tree matches an earlier recorded turn, whose conclusions may be reused once confirmed. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context. Each source inlines its latest turn as a structured handoff, with older turns as one-line indexes and failed attempts called out; if upstream detail you need is not inlined here (full final answers, findings, evidence), state exactly what is missing and ask the orchestrator to fetch it via `get_session_context` with that session ID — do not re-derive it and do not guess.";
 
 /**
  * Renders the normalized history of one or more source sessions as first-hand
@@ -1377,6 +1475,7 @@ export class MultiAgentRunner {
     // openItems signal without a get_session round-trip.
     if (handoff) {
       result.handoff = handoff;
+      this.appendHandoffGroundingWarning({ session, result, handoff, repositoryAfter });
     }
 
     this.sessionManager.addHistory(session.id, {
@@ -1419,6 +1518,46 @@ export class MultiAgentRunner {
   }
 
   /**
+   * Productized grounding check for handoff artifact claims: every file a
+   * handoff reports must be locatable in the recorded repository changes or
+   * under the session working directory, or the MCP response carries a Warning
+   * so downstream consumers treat the artifact list as unverified (the
+   * documented "test artifacts never landed in the workspace" failure mode).
+   * Warning-level only — it never changes the turn status or history schema,
+   * and unverifiable filesystem checks are reported as such, never silently
+   * counted as grounded.
+   */
+  private appendHandoffGroundingWarning(options: {
+    session: BridgeSession;
+    result: AgentResult;
+    handoff: HandoffSummary;
+    repositoryAfter: RepositoryStateEvidence | undefined;
+  }): void {
+    const files = options.handoff.artifacts.files ?? [];
+    if (files.length === 0) return;
+    const { ungrounded, unverifiable } = findUngroundedHandoffFiles(files, {
+      cwd: options.session.cwd,
+      changedPaths: options.repositoryAfter?.changedPaths,
+    });
+    if (ungrounded.length === 0 && unverifiable === 0) return;
+
+    const parts: string[] = [];
+    if (ungrounded.length > 0) {
+      const listed = ungrounded.slice(0, 5).join(", ");
+      const more = ungrounded.length > 5 ? ` (+${ungrounded.length - 5} more)` : "";
+      parts.push(
+        `Handoff grounding: ${ungrounded.length} reported file reference(s) were not found in the recorded repository changes or the working tree (${listed}${more}); treat the handoff artifact list as unverified.`,
+      );
+    }
+    if (unverifiable > 0) {
+      parts.push(
+        `Handoff grounding: ${unverifiable} file existence check(s) were skipped due to filesystem errors; grounding was not verified.`,
+      );
+    }
+    options.result.warning = [options.result.warning, ...parts].filter(Boolean).join(" ");
+  }
+
+  /**
    * Returns list of supported agents and their availability on this machine.
    */
   public async listAgents() {
@@ -1441,30 +1580,44 @@ export class MultiAgentRunner {
    * Read-only retrieval of one recorded turn, the lazy-loading counterpart of
    * the handoff-first injection: downstream agents fetch the full final
    * answer, findings, or evidence instead of AgentMesh replaying them into
-   * every prompt. Returns `{ error }` for unknown sessions and bad indexes.
+   * every prompt. Unknown sessions, sessions without turns, and out-of-range
+   * indexes return a structured CONTEXT_INSUFFICIENT miss; successful returns
+   * carry a sufficiency verdict whenever the freshness is not MATCHED.
    */
   public async getSessionTurnContext(params: {
     sessionId: string;
     turnIndex?: number;
     fields?: SessionTurnContextField[];
-  }): Promise<SessionTurnContext | { error: string }> {
+  }): Promise<SessionTurnContext | SessionTurnContextMiss> {
     const session = this.sessionManager.getSession(params.sessionId);
     if (!session) {
-      return { error: `Session '${params.sessionId}' not found.` };
+      return {
+        error: `Session '${params.sessionId}' not found.`,
+        code: "CONTEXT_INSUFFICIENT",
+        missing: ["session"],
+      };
     }
     const totalTurns = session.history.length;
     if (totalTurns === 0) {
-      return { error: `Session '${params.sessionId}' has no recorded turns.` };
+      return {
+        error: `Session '${params.sessionId}' has no recorded turns.`,
+        code: "CONTEXT_INSUFFICIENT",
+        missing: ["turns"],
+      };
     }
     const turnIndex = params.turnIndex ?? totalTurns;
     if (!Number.isInteger(turnIndex) || turnIndex < 1 || turnIndex > totalTurns) {
       return {
         error: `Session '${params.sessionId}' has ${totalTurns} turn(s); turnIndex must be between 1 and ${totalTurns}.`,
+        code: "CONTEXT_INSUFFICIENT",
+        missing: ["turn"],
       };
     }
     const entry = session.history[turnIndex - 1]!;
     const fields = new Set(params.fields ?? ["handoff"]);
     const currentRepositoryState = await captureRepositoryState(session.cwd);
+    const freshness = computeSessionFreshness(session, currentRepositoryState);
+    const sufficiency = deriveContextSufficiency(freshness);
     return {
       sessionId: session.id,
       turnIndex,
@@ -1475,7 +1628,8 @@ export class MultiAgentRunner {
       timestamp: entry.timestamp,
       task: entry.task,
       ...(entry.summary ? { summary: entry.summary } : {}),
-      freshness: computeSessionFreshness(session, currentRepositoryState),
+      freshness,
+      ...(sufficiency ? { sufficiency } : {}),
       ...(fields.has("handoff") && entry.handoff ? { handoff: entry.handoff } : {}),
       ...(fields.has("finalAnswer") && entry.finalAnswer
         ? {

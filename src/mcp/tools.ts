@@ -541,8 +541,17 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
           fields: args.fields,
         });
         if ("error" in context) {
+          const missing =
+            "missing" in context && context.missing.length > 0
+              ? context.missing.join(", ")
+              : "unknown";
           return {
-            content: [{ type: "text", text: context.error }],
+            content: [
+              {
+                type: "text",
+                text: `${context.error}\nContext Status: CONTEXT_INSUFFICIENT — missing: ${missing}`,
+              },
+            ],
             isError: true,
           };
         }
@@ -551,7 +560,14 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
             ? JSON.stringify(context, null, 2)
             : `${JSON.stringify(context, null, 2)}\n\nNo structured handoff was recorded for this turn (it predates the handoff contract or the agent did not follow it). Call again with fields=["finalAnswer"] to read the full answer.`;
         return {
-          content: [{ type: "text", text }],
+          content: [
+            {
+              type: "text",
+              text: context.sufficiency
+                ? `${text}\n\nContext Status: ${context.sufficiency.level} — ${context.sufficiency.reasons.join(" ")} Verify before adopting this context.`
+                : text,
+            },
+          ],
         };
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);

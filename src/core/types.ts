@@ -45,6 +45,23 @@ export interface SessionExecutionEvidence {
 }
 
 /**
+ * Who or what must resolve a blocker before the blocked work can continue.
+ * Machine-readable escalation target for the orchestrator: `agent` = another
+ * agent role must act first, `user` = human decision/credential, `resource` =
+ * missing quota/token/seat, `dependency` = an upstream task or library, and
+ * `environment` = infrastructure (transport, sandbox, network, toolchain).
+ */
+export type BlockerRequirement = "agent" | "user" | "resource" | "dependency" | "environment";
+
+/** One structured blocker in a handoff: what is stuck and who must unstick it. */
+export interface HandoffBlocker {
+  /** One-line description of what is blocking progress. */
+  summary: string;
+  /** Escalation target; unparsable or missing markers degrade to `user`. */
+  requires: BlockerRequirement;
+}
+
+/**
  * Structured handoff extracted from one turn's final answer. Downstream
  * injections render this instead of replaying the full answer body.
  */
@@ -62,6 +79,12 @@ export interface HandoffSummary {
   };
   /** Unfinished work, known risks, or open questions for the receiver. */
   openItems: string[];
+  /**
+   * Conditions that stop the work from continuing until an escalation target
+   * resolves them. Present only when the report declares blockers; absence
+   * means "nothing reported as blocking", not "verified unblocked".
+   */
+  blockers?: HandoffBlocker[];
 }
 
 /** Verbatim-audit record for the shared context injected into one turn's prompt. */

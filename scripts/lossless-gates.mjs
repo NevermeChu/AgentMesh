@@ -91,6 +91,9 @@ function handoffText(handoff) {
     ...(handoff.artifacts.commands ?? []),
     handoff.artifacts.tests ?? "",
     ...handoff.openItems,
+    ...(handoff.blockers ?? []).map(
+      (blocker) => `${blocker.summary} (requires: ${blocker.requires})`,
+    ),
   ]
     .filter(Boolean)
     .join("\n");
@@ -111,6 +114,7 @@ function computeStructural(traces) {
     commands: handoffTurns.filter((t) => (t.handoff.artifacts.commands ?? []).length > 0).length,
     tests: handoffTurns.filter((t) => Boolean(t.handoff.artifacts.tests?.trim())).length,
     openItems: handoffTurns.filter((t) => (t.handoff.openItems ?? []).length > 0).length,
+    blockers: handoffTurns.filter((t) => (t.handoff.blockers ?? []).length > 0).length,
   };
   const fieldCoverage = {};
   for (const key of Object.keys(rawCoverage)) {

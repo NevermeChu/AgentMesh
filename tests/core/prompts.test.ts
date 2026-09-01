@@ -45,6 +45,13 @@ describe("core/prompts", () => {
     expect(workerPrompt).toContain(
       "If the SPEC or task text itself is contradictory or impossible, state that FIRST here — a spec contradiction outranks any implementation defect.",
     );
+    // Blockers carry a machine-readable escalation target so orchestrators can
+    // route them (another agent, the user, resources, dependencies, environment).
+    expect(workerPrompt).toContain("## Blockers");
+    expect(workerPrompt).toContain(
+      "(requires: agent | user | resource | dependency | environment)",
+    );
+    expect(workerPrompt).toContain("Omit this section entirely when nothing is blocking.");
     expect(workerPrompt).toContain("Implement the feature");
 
     const testerPrompt = buildRolePrompt("Run the test suites", "tester");

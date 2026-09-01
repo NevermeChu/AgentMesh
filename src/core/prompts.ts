@@ -54,6 +54,10 @@ export function buildHandoffContract(): string {
     "## Open Items",
     "- <unfinished work, known risks, or open questions>",
     "- If the SPEC or task text itself is contradictory or impossible, state that FIRST here — a spec contradiction outranks any implementation defect.",
+    "## Blockers",
+    "- <ONLY when work cannot continue: one line per blocker> (requires: agent | user | resource | dependency | environment)",
+    "- `requires` names who must resolve the blocker before work can resume: another agent role must act (agent), a human decision or credential is needed (user), quota/seats are missing (resource), an upstream task or library is waiting (dependency), or infrastructure such as transport/sandbox/network/toolchain is at fault (environment).",
+    "- Omit this section entirely when nothing is blocking. Keep each blocker on a single line so the `requires:` marker stays machine-readable.",
   ].join("\n");
 }
 

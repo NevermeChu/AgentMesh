@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import path from "node:path";
 import type { ReviewFinding } from "../agents/types.js";
-import type { HandoffSummary } from "./types.js";
+import type { BlockerRequirement, HandoffBlocker, HandoffSummary } from "./types.js";
 import { truncateText } from "./text.js";
 
 /**
@@ -17,7 +17,7 @@ const MAX_GOAL_CHARS = 200;
 const MAX_ITEM_CHARS = 400;
 const MAX_TESTS_CHARS = 300;
 
-type SectionKey = "goal" | "decisions" | "files" | "commands" | "tests" | "openItems";
+type SectionKey = "goal" | "decisions" | "files" | "commands" | "tests" | "openItems" | "blockers";
 
 const SECTION_ALIASES: ReadonlyArray<readonly [SectionKey, string[]]> = [
   ["goal", ["goal", "objective"]],
@@ -26,6 +26,7 @@ const SECTION_ALIASES: ReadonlyArray<readonly [SectionKey, string[]]> = [
   ["commands", ["commands", "commands run"]],
   ["tests", ["tests", "test results"]],
   ["openItems", ["open items", "open questions", "risks"]],
+  ["blockers", ["blockers", "blocked"]],
 ];
 
 /**
@@ -102,6 +103,42 @@ function deriveGoalFromTask(task: string): string {
   return truncateText(collapsed, MAX_GOAL_CHARS);
 }
 
+const BLOCKER_REQUIREMENTS: readonly BlockerRequirement[] = [
+  "agent",
+  "user",
+  "resource",
+  "dependency",
+  "environment",
+];
+const BLOCKER_REQUIREMENT_RE = /\brequires\s*[:=]\s*"?([A-Za-z]+)"?/;
+
+/**
+ * Parses one `## Blockers` item of the contract form
+ * `- <what is blocked> (requires: agent|user|resource|dependency|environment)`.
+ * Vendors frequently drop or mangle the `requires` marker; the summary is kept
+ * and the escalation target degrades to `user` (a human decides) instead of
+ * discarding the whole blocker — a machine-readable guess beats no signal.
+ */
+function parseBlockerItem(item: string): HandoffBlocker | undefined {
+  if (!item.trim()) return undefined;
+  const match = BLOCKER_REQUIREMENT_RE.exec(item);
+  const raw = match?.[1]?.toLowerCase();
+  const requires: BlockerRequirement = BLOCKER_REQUIREMENTS.includes(raw as BlockerRequirement)
+    ? (raw as BlockerRequirement)
+    : "user";
+  const summary = truncateText(
+    (match ? item.replace(match[0], " ") : item)
+      .replace(/\s{2,}/g, " ")
+      // The contract wraps the marker in parentheses; removing the marker must
+      // not leave an empty "( )" tail behind.
+      .replace(/\(\s*\)\s*$/, "")
+      .replace(/[\s—-]+$/, "")
+      .trim(),
+    MAX_ITEM_CHARS,
+  );
+  return summary ? { summary, requires } : undefined;
+}
+
 export function parseHandoffReport(
   finalAnswer: string | undefined,
   task: string,
@@ -119,7 +156,12 @@ export function parseHandoffReport(
       current = match.key;
       if (!sections.has(current)) sections.set(current, []);
       if (match.inline) {
-        const items = current === "tests" ? [match.inline] : splitListValues(match.inline);
+        // Tests and blockers keep the inline value whole: splitting on commas
+        // would shred a single blocker/test summary containing commas.
+        const items =
+          current === "tests" || current === "blockers"
+            ? [match.inline]
+            : splitListValues(match.inline);
         sections.get(current)!.push(...items.map((item) => cleanItemLine(item)).filter(Boolean));
       }
       continue;
@@ -155,6 +197,9 @@ export function parseHandoffReport(
 
   // The report's own one-sentence goal wins; the task's first line is the fallback.
   const reportGoal = list("goal")?.[0];
+  const blockers = (sections.get("blockers") ?? [])
+    .map(parseBlockerItem)
+    .filter((blocker): blocker is HandoffBlocker => Boolean(blocker));
 
   return {
     goal: reportGoal ? truncateText(reportGoal, MAX_GOAL_CHARS) : deriveGoalFromTask(task),
@@ -162,6 +207,7 @@ export function parseHandoffReport(
     keyDecisions: list("decisions") ?? [],
     artifacts,
     openItems: list("openItems") ?? [],
+    ...(blockers.length ? { blockers } : {}),
   };
 }
 

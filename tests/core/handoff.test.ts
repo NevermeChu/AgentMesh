@@ -86,6 +86,57 @@ describe("core/handoff parseHandoffReport", () => {
     expect(parseHandoffReport("   \n  ", "Task", "failed")).toBeUndefined();
   });
 
+  it("parses declared blockers with their escalation targets", () => {
+    const answer = [
+      "Blocked mid-way.",
+      "## Goal",
+      "Deploy the permission fix",
+      "## Blockers",
+      "- Need production SSH credentials (requires: environment)",
+      "- Security sign-off pending from the review role (requires: agent)",
+      "- Waiting for the human go/no-go (requires: user)",
+    ].join("\n");
+    const handoff = parseHandoffReport(answer, "Deploy", "success");
+
+    expect(handoff!.blockers).toEqual([
+      { summary: "Need production SSH credentials", requires: "environment" },
+      { summary: "Security sign-off pending from the review role", requires: "agent" },
+      { summary: "Waiting for the human go/no-go", requires: "user" },
+    ]);
+  });
+
+  it("keeps the inline blocker form whole instead of comma-splitting it", () => {
+    const answer = "## Blockers: blocked on quota, seats, and credentials (requires: resource)";
+    const handoff = parseHandoffReport(answer, "Task", "success");
+
+    expect(handoff!.blockers).toEqual([
+      {
+        summary: "blocked on quota, seats, and credentials",
+        requires: "resource",
+      },
+    ]);
+  });
+
+  it("degrades blockers without a parsable requires marker to the user escalation", () => {
+    const answer = [
+      "## Blockers",
+      "- Upstream library build is broken",
+      "- Waiting on someone (requires: banana)",
+    ].join("\n");
+    const handoff = parseHandoffReport(answer, "Task", "success");
+
+    expect(handoff!.blockers).toEqual([
+      { summary: "Upstream library build is broken", requires: "user" },
+      { summary: "Waiting on someone", requires: "user" },
+    ]);
+  });
+
+  it("omits the blockers field entirely when no blocker section is reported", () => {
+    const handoff = parseHandoffReport(finalAnswerWithReport(), "Fix the login flow", "success");
+    expect(handoff!.blockers).toBeUndefined();
+    expect("blockers" in handoff!).toBe(false);
+  });
+
   it("stops collecting at unrelated markdown headings", () => {
     const answer = ["## Decisions", "- one", "## Appendix", "- not a decision"].join("\n");
     const handoff = parseHandoffReport(answer, "Task", "success");

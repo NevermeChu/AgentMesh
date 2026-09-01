@@ -6,3 +6,4 @@ codegraph.watch.json
 .tmp-*
 *.tgz
 package-lock.json
+.claude

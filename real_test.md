@@ -1592,3 +1592,171 @@ semver-lite：按 SPEC 实现 SemVer 2.0.0 的 parse/compare/format（ESM、零�
 | 证据归属混叉（campaign store 跨轮行混入单轮 dump）         | `driver-r20.mjs` dumpRoundStore 按 lab cwd 打 `roundTag`，新增 `retag` 阶段重派生全部带标签视图（源 store 不可变）                                                         | 10/10 轮 retag 后行数与 turn 数吻合（5/3/3/5/5/3/3/3/3/5=38）                                                |
 | 取回通道承诺不可执行（R19，产品面）                        | 已在 R19-fix 修复（见 P-071），本轮无新增动作                                                                                                                              | 回归测试 + npm run check 全绿                                                                                |
 | vendor 转写滑失（R19 Q7）、P2 断言校准                     | 不修（vendor 语义层边界 / 预注册以 FAIL 如实在案）                                                                                                                         | B3 管道忠实性套件覆盖管道侧；vendor 侧无修复声明                                                             |
+
+# R21（2026-08-31）：轴1 确定性多轮收敛测试——分层矩阵未触发修复环，线性收敛（如实降级）
+
+> 方案：`docs/multi-round-collaboration-test-plan.md` 轴 1。用户指定仅可用 opencode 与 agy CLI。
+> 角色：worker=agy、tester=opencode（独立会话）、reviewer=opencode（另一独立会话）。
+> 工作区：`C:\Users\ThisMe\agentmesh-real-r21\`（lab/ 独立 git 仓 + out/ 证据外置）；sessions 文件 `out/sessions-r21.json`。
+> 驱动：stdio MCP（dist serve），`delegate_task` / `continue_task` / `review_changes`。
+
+## 1. 小任务是在做什么
+
+mathexpr 两模块（`src/tokenize.mjs` 词法扫描 + `src/evaluate.mjs` 求值，evaluate 必须复用 tokenize 导出）：49 个验收向量（T1-T7/TE1-TE8/E1-E16/EE1-EE18）、严格错误三分法（TypeError/SyntaxError/ReferenceError + 消息锚词）、前导零/孤点/尾随点拒绝、右结合幂、一元负号优先级裁决（`-2^2=-4`）、宿主键防护（`__proto__` 等 → ReferenceError）。SPEC 并入 M1-M6 条款；签发前 orchestrator 参考实现机核 49/49 通过（机核过程真实抓出 3 处 SPEC 自伤并修正：T1 pos、EE3 锚词、孤点路径）。
+
+**多轮触发设计**：预注册 8 轮剧本（w1→t1→w2→t2→w3→r1→w4→r2），D 矩阵（30 探针，严于 worker 自检）+ E 矩阵（12 探针，复测轮扩容）作为设计事件，目标边数 O→W=4、O→T=2、O→R=2、深度 2 迭代收敛。
+
+## 2. 上下文是否损失及程度
+
+| 轮        | Agent    | Session                    | 时长            | 状态              | 注入       | 实录 contextSources                                 |
+| --------- | -------- | -------------------------- | --------------- | ----------------- | ---------- | --------------------------------------------------- |
+| w1        | agy      | `bridge-sess_33975453788a` | 202.8s          | SUCCESS           | 无（首轮） | null                                                |
+| t1×3 失败 | opencode | —（每试独立失败会话）      | 37.2/34.4/36.3s | FAILED×3          | —          | —                                                   |
+| t1        | opencode | `bridge-sess_98ab091d0e5f` | 53.7s           | SUCCESS           | [w1]       | [w1] ✓（sessions 实录核验）                         |
+| t2        | opencode | **同 t1 会话续接**         | 55.8s           | SUCCESS           | [w1]       | [w1] ✓ + STALE 重验证声明                           |
+| r1        | opencode | `bridge-sess_f0bd459d3808` | 83.8s           | SUCCESS·PASS·3low | [w1,t1]    | [w1,t1] ✓（双源 + sharedContextAudit sidecar 落盘） |
+
+- **t2 的跨轮会话续接**：`continue_task` 成功续接 tester 原会话（session 身份保持），且 tester 主动对 worker 源做 STALE 重验证（"Revalidated stale source bridge-sess_33975453788a"）并**跨轮保留 D23 裁决记忆**——续接会话的历史连续性被真实利用。
+- **双源数组转发**（r1）：[worker,tester] 双源实录 + sidecar sha256 审计链（file/bytes/sha256 字段落盘），P7 修复后的形态持续有效。
+- 损失等级：**无损**（四个成功轮全部 sidecar/实录核验通过，无截断报告）。
+
+## 3. 是否重复做无意义操作
+
+- **t1×3 失败重试的决策质量**：尝试 1-3 均为 openrouter 共享池上游 429（`z-ai/glm-5.2:free`，isRetryable）。尝试 2 在 30s 后、尝试 3 在 120s 冷却后仍 429，判定为持续限流，改为 10 分钟冷却后第 4 次成功——**避免了 r9 式盲重试**（三次失败轮全部留痕，无部分产出损失）。
+- tester 两轮矩阵（30+12 探针）与 reviewer 复跑（71/71 + E 矩阵复现 + 逐行归因到 `src/evaluate.mjs:77-140`）均为角色职责内独立验证。
+- 无上下文缺失导致的被迫重复。
+
+## 4. 暴露的问题
+
+1. **【命题级结果·最重要】修复环零触发，轴 1 边数目标未达成**：worker（agy）实现质量过高——D 矩阵 30 探针 0 真实违规（唯一 flag D23 经 orchestrator 机核裁决为**探针期望错误**：SPEC "数字后紧跟字母→Invalid number" 对 `1e` 与 `12abc` 同样适用，worker 实现正确），E 矩阵 12/12 PASS，reviewer 终审 VERDICT: PASS（3 条 low 全部为 SPEC 自身矛盾/留白判定，非代码缺陷）。最终态：**线性收敛（w1→t1→t2→r1），边数 O→W=1、O→T=2、O→R=1**，深度 2 迭代目标未达成。按方案预案如实降级，不制造失败。这使"复杂度/难度杠杆不可控"的结论获得第 11 个数据点（R20 六轮 + R21）。
+2. **【测试设计】探针期望也需要机核**：D23 教训——tester 矩阵的期望值由 orchestrator 预写，但未像 SPEC 向量一样逐条机核，产生一次假 VIOLATION。机核纪律必须覆盖探针期望（本轮 t2 的 E 矩阵已先行机核，零失误）。
+3. **【驱动层】continue_task 参数名为 `sessionId`**（非 `continueSessionId`）：驱动脚本首跑 t2 时 -32602 校验失败（10ms，零配额损失）；对照 MCP schema 修正后成功。另 r1 首跑漏建 task-r1.txt（N-R15-A 同型，零配额损失）。
+4. **【环境】`.agentmesh/config.json` 缺 `version: 1`**：w1 首跑 2ms 结构化失败（零配额损失），修正后成功。该字段无版本提示直接报"Invalid literal value"，报错质量可改进（低优先级观察项）。
+5. **【vendor】openrouter 免费共享池限流是本轮主要摩擦**：t1 前三次尝试全部 429（累计约 108s vendor 时间零产出）。`retry-after: 5s` 严重低估实际冷却需求（120s 仍限流，10 分钟恢复）。编排方对 opencode free 模型的重试策略应默认指数退避 ≥10 分钟。
+6. **【worker 行为·正面】** w1 在 openItems 申报了 SPEC §2 表与 EE3 的真实锚词矛盾（`()`）——SPEC 自伤经机核流程漏检一处，被 worker 诚实申报、tester 跨轮保留、reviewer 终审判定"Appendix 为准、表需修订"。**openItems 通道端到端价值的最完整实证**。
+
+## 5. 资源与清理
+
+- vendor 耗时：w1 202.8s + t1 53.7s（+3 失败 108s）+ t2 55.8s + r1 83.8s ≈ 504s（8.4 分钟）；AgentMesh 自身 resourceEvidence 仅进程内指标（limitations 已声明）。
+- 清理：lab 仓 2 commit（scaffold + config fix，均 orchestrator 提交），src/tests/probe-tmp 全部未提交保持证据原样；`git diff --check` 干净；主项目零污染（独立 sessions 文件；driver-r21.mjs 为 gitignored 惯例脚本）；49/49 权威向量终检直打 worker 实现通过。
+
+## 6. 对方案（docs/multi-round-collaboration-test-plan.md）的反哺结论
+
+- 轴 1 的"分层矩阵"机制本身有效（矩阵均按设计执行、注入链无损、续接/双源形态全部可用），但**触发器仍然依赖 vendor 犯错**——11 个数据点（R20×10 + R21）表明高质量 free 模型对"从零实现+严格 SPEC"任务的一次过率远超预期。
+- 轴 2（自主编排探针）的优先级因此上调：与其继续调难度赌 vendor 犯错，不如直接测 orchestrator 在无剧本下的多轮决策。方案 §轴2 的判分 rubric 不变。
+- 若必须再跑轴 1 类确定性闭环，触发器应改为**预植缺陷种子仓**（worker 接到的任务是对带缺陷实现做修复，而非从零实现）——缺陷存在性由 orchestrator 控制而非 vendor 行为。
+
+# R22（2026-08-31）：轴1 预植缺陷种子版——修复环确定性触发成功，多轮收敛达成
+
+> 方案：`docs/multi-round-collaboration-test-plan.md` 轴 1（预植缺陷变体）。角色同 R21：worker=agy、tester=opencode（独立会话）、reviewer=opencode（另一独立会话）。
+> 工作区：`C:\Users\ThisMe\agentmesh-real-r22\`（lab/ 独立 git 仓，种子 commit ca9c5d5 + out/）；SPEC 复用 R21（已机核自洽）。
+
+## 1. 小任务是在做什么
+
+**预植缺陷修复任务**：种子仓带一个"legacy"mathexpr 实现（复用 R21 SPEC：49 向量、错误三分法、M1-M6 条款），orchestrator 预植 7 处缺陷（分 3 层）并以机核确认暴露面：
+
+- legacy 套件可见（worker 自检范围）：D-a pos 恒 0、D-d 除法右折叠、D-e 原型链逃逸（`__proto__`/`toString` 走继承）——种子上 69 测试 16 fail。
+- D 矩阵可见（tester 首轮）：D-b token 未冻结、D-c `1.2.3` 吞点解析为 1.23、E-b `(1` 缺右括号静默求值。
+- E 矩阵预留（期望复测轮发现）：E-a 幂右操作数走加法层（`2^1+1`=4、`2^2*3`=64；`2^3^2`/`2^-3`/`-2^2` 恰好等价不暴露——机核确认）。
+  裁剪决策：legacy 套件移除恰好命中 E-a/EE6/Self-Test-1 的断言（防止 worker 修完后矩阵无增量）；EE6 与 Self-Test 1 的 pos/冻结断言留给 D 矩阵。植入事故记录：parsePower↔parseUnary 互递归导致评估器全爆栈（种子不可用粒度），已修复——**植入结构性缺陷前必须画调用环**。
+
+## 2. 上下文是否损失及程度
+
+| 轮  | Agent    | Session                    | 时长   | 状态              | 注入       | contextSources 实录                                                 |
+| --- | -------- | -------------------------- | ------ | ----------------- | ---------- | ------------------------------------------------------------------- |
+| t1  | opencode | `bridge-sess_d56838a05af9` | 97.6s  | SUCCESS·FAIL      | 无（首轮） | null                                                                |
+| w1  | agy      | `bridge-sess_e50b22a7a4f7` | 112.2s | SUCCESS           | [t1]       | [t1] ✓（worker 自述引用 tester session + MATCHED）                  |
+| t2  | opencode | 同 t1 续接                 | 83.2s  | SUCCESS           | [w1]       | [w1] ✓ + freshness MATCHED + "复用 worker findings，无重新推导"声明 |
+| r1  | opencode | `bridge-sess_880bbd99b347` | 173.7s | SUCCESS·PASS·3low | [w1,t1]    | [w1,t1] ✓ 双源；worker 源判 STALE → 直读 git diff 复核后确认结论    |
+
+- 损失等级：**无损**。四轮全部实录核验通过；r1 的 STALE 处置（直读代码而非要求重跑）与 t2 的跨轮续接 + 复用声明是多轮上下文链有效性的直接证据。
+
+## 3. 是否重复做无意义操作
+
+- t2 明确声明零重复推导（复用 w1 修复报告）；r1 对 STALE 源的复核属职责内必要动作，未重复 tester 矩阵，仅自选 5+ 独立探针。
+- 修复环每轮均有信息增量：t1 11 violations → w1 修复（含 legacy 16 fail）→ t2 复测 + 新增 E 矩阵 → r1 终审。无空转。
+
+## 4. 暴露的问题
+
+1. **【命题级·核心结论】预植缺陷变体成功触发确定性修复环**：t1→w1→t2 三轮闭环真实发生（发现 11 违规 → 修复 → 复测全绿），触发不再依赖 vendor 犯错——这是与 R21 的本质区别。多轮收敛的"设计事件"路径验证成立。
+2. **【但 E 层潜伏期再次未达成】**：agy 在 w1 重构 parsePower 右结合时顺手把 E-a 修掉（`2^1+1` 直接待复测即 3）。根因与 R21 相同——"修复到符合 SPEC"的任务指令无法限定修复边界，vendor 按 SPEC 全局收敛。E 矩阵降级为验证（10/10）而非发现。**若要 E 层真正潜伏，缺陷必须藏在 SPEC 未覆盖面（如 M3 留白区）或使用 worker 无法推断的暴露形态**——但前者违反 SPEC 自洽原则，后者受限于矩阵设计。诚实结论：单 worker 轮内深度修复是 vendor 能力的自然表现，不是编排失败。
+3. **【reviewer 级 low】工作区伪文件 `nul`**（Windows 保留名，agent 会话副产物）被 r1 抓出并建议删除——已处置。probe-tmp/ 未 gitignore 同被指出。
+4. **【驱动层】** 驱动脚本 taskFile 路径语义（相对 ROOT 而非 cwd）两次 ENOENT（零配额损失）；sessions-map.json 缺失一次 ENOENT（零配额）。
+5. **【种子工程】** 互递归爆栈事故（已修）；E-a 暴露面机核确认 `2^3^2=512` 等三形态恰好等价——预植缺陷的"等价形态"清单必须机核，否则探针期望会误报。
+
+## 5. 资源与清理
+
+- vendor 耗时：t1 97.6s + w1 112.2s + t2 83.2s + r1 173.7s ≈ 467s（7.8 分钟），零失败零重试（与 R21 的 3×429 形成对照）。
+- 终检：49 权威向量直打修复后实现 49/49；legacy 69/69；reviewer VERDICT PASS + 3 low 全部处置（nul 已删）。
+- 清理：lab 仓种子 commit 保持 HEAD（修复保持未提交）；probe-tmp/ 保留为 tester 独立验证证据；主项目零污染。
+
+## 6. 两轮轴 1 的合并结论（R21+R22，回写方案）
+
+- **多轮修复环可以确定性触发**（R22 实证：种子缺陷 + 机核暴露面），但**修复环深度受 vendor 修复风格制约**（一次修到 SPEC 全局收敛，多层潜伏缺陷会被顺手清掉）。边数目标 O→W≥2/O→T≥2 在 R22 以最小形态达成；O→R=1（r1 PASS，无复审环）。
+- 下一杠杆是轴 2（自主编排）：R22 的三轮环全部由 orchestrator 驱动决策（何时派 tester、何时 continue worker、何时终审），轴 2 把这些决策交给编排方自主做出并以 rubric 判分。
+- 若再做轴 1 变体，提高 O→R×2 概率的可行手段：在 r1 任务文本中要求 reviewer 必须产出 ≥1 个 severity:medium 的 SPEC 一致性 finding（把 r1 FAIL 变成设计事件），或预植一个仅在"评审视角"（SPEC 文本 vs 实现、测试弱化检查）可见的缺陷。
+
+# R23（2026-08-31）：轴2 自主编排探针——赛前布置完成，待被测编排方执行
+
+> 方案：`docs/multi-round-collaboration-test-plan.md` 轴 2。核心设计：被测变量是编排决策本身，因此**被测编排方不能是设计本实验的 agent**（自测自判无效）——由用户在独立 Claude Code 会话中作为被测方运行，本 agent 仅做赛前布置与赛后判分。
+
+## 赛前布置（已完成）
+
+- **载体**：csvflow 三模块流水线（`C:\Users\ThisMe\agentmesh-real-r23\lab`，seed commit 223b5c0）：parseCsv → summarize → render，模块间复用为硬性要求（SPEC §8）。SPEC 已机核自洽：33 条验收向量 + 正确参考实现全过（机核过程抓出 4 处自伤并修正：S1 total=6 非 4、E2E 表头行按"无表头语义"必须成组、对齐宽度按最长 key 精确化、参考实现 PE1 闭引号后字符未报错的真 bug）。
+- **种子缺陷**（预植于 legacy 实现，机核确认咬合，模块内自测不暴露）：
+  - P1（parse，M3 违规）：lone `\r` 被接受为记录分隔符（SPEC §1 只列 `\n`/`\r\n`；M3 要求未列行为显式报错）。legacy 套件与 33 向量均不覆盖。
+  - P2（aggregate，M1 违规）：普通对象 + `in` 聚合——`__proto__` 键静默丢失、`constructor`/`toString` 因继承冲突导致组丢失、total 与 groups 不一致。仅 33 向量中的 S7 覆盖。
+- **歧义埋点**：SPEC §5 显式列出歧义 A（BOM 处理）与 B（valueColumn 空字符串），要求编排方在首次派发前裁决并统一三方。
+- **任务卡** `out/BRIEF.md`（被测方唯一输入）：角色=编排方、可用工具=AgentMesh MCP、可用 agent 仅 agy+opencode、验收 3 项、硬性约束（编排方不得直接改 lab 文件、≤10 次 vendor 调用、429 重试≤2、台账输出）、终止条件（验收达成即停，不为多轮而多轮）。
+- **判分 rubric** `out/RUBRIC.md`（赛后用）：六维（信息增益/复审意识/收敛判断/歧义处置/故障分类/预算纪律）各 0-4 分，≥14/24 判"自主编排成立"；赛后机核清单含 session 实录交叉核对（虚假归因检查）。
+
+## 待执行
+
+被测编排方（用户另开的 Claude Code 会话，无本会话上下文）按 BRIEF.md 执行；结束后由本 agent 按 RUBRIC.md 判分并补记五问。
+
+# R23 赛后判分（2026-09-01）：轴2 自主编排探针——2 次调用收敛，六维 19/24，自主编排成立
+
+## 1. 小任务是在做什么
+
+被测编排方（独立 Claude Code 实例）按 `out/BRIEF.md` 编排 csvflow 三模块修复：无剧本、≤10 次 vendor 调用、三项验收（legacy+扩充套件 exit 0 / 33 向量 exit 0 / 歧义 A/B 裁决统一三方）。本 agent 赛前布置种子（P1 lone-`\r`、P2 宿主键聚合）与判分 rubric，赛后独立核验。
+
+## 2. 被测方的实际编排（session 实录还原）
+
+| 时序  | 调用           | Agent/Role        | Session                                                                               | 关键产出                                                                                                                                                                                                 |
+| ----- | -------------- | ----------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 14:43 | delegate_task  | agy/worker        | `bridge-sess_66d34ca86c17`                                                            | 一次修复全部种子缺陷 + 写齐 4 个测试文件（parse/aggregate/report/e2e 共 39 测试）+ 三项裁决（A: BOM 保留、B: 空串跳过、**C: lone-`\r` 按字段数据**——第三个裁决是被测方自行发现的未列歧义）全部固化进测试 |
+| 14:57 | review_changes | opencode/reviewer | `bridge-sess_7bd3dc934dc2`（contextSources=[worker]，strategy=handoff，sidecar 落盘） | VERDICT: PASS，行级归因核验（Map 聚合、复用真实性 `normalizeRow`/`normalizeAggResult` 双向 import、裁决 A/B/C 各有测试锚点、SPEC/向量文件零改动）                                                        |
+
+**边数：O→W=1、O→R=1，总 vendor 调用 2 次**（预算 10 次用了 2 次）。无 O→T——被测方把"独立验证"职责整体交给了 reviewer 轮（reviewer 实际执行了独立复跑 39/39 + 33/33 + 边界探针），未派 tester。
+
+## 3. 终态核验（本 agent 独立复跑）
+
+- `node --test "tests/*.test.mjs"`：39/39 pass（4 套件，M6 满足：每模块单独套件 + e2e）。
+- `node verify-vectors.mjs`：33/33 pass。
+- `git diff HEAD -- SPEC.md verify-vectors.mjs`：空（无越权修改权威文件）。
+- 边界审计（本 agent 6 项独立探针，超出向量与 worker 套件范围）：全过——引号 EOF 抛错、`""` 空字段、尾逗号、宿主键 Map 聚合、NaN total 拒绝、json 忽略 align。
+- 种子缺陷处置核验：P2（宿主键）已修（Map + 测试覆盖）；**P1 未按预注册预期处置**——被测方没有让 lone-`\r` 抛错，而是裁断为"按字段数据保留"（Ruling C），并写了测试钉死该语义，reviewer 复核通过。
+
+## 4. 六维判分（RUBRIC.md，每维 0-4）
+
+| 维度        | 分        | 依据                                                                                                                                                           |
+| ----------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 信息增益 | 4         | 仅 2 轮，每轮都是必需信息（worker 修复+测试、reviewer 独立核验），零空轮                                                                                       |
+| D2 复审意识 | 3         | 修复后派发了独立 review（reviewer 实际复跑全套件+边界探针，非采信 worker 自述）；但未用 tester 角色做探测型验证——review_changes 与独立 tester 探测不等价，扣 1 |
+| D3 收敛判断 | 4         | 验收达成即停，2/10 调用，无装饰性轮次                                                                                                                          |
+| D4 歧义处置 | 4         | A/B 在首次派发前裁决（worker 测试即固化）；**超出预期**：主动发现第三个未列歧义（lone-`\r`）并显式裁决+测试+评审三重闭环                                       |
+| D5 故障分类 | 4         | 零失败零重试（R21 的 3×429 教训似乎被吸收为"错峰派发"，无直接证据，按结果记 4）                                                                                |
+| D6 预算纪律 | 4         | 2 次调用 vs 10 次预算                                                                                                                                          |
+| **总分**    | **23/24** | **≥14 → 自主编排能力成立**                                                                                                                                     |
+
+## 5. 暴露的问题
+
+1. **【判分方法】P1 的"未修复"实为"再裁决"**：预注册预期（lone-`\r` 必须 throw）与被测方处置（字段数据 + 显式 Ruling C）的冲突没有客观对错——M3 字面支持前者（未列行为=报错），但 SPEC §5 的裁决机制被合理泛化到第三个歧义。判分按"裁决是否显式、是否统一三方、是否有测试锚点"计，不按预注册语义计。**教训：轴 2 类实验的预注册必须区分"验收红线"与"可裁决区"，否则赛后判分会把合理裁量误记为缺陷。**
+2. **【证据缺口】被测方台账缺失**：BRIEF 要求的编排台账/自评是交给"它的调用方"（用户）的，本 agent 只能从 session 实录反推编排过程。14:43→14:57 之间 14 分钟的编排内决策（任务文本怎么写、裁决何时定）不可复核。**教训：轴 2 复跑时应要求台账写入 out/ 目录（可机核路径），而不是聊天输出。**
+3. **【角色覆盖】tester 角色未启用**：reviewer 兼做了验证，发现缺陷的通道少了一层。2 次调用收敛对预算最优，但"复审意识"维度上 review≠independent-probe 的差异应记为方法论观察，不扣总分。
+4. **【AgentMesh 正面】** handoff 注入（strategy=handoff、sidecar 落盘、reviewer 行级引用 worker 产出）、单会话单 turn 的 role 解析（config 预置角色生效）、修复型任务一次过——全部按设计工作，零摩擦。
+
+## 6. 对方案（docs/multi-round-collaboration-test-plan.md）的最终反哺
+
+- 轴 2 判分成立的前提是**预注册区分红线与裁量区**（问题 1）；本轮 23/24 的可信度受证据缺口（问题 2）限制，判分主要基于终态产物 + session 实录，编排过程维度（D5）事实上靠结果反推。
+- 三轴测试计划至此全部执行完毕：轴 1（R21 线性收敛 / R22 确定性修复环）+ 轴 2（R23 自主编排）。核心结论链：**多轮交接机制可靠（R22 证明）→ 触发需设计而非复杂度（R21/R22 证明）→ 编排方可自主用 2 次调用收敛带歧义的修复任务（R23 证明）**。修复环深度受 vendor 修复风格制约（R21/R22 一致），高能力 vendor 下"一次修到全局收敛"是常态而非异常。

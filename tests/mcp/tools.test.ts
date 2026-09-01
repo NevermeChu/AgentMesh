@@ -89,6 +89,24 @@ class TestAdapter extends BaseAdapter {
         reviewVerdictRequired: verdictRequired,
       });
     }
+    if (options.task.includes("HANDOFF_BLOCKER_TRIGGER")) {
+      return this.formatSuccessResult("done", Date.now(), {
+        nativeSessionId: "native_handoff_blocker",
+        exitCode: 0,
+        summary: "Task completed: HANDOFF_BLOCKER_TRIGGER",
+        finalAnswer: [
+          "Implemented the migration but cannot deploy it.",
+          "## Goal",
+          "Ship the billing export",
+          "## Decisions",
+          "- Reuse the shared CSV writer",
+          "## Blockers",
+          "- Need production SSH credentials (requires: environment)",
+        ].join("\n"),
+        role: options.role,
+        reviewVerdictRequired: verdictRequired,
+      });
+    }
     if (options.task.includes("GHOST_FILE_TRIGGER")) {
       return this.formatSuccessResult("done", Date.now(), {
         nativeSessionId: "native_ghost_file",
@@ -183,6 +201,8 @@ describe("mcp/tools protocol integration", () => {
     expect(toolNames).toContain("continue_task");
     expect(toolNames).toContain("list_agents");
     expect(toolNames).toContain("get_session");
+    expect(toolNames).toContain("get_session_context");
+    expect(toolNames).toContain("get_session_events");
     expect(toolNames).toContain("get_role_config");
   });
 
@@ -298,7 +318,26 @@ describe("mcp/tools protocol integration", () => {
     const content = res.content as Array<{ type: string; text: string }>;
     expect(content[0]?.text).toContain("Handoff: goal=Ship the billing export");
     expect(content[0]?.text).toContain("openItems=0");
+    expect(content[0]?.text).toContain("blockers=0");
     expect(content[0]?.text).not.toContain("⚠");
+  });
+
+  it("surfaces structured blockers as an escalation signal in worker responses", async () => {
+    const res = await client.callTool({
+      name: "delegate_task",
+      arguments: {
+        agent: "codex",
+        task: "Deploy migration HANDOFF_BLOCKER_TRIGGER",
+        role: "worker",
+      },
+    });
+
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    expect(content[0]?.text).toContain("blockers=1");
+    expect(content[0]?.text).toContain(
+      "⚠ 1 blocker(s) reported (requires: environment) — resolve before chaining further work (see get_session_context)",
+    );
   });
 
   it("fails closed for an unknown reviewer verdict", async () => {
@@ -413,6 +452,50 @@ describe("mcp/tools protocol integration", () => {
     expect(parsed.totalTurns).toBe(1);
     expect(parsed.freshness).toBe("MATCHED");
     expect(parsed.finalAnswer).toContain("Source turn");
+  });
+
+  it("serves the append-only event projection with a cursor through get_session_events", async () => {
+    const sourceRun = await runner.delegateTask({ agent: "codex", task: "Source turn" });
+
+    const res = await client.callTool({
+      name: "get_session_events",
+      arguments: { sessionId: sourceRun.sessionId! },
+    });
+    expect(res.isError).toBeFalsy();
+    const content = res.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]!.text) as {
+      sessionId: string;
+      totalEvents: number;
+      lastEventId: number;
+      totalTurns: number;
+      events: Array<{ eventId: number; turnIndex: number; type: string }>;
+    };
+    expect(parsed.sessionId).toBe(sourceRun.sessionId);
+    expect(parsed.totalTurns).toBe(1);
+    expect(parsed.totalEvents).toBeGreaterThan(0);
+    expect(parsed.lastEventId).toBe(parsed.totalEvents);
+    expect(parsed.events[0]!.type).toBe("turn.recorded");
+    expect(parsed.events[0]!.turnIndex).toBe(1);
+
+    // An exclusive cursor at the end of the projection yields an empty page.
+    const drained = await client.callTool({
+      name: "get_session_events",
+      arguments: { sessionId: sourceRun.sessionId!, afterEventId: parsed.lastEventId },
+    });
+    expect(drained.isError).toBeFalsy();
+    const drainedContent = drained.content as Array<{ type: string; text: string }>;
+    const drainedParsed = JSON.parse(drainedContent[0]!.text) as { events: unknown[] };
+    expect(drainedParsed.events).toEqual([]);
+
+    const missing = await client.callTool({
+      name: "get_session_events",
+      arguments: { sessionId: "bridge-sess_missing" },
+    });
+    expect(missing.isError).toBe(true);
+    const missingContent = missing.content as Array<{ type: string; text: string }>;
+    expect(missingContent[0]?.text).toContain(
+      "Context Status: CONTEXT_INSUFFICIENT — missing: session",
+    );
   });
 
   it("rejects out-of-range turn indexes and unknown sessions in get_session_context", async () => {

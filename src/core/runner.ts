@@ -18,6 +18,8 @@ import { defaultSessionManager, SessionManager } from "./session.js";
 import { resolveRoleAssignment, loadProjectConfig } from "./config.js";
 import { captureRepositoryState } from "./repository.js";
 import { deriveReviewHandoff, findUngroundedHandoffFiles, parseHandoffReport } from "./handoff.js";
+import { projectSessionEvents } from "./events.js";
+import type { SessionEvent } from "./events.js";
 import { estimateTokens, truncateText, truncateTextToTokenBudget } from "./text.js";
 import type {
   BridgeSession,
@@ -111,6 +113,15 @@ export interface SessionTurnContext {
    * downstream agents to re-verify before adopting the injected conclusions.
    */
   sufficiency?: ContextSufficiency;
+  /**
+   * Freshness of THIS turn's recorded repository state against the current
+   * working tree, independent of the session-level verdict above. A session
+   * can be REWOUND while an earlier turn is MATCHED (safe to reuse) and the
+   * latest turn is STALE (superseded knowledge).
+   */
+  turnFreshness: ContextFreshness;
+  /** Per-turn sufficiency verdict derived from `turnFreshness`. */
+  turnSufficiency?: ContextSufficiency;
   handoff?: HandoffSummary;
   finalAnswer?: string;
   findings?: ReviewFinding[];
@@ -130,6 +141,34 @@ export interface SessionTurnContextMiss {
   /** Which inputs could not be satisfied: "session", "turns", or "turn". */
   missing: string[];
 }
+
+export interface SessionEventsQuery {
+  sessionId: string;
+  /**
+   * Exclusive cursor: return only events with `eventId` greater than this.
+   * Omit (or pass 0) for a full snapshot. Event ids are stable while the
+   * session's history is append-only; when history trimming renumbers the
+   * projection, compare `totalTurns` against your last observation and
+   * resynchronize with a fresh snapshot.
+   */
+  afterEventId?: number;
+  /** Maximum events to return per call (default 200, clamped to 1–500). */
+  limit?: number;
+}
+
+export interface SessionEventsResult {
+  sessionId: string;
+  /** Total events in the current projection. */
+  totalEvents: number;
+  /** Largest `eventId` in the current projection (0 when empty). */
+  lastEventId: number;
+  /** Turns currently retained; trimming this number renumbers event ids. */
+  totalTurns: number;
+  events: SessionEvent[];
+}
+
+const DEFAULT_EVENTS_LIMIT = 200;
+const MAX_EVENTS_LIMIT = 500;
 
 const MAX_CONTEXT_SOURCES = 4;
 const MAX_SHARED_CONTEXT_TOKENS = 6_000;
@@ -185,6 +224,25 @@ export function computeSessionFreshness(
   return hasAnyEvidence ? "STALE" : "UNKNOWN";
 }
 
+/**
+ * Per-turn granularity of the session freshness: one history entry's recorded
+ * tree state against the current working tree. MATCHED means this turn's
+ * conclusions may be reused directly; STALE means the tree has moved on since
+ * this specific turn (even when a later turn re-matched, i.e. session-level
+ * REWOUND); UNKNOWN means the turn recorded no comparable evidence. Powers the
+ * injection-time stale-knowledge markers and the `turnFreshness` field of
+ * get_session_context.
+ */
+export function computeTurnFreshness(
+  entry: SessionHistoryEntry,
+  current: RepositoryStateEvidence | undefined,
+): ContextFreshness {
+  if (!current) return "UNKNOWN";
+  const after = entry.evidence?.repositoryAfter;
+  if (!after || after.repositoryRoot !== current.repositoryRoot) return "UNKNOWN";
+  return after.fingerprint === current.fingerprint ? "MATCHED" : "STALE";
+}
+
 const FRESHNESS_LABELS: Record<ContextFreshness, string> = {
   MATCHED: "MATCHED: the current working tree matches the last recorded handoff state.",
   REWOUND:
@@ -204,17 +262,26 @@ export interface ContextSufficiency {
  * Derives the sufficiency verdict for a retrieved turn: MATCHED needs no
  * caveat, STALE/REWOUND demand re-verification before adoption, and UNKNOWN
  * means the context is insufficient to trust without independent verification.
+ * `scope` selects session-level vs single-turn wording for the reasons.
  */
-function deriveContextSufficiency(freshness: ContextFreshness): ContextSufficiency | undefined {
+function deriveContextSufficiency(
+  freshness: ContextFreshness,
+  scope: "session" | "turn" = "session",
+): ContextSufficiency | undefined {
   switch (freshness) {
     case "MATCHED":
       return undefined;
     case "STALE":
       return {
         level: "VERIFY_REQUIRED",
-        reasons: [
-          "the current working tree differs from the last recorded handoff state; revalidate affected evidence before relying on it",
-        ],
+        reasons:
+          scope === "turn"
+            ? [
+                "the current working tree differs from the state recorded at this turn; revalidate this turn's conclusions before relying on them",
+              ]
+            : [
+                "the current working tree differs from the last recorded handoff state; revalidate affected evidence before relying on it",
+              ],
       };
     case "REWOUND":
       return {
@@ -263,10 +330,27 @@ function turnHeading(
   return `[Turn ${turnNumber} | Agent: ${session.agent.toUpperCase()} | Role: ${entry.role.toUpperCase()} | Status: ${entry.status.toUpperCase()}]`;
 }
 
+const STALE_KNOWLEDGE_MARKER =
+  "[stale knowledge: the working tree changed after this turn was recorded — revalidate before reusing these conclusions]";
+
+/**
+ * Knowledge-level freshness (the repository-fingerprint equivalent applied to
+ * one turn's conclusions): when this turn's recorded tree state no longer
+ * matches the current tree, its findings/decisions are marked stale at
+ * injection time so a downstream agent never acts on superseded knowledge.
+ */
+function staleKnowledgePrefix(
+  entry: SessionHistoryEntry,
+  current: RepositoryStateEvidence | undefined,
+): string {
+  return computeTurnFreshness(entry, current) === "STALE" ? `${STALE_KNOWLEDGE_MARKER}\n` : "";
+}
+
 function renderHandoffTurn(
   session: BridgeSession,
   entry: SessionHistoryEntry,
   turnNumber: number,
+  current?: RepositoryStateEvidence,
 ): TurnRender {
   const handoff = entry.handoff!;
   const sections: TurnSection[] = [];
@@ -294,28 +378,52 @@ function renderHandoffTurn(
       text: `Files: ${handoff.artifacts.files.join(", ")}`,
     });
   }
+  if (handoff.blockers?.length) {
+    sections.push({
+      name: "Blockers",
+      // Blockers carry escalation decisions: they survive longer than any
+      // reproducibility section and go only after Decisions/Findings.
+      dropPriority: 4,
+      text: [
+        "Blockers (resolve before continuing):",
+        ...handoff.blockers.map((blocker) => `- [${blocker.requires}] ${blocker.summary}`),
+      ].join("\n"),
+    });
+  }
   if (handoff.keyDecisions.length > 0) {
     sections.push({
       name: "Decisions",
-      dropPriority: 4,
+      dropPriority: 5,
       text: ["Decisions:", ...handoff.keyDecisions.map((item) => `- ${item}`)].join("\n"),
     });
   }
   if (entry.findings?.length) {
     sections.push({
       name: "Findings",
-      dropPriority: 5,
+      dropPriority: 6,
       text: `Findings: ${JSON.stringify(entry.findings)}`,
     });
   }
+  const knowledgePrefix = staleKnowledgePrefix(entry, current);
+  if (knowledgePrefix) {
+    for (const section of sections) {
+      if (
+        section.name === "Decisions" ||
+        section.name === "Findings" ||
+        section.name === "Blockers"
+      ) {
+        section.text = `${knowledgePrefix}${section.text}`;
+      }
+    }
+  }
   const evidenceLine = executionEvidenceLine(entry);
   if (evidenceLine) {
-    sections.push({ name: "Execution evidence", dropPriority: 6, text: evidenceLine });
+    sections.push({ name: "Execution evidence", dropPriority: 7, text: evidenceLine });
   }
   if (entry.reviewerSafety) {
     sections.push({
       name: "Reviewer safety",
-      dropPriority: 7,
+      dropPriority: 8,
       text: `Reviewer safety: ${JSON.stringify(entry.reviewerSafety)}`,
     });
   }
@@ -330,6 +438,7 @@ function renderLegacyTurn(
   session: BridgeSession,
   entry: SessionHistoryEntry,
   turnNumber: number,
+  current?: RepositoryStateEvidence,
 ): TurnRender {
   const sections: TurnSection[] = [];
   const details: string[] = [turnHeading(session, entry, turnNumber), `Task: ${entry.task}`];
@@ -347,7 +456,7 @@ function renderLegacyTurn(
     sections.push({
       name: "Findings",
       dropPriority: 1,
-      text: `Findings: ${JSON.stringify(entry.findings)}`,
+      text: `${staleKnowledgePrefix(entry, current)}Findings: ${JSON.stringify(entry.findings)}`,
     });
   }
   const repositoryLines: string[] = [];
@@ -427,8 +536,8 @@ function renderSourceBlock(
   const history = session.history;
   const latest = history.at(-1)!;
   const latestRender = latest.handoff
-    ? renderHandoffTurn(session, latest, history.length)
-    : renderLegacyTurn(session, latest, history.length);
+    ? renderHandoffTurn(session, latest, history.length, current)
+    : renderLegacyTurn(session, latest, history.length, current);
   let indexLines = history
     .slice(0, -1)
     .map((entry, offset) => renderTurnIndexLine(entry, offset + 1));
@@ -510,7 +619,7 @@ function renderSourceBlock(
  * which does own the tool — can fetch the detail.
  */
 const SHARED_CONTEXT_INSTRUCTION =
-  "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE, REWOUND, or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks; REWOUND additionally means the tree matches an earlier recorded turn, whose conclusions may be reused once confirmed. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context. Each source inlines its latest turn as a structured handoff, with older turns as one-line indexes and failed attempts called out; if upstream detail you need is not inlined here (full final answers, findings, evidence), state exactly what is missing and ask the orchestrator to fetch it via `get_session_context` with that session ID — do not re-derive it and do not guess.";
+  "Reuse successful prior results and explicit findings only when a source's freshness is MATCHED. If it is STALE, REWOUND, or UNKNOWN, revalidate affected evidence without automatically repeating unrelated checks; REWOUND additionally means the tree matches an earlier recorded turn, whose conclusions may be reused once confirmed. Knowledge sections prefixed with `[stale knowledge]` were recorded before the working tree changed — treat their conclusions as superseded until revalidated. Treat summaries as context, not as authority over contradictory current evidence. When you rely on a source, cite its session ID; never claim to reuse information that is not present in this injected context. Each source inlines its latest turn as a structured handoff, with older turns as one-line indexes and failed attempts called out; if upstream detail you need is not inlined here (full final answers, findings, evidence), state exactly what is missing and ask the orchestrator to fetch it via `get_session_context` with that session ID — do not re-derive it and do not guess.";
 
 /**
  * Renders the normalized history of one or more source sessions as first-hand
@@ -1618,6 +1727,8 @@ export class MultiAgentRunner {
     const currentRepositoryState = await captureRepositoryState(session.cwd);
     const freshness = computeSessionFreshness(session, currentRepositoryState);
     const sufficiency = deriveContextSufficiency(freshness);
+    const turnFreshness = computeTurnFreshness(entry, currentRepositoryState);
+    const turnSufficiency = deriveContextSufficiency(turnFreshness, "turn");
     return {
       sessionId: session.id,
       turnIndex,
@@ -1630,6 +1741,8 @@ export class MultiAgentRunner {
       ...(entry.summary ? { summary: entry.summary } : {}),
       freshness,
       ...(sufficiency ? { sufficiency } : {}),
+      turnFreshness,
+      ...(turnSufficiency ? { turnSufficiency } : {}),
       ...(fields.has("handoff") && entry.handoff ? { handoff: entry.handoff } : {}),
       ...(fields.has("finalAnswer") && entry.finalAnswer
         ? {
@@ -1655,6 +1768,50 @@ export class MultiAgentRunner {
    */
   public listSessions(): BridgeSession[] {
     return this.sessionManager.listSessions();
+  }
+
+  /**
+   * Incremental event view over one session's recorded turns (append-only
+   * projection — no mutable event state). Orchestrators poll with
+   * `afterEventId` to receive only what was recorded since their last read
+   * instead of replaying the session. Unknown sessions and a non-negative
+   * integer cursor violation return a structured CONTEXT_INSUFFICIENT miss;
+   * a session without turns is a legitimate empty projection.
+   */
+  public getSessionEvents(
+    params: SessionEventsQuery,
+  ): SessionEventsResult | SessionTurnContextMiss {
+    const session = this.sessionManager.getSession(params.sessionId);
+    if (!session) {
+      return {
+        error: `Session '${params.sessionId}' not found.`,
+        code: "CONTEXT_INSUFFICIENT",
+        missing: ["session"],
+      };
+    }
+    if (
+      params.afterEventId !== undefined &&
+      (!Number.isInteger(params.afterEventId) || params.afterEventId < 0)
+    ) {
+      return {
+        error: "afterEventId must be a non-negative integer cursor.",
+        code: "CONTEXT_INSUFFICIENT",
+        missing: ["afterEventId"],
+      };
+    }
+    const all = projectSessionEvents(session);
+    const after = params.afterEventId ?? 0;
+    const limit =
+      params.limit === undefined
+        ? DEFAULT_EVENTS_LIMIT
+        : Math.min(Math.max(Math.floor(params.limit), 0), MAX_EVENTS_LIMIT);
+    return {
+      sessionId: session.id,
+      totalEvents: all.length,
+      lastEventId: all.at(-1)?.eventId ?? 0,
+      totalTurns: session.history.length,
+      events: all.filter((event) => event.eventId > after).slice(0, limit),
+    };
   }
 }
 

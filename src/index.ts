@@ -20,6 +20,8 @@ export type {
   SessionExecutionEvidence,
   SharedContextAudit,
   HandoffSummary,
+  HandoffBlocker,
+  BlockerRequirement,
   SessionManagerOptions,
   RunnerOptions,
 } from "./core/types.js";
@@ -98,6 +100,7 @@ export {
   buildSharedContext,
   buildSharedContextDetailed,
   computeSessionFreshness,
+  computeTurnFreshness,
 } from "./core/runner.js";
 export type {
   DelegateTaskParams,
@@ -108,7 +111,19 @@ export type {
   SessionTurnContext,
   SessionTurnContextField,
   SessionTurnContextMiss,
+  SessionEventsQuery,
+  SessionEventsResult,
 } from "./core/runner.js";
+export { projectSessionEvents } from "./core/events.js";
+export type {
+  SessionEvent,
+  SessionEventType,
+  TurnRecordedEvent,
+  HandoffRecordedEvent,
+  FindingsRecordedEvent,
+  EvidenceRecordedEvent,
+  SafetyRecordedEvent,
+} from "./core/events.js";
 
 // MCP Server
 export { createMcpServer, startMcpServer } from "./mcp/server.js";

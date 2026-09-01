@@ -19,11 +19,21 @@ const NonBlankString = z.string().trim().min(1);
  * One-line handoff digest for MCP responses. openItems is the only channel that
  * can carry "the SPEC itself is contradictory" — surface it (with an explicit
  * warning line) so orchestrators can escalate without polling get_session.
+ * Blockers are the machine-readable escalation channel: when present, the
+ * distinct `requires` targets are listed so the orchestrator knows whether to
+ * re-delegate to another agent, ask the user, or fix the environment.
  */
 function formatHandoffDigest(handoff: HandoffSummary): string[] {
+  const blockers = handoff.blockers ?? [];
   const lines = [
-    `Handoff: goal=${truncateText(handoff.goal, MAX_HANDOFF_GOAL_CHARS)}; decisions=${handoff.keyDecisions.length}; files=${handoff.artifacts.files?.length ?? 0}; commands=${handoff.artifacts.commands?.length ?? 0}; openItems=${handoff.openItems.length}`,
+    `Handoff: goal=${truncateText(handoff.goal, MAX_HANDOFF_GOAL_CHARS)}; decisions=${handoff.keyDecisions.length}; files=${handoff.artifacts.files?.length ?? 0}; commands=${handoff.artifacts.commands?.length ?? 0}; openItems=${handoff.openItems.length}; blockers=${blockers.length}`,
   ];
+  if (blockers.length > 0) {
+    const requires = [...new Set(blockers.map((blocker) => blocker.requires))].join(", ");
+    lines.push(
+      `⚠ ${blockers.length} blocker(s) reported (requires: ${requires}) — resolve before chaining further work (see get_session_context)`,
+    );
+  }
   if (handoff.openItems.length > 0) {
     lines.push(
       `⚠ ${handoff.openItems.length} open item(s) reported — review before chaining further work (see get_session_context)`,
@@ -262,6 +272,25 @@ export const GetSessionContextInputSchema = z.object({
     .describe(
       "Which parts of the turn to return; defaults to the structured handoff. Use finalAnswer for the full upstream answer",
     ),
+});
+
+export const GetSessionEventsInputSchema = z.object({
+  sessionId: NonBlankString.describe("The Bridge session ID to read events from"),
+  afterEventId: z
+    .number()
+    .int()
+    .nonnegative()
+    .optional()
+    .describe(
+      "Exclusive cursor: return only events with eventId greater than this value. Omit for a full snapshot. Event ids are stable while the session history is append-only; if history trimming renumbers the projection, totalTurns changes — resynchronize with a fresh snapshot",
+    ),
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .max(500)
+    .optional()
+    .describe("Maximum events to return (default 200)"),
 });
 
 export const GetRoleConfigInputSchema = z.object({
@@ -572,7 +601,53 @@ export function registerMcpTools(server: McpServer, runner: MultiAgentRunner) {
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         return {
-          content: [{ type: "text", text: `Error reading session context: ${errorMsg}` }],
+          content: [
+            {
+              type: "text",
+              text: `Error reading session context: ${errorMsg}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    },
+  );
+
+  // get_session_events
+  server.tool(
+    "get_session_events",
+    "Reads the append-only event projection of a Bridge Session (turns, handoffs, findings, evidence, reviewer safety) with an afterEventId cursor, so orchestrators can poll what changed without replaying the session; fetch full detail per turn via get_session_context",
+    GetSessionEventsInputSchema.shape,
+    async (args: z.infer<typeof GetSessionEventsInputSchema>) => {
+      try {
+        const result = runner.getSessionEvents({
+          sessionId: args.sessionId,
+          afterEventId: args.afterEventId,
+          limit: args.limit,
+        });
+        if ("error" in result) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${result.error}\nContext Status: CONTEXT_INSUFFICIENT — missing: ${result.missing.join(", ")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text", text: `Error reading session events: ${errorMsg}` }],
           isError: true,
         };
       }

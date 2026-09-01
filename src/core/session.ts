@@ -105,6 +105,14 @@ const SessionHistoryEntrySchema = z.object({
         tests: z.string().optional(),
       }),
       openItems: z.array(z.string()),
+      blockers: z
+        .array(
+          z.object({
+            summary: z.string().min(1),
+            requires: z.enum(["agent", "user", "resource", "dependency", "environment"]),
+          }),
+        )
+        .optional(),
     })
     .optional(),
   findings: z.array(ReviewFindingSchema).optional(),

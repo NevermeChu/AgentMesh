@@ -7,6 +7,7 @@ import {
   MultiAgentRunner,
   DEFAULT_RUN_TIMEOUT_MS,
   computeSessionFreshness,
+  computeTurnFreshness,
   modelRejectionDiagnostic,
   sandboxSpawnHint,
   buildSharedContextDetailed,
@@ -1388,6 +1389,113 @@ describe("core/runner", () => {
     expect(text).toContain("matches an EARLIER recorded turn");
   });
 
+  it("renders declared blockers as a dedicated decision-class section", () => {
+    const created = sessionManager.createSession({
+      agent: "codex",
+      cwd: process.cwd(),
+      role: "worker",
+    });
+    sessionManager.addHistory(created.id, {
+      role: "worker",
+      task: "Deploy the permission fix",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "success",
+      handoff: {
+        goal: "Deploy the permission fix",
+        outcome: "success",
+        keyDecisions: [],
+        artifacts: {},
+        openItems: [],
+        blockers: [
+          { summary: "Need production SSH credentials", requires: "environment" },
+          { summary: "Security sign-off pending", requires: "agent" },
+        ],
+      },
+    });
+    const stored = sessionManager.getSession(created.id)!;
+
+    const render = buildSharedContextDetailed([stored]);
+    expect(render?.text).toContain("Blockers (resolve before continuing):");
+    expect(render?.text).toContain("- [environment] Need production SSH credentials");
+    expect(render?.text).toContain("- [agent] Security sign-off pending");
+  });
+
+  it("classifies per-turn freshness independently of the session verdict", () => {
+    const evidenceFor = (fingerprint: string): RepositoryStateEvidence => ({
+      capturedAt: "2026-08-30T00:00:00.000Z",
+      repositoryRoot: "/repo",
+      dirty: false,
+      fingerprint,
+      changedPaths: [],
+    });
+    const entry: SessionHistoryEntry = {
+      role: "worker",
+      task: "Turn",
+      timestamp: "2026-08-30T00:00:00.000Z",
+      status: "success",
+      evidence: { repositoryAfter: evidenceFor("a".repeat(64)) },
+    };
+
+    expect(computeTurnFreshness(entry, evidenceFor("a".repeat(64)))).toBe("MATCHED");
+    expect(computeTurnFreshness(entry, evidenceFor("b".repeat(64)))).toBe("STALE");
+    expect(computeTurnFreshness(entry, undefined)).toBe("UNKNOWN");
+    // Evidence from a different repository root is not comparable — never STALE.
+    expect(
+      computeTurnFreshness(entry, { ...evidenceFor("a".repeat(64)), repositoryRoot: "/other" }),
+    ).toBe("UNKNOWN");
+    expect(
+      computeTurnFreshness({ ...entry, evidence: undefined }, evidenceFor("a".repeat(64))),
+    ).toBe("UNKNOWN");
+  });
+
+  it("marks superseded knowledge stale at injection time when the tree moved on", () => {
+    const evidenceFor = (fingerprint: string): RepositoryStateEvidence => ({
+      capturedAt: "2026-08-30T00:00:00.000Z",
+      repositoryRoot: "/repo",
+      dirty: false,
+      fingerprint,
+      changedPaths: [],
+    });
+    const session: BridgeSession = {
+      id: "bridge-sess_stale_knowledge",
+      agent: "codex",
+      cwd: "/repo",
+      role: "worker",
+      createdAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:00.000Z",
+      history: [
+        {
+          role: "worker",
+          task: "Analyze the cache layer",
+          timestamp: "2026-08-30T00:00:00.000Z",
+          status: "success",
+          handoff: {
+            goal: "Analyze the cache layer",
+            outcome: "success",
+            keyDecisions: ["Keep the LRU cache at 512 entries"],
+            artifacts: {},
+            openItems: [],
+          },
+          evidence: { repositoryAfter: evidenceFor("a".repeat(64)) },
+        },
+      ],
+    };
+
+    // The tree moved on after the turn: its conclusions are marked stale
+    // inline, right where the knowledge is injected.
+    const stale = buildSharedContextDetailed([session], evidenceFor("b".repeat(64)))?.text ?? "";
+    expect(stale).toContain("[stale knowledge:");
+    expect(stale.indexOf("[stale knowledge:")).toBeLessThan(
+      stale.indexOf("Keep the LRU cache at 512 entries"),
+    );
+
+    // Matching tree → no marker; missing current evidence → never fabricated.
+    const fresh = buildSharedContextDetailed([session], evidenceFor("a".repeat(64)))?.text ?? "";
+    expect(fresh).not.toContain("[stale knowledge:");
+    const unknown = buildSharedContextDetailed([session])?.text ?? "";
+    expect(unknown).not.toContain("[stale knowledge:");
+  });
+
   it("returns structured CONTEXT_INSUFFICIENT misses from getSessionTurnContext", async () => {
     const missingSession = await runner.getSessionTurnContext({
       sessionId: "bridge-sess_missing",
@@ -1487,6 +1595,33 @@ describe("core/runner", () => {
         expect(rewound.freshness).toBe("REWOUND");
         expect(rewound.sufficiency?.level).toBe("VERIFY_REQUIRED");
         expect(rewound.sufficiency?.reasons.join(" ")).toContain("earlier recorded turn");
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+
+      // Per-turn granularity: the tree matches turn 1 again, so turn 1's
+      // knowledge is MATCHED (safe to reuse) while the latest turn's
+      // conclusions are STALE (superseded) — the session verdict alone (REWOUND)
+      // cannot express that split.
+      const firstTurn = await runner.getSessionTurnContext({
+        sessionId: turn1.sessionId!,
+        turnIndex: 1,
+      });
+      if (!("error" in firstTurn)) {
+        expect(firstTurn.freshness).toBe("REWOUND");
+        expect(firstTurn.turnFreshness).toBe("MATCHED");
+        expect(firstTurn.turnSufficiency).toBeUndefined();
+      } else {
+        throw new Error("get_session_context should succeed for a recorded turn");
+      }
+      const latestTurn = await runner.getSessionTurnContext({ sessionId: turn1.sessionId! });
+      if (!("error" in latestTurn)) {
+        expect(latestTurn.freshness).toBe("REWOUND");
+        expect(latestTurn.turnFreshness).toBe("STALE");
+        expect(latestTurn.turnSufficiency?.level).toBe("VERIFY_REQUIRED");
+        expect(latestTurn.turnSufficiency?.reasons.join(" ")).toContain(
+          "differs from the state recorded at this turn",
+        );
       } else {
         throw new Error("get_session_context should succeed for a recorded turn");
       }
